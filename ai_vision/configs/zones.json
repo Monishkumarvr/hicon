@@ -1,0 +1,89 @@
+{
+  "metadata": {
+    "version": "4.0",
+    "created_at": "2026-02-10",
+    "updated_at": "2026-02-10",
+    "description": "Zone configuration for HiCon 2-stream system (Process + Pyrometer)",
+    "notes": "ROI points calibrated from 2560x1440 standalone coords, scaled 0.75 for 1920x1080 mux"
+  },
+  "tapping": {
+    "description": "Tapping detection zone on Stream 0 (Process Camera)",
+    "roi_type": "quadrilateral",
+    "roi_points": [
+      [1378, 268],
+      [1430, 236],
+      [1481, 320],
+      [1428, 352]
+    ],
+    "brightness_threshold": 180,
+    "start_white_ratio": 0.80,
+    "start_frame_count": 10,
+    "end_white_ratio": 0.60,
+    "end_frame_count": 20
+  },
+  "deslagging": {
+    "description": "Deslagging detection zone on Stream 0 (Process Camera)",
+    "roi_type": "polygon",
+    "roi_points": [
+      [1207, 379],
+      [1357, 380],
+      [1375, 424],
+      [1304, 428],
+      [1288, 550],
+      [1262, 552]
+    ],
+    "brightness_threshold": 250,
+    "start_white_ratio": 0.01,
+    "start_frame_count": 10,
+    "end_white_ratio": 0.01,
+    "end_frame_count": 15
+  },
+  "pyrometer": {
+    "description": "Pyrometer rod detection zone on Stream 1 (Pyrometer Camera)",
+    "zone_polygon": [
+      [303, 151],
+      [303, 568],
+      [724, 568],
+      [724, 151]
+    ],
+    "confidence_threshold": 0.25,
+    "temporal_in_frames": 10,
+    "temporal_out_frames": 10
+  },
+  "spectro": {
+    "description": "Spectrometer reading detection zone on Stream 0 (Process Camera)",
+    "roi_type": "polygon",
+    "roi_points": [
+      [1535, 448],
+      [1527, 510],
+      [1550, 545],
+      [1558, 496],
+      [1595, 495],
+      [1600, 449]
+    ],
+    "brightness_threshold": 250,
+    "start_white_ratio": 0.03,
+    "start_frame_count": 10,
+    "end_white_ratio": 0.03,
+    "end_frame_count": 15,
+    "max_white_ratio": 0.20
+  },
+  "pouring": {
+    "description": "Pouring detection parameters for Stream 0 (Process Camera)",
+    "session_start_duration": 1.0,
+    "session_end_duration": 1.5,
+    "pour_probe_offset_px": 50,
+    "pour_probe_radius_px": 6,
+    "pour_brightness_start": 230,
+    "pour_brightness_end": 180,
+    "pour_start_duration": 0.25,
+    "pour_end_duration": 1.0,
+    "pour_min_duration": 2.0,
+    "mould_displacement_threshold": 0.15,
+    "mould_sustained_duration": 1.5,
+    "cluster_r_cluster": 0.08,
+    "cluster_r_merge": 0.05,
+    "ladle_mouth_confidence": 0.40,
+    "trolley_confidence": 0.25
+  }
+}

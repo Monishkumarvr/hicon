@@ -1,0 +1,109 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment variables (IMPORTANT - contains secrets!)
+.env
+*.env
+!.env.example
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+*.test.log
+*_debug.log
+test_run_*.log
+test_all_*.log
+debug_output.log
+logs/
+ai_vision/logs/
+
+# Screenshots and output
+screenshots/
+ai_vision/screenshots/
+test_output/
+ai_vision/test_output/
+output/
+ai_vision/output/
+
+# Model files (large binary files)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# CUDA cache
+.nv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Backup files
+*.backup
+*.backup_*
+*.old
+*_broken.*
+*.onnx.backup*
+*.engine.backup*
+
+# Test outputs
+ai_vision/test_output/csv/*.csv
+ai_vision/test_output/screenshots/*.jpg
+
+# Logs
+ai_vision/logs/*.log
+
+# Model engines (auto-generated)
+ai_vision/engines/*.engine
+
+# Environment
+.env
+
+# Archive directory (old debugging docs and scripts)
+archive/
+
+# Local assistant/session artifacts
+.claude/
+
+# Local DeepStream clones (keep out of main project repo)
+DeepStream-Yolo/
+DeepStream-Yolo-old/
+
+# Large documentation exports
+ai_vision/docs/whole_chat.md
+ai_vision/docs/*chat*.md
+ai_vision/docs/*.prompt.md
+ai_vision_cpp/build/
+ai_vision_cpp/external/*/
+!ai_vision_cpp/external/README.md
