@@ -2,11 +2,11 @@
 
 ## 1. Executive Summary
 
-HiCon is a 2-camera edge AI vision system deployed on NVIDIA Jetson Orin Nano 8GB for induction furnace process monitoring at steel/foundry plants. Unlike the TRSL baseline (3 cameras with PPE detection), HiCon focuses exclusively on **furnace operations** — no PPE detection is performed. The system monitors tapping, pouring, spectrometry, and deslagging through one camera, and pyrometer rod insertion through a second camera, synchronizing all events to the AGNI cloud backend.
+HiCon is a 2-camera edge AI vision system deployed on NVIDIA Jetson Orin Nano 8GB for induction furnace process monitoring at steel/foundry plants. Compared with the earlier 3-camera PPE-focused baseline, HiCon focuses exclusively on **furnace operations** — no PPE detection is performed. The system monitors tapping, pouring, spectrometry, and deslagging through one camera, and pyrometer rod insertion through a second camera, synchronizing all events to the AGNI cloud backend.
 
-**Key Differences from TRSL Baseline:**
+**Key Differences from Legacy Baseline:**
 
-| Aspect | TRSL (Baseline) | HiCon |
+| Aspect | Legacy Baseline | HiCon |
 |--------|----------------|-------|
 | Cameras | 3 (2× PPE + 1× Pouring) | 2 (1× Process + 1× Pyrometer) |
 | PPE Detection | Yes (Person + Helmet) | **No** |
@@ -114,7 +114,7 @@ HiCon is a 2-camera edge AI vision system deployed on NVIDIA Jetson Orin Nano 8G
 
 ### 5.1 Architecture Overview — Standalone Detectors (NOT DeepStream)
 
-Unlike the TRSL baseline which uses a DeepStream GStreamer pipeline, HiCon implements **standalone Python detectors** that each manage their own decode → process → output pipeline. This provides per-detector isolation, simpler debugging, and independent restart capability.
+Unlike the previous baseline which uses a DeepStream GStreamer pipeline, HiCon implements **standalone Python detectors** that each manage their own decode → process → output pipeline. This provides per-detector isolation, simpler debugging, and independent restart capability.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -197,7 +197,7 @@ Per-detector processing (brightness analysis OR TensorRT inference)
 | *None* | Deslagging | N/A | Brightness-based | N/A | Y>250 | N/A | N/A |
 
 **Notes:**
-- Person and Helmet models from TRSL are **NOT loaded** — no PPE detection
+- Person and Helmet models from the previous PPE system are **NOT loaded** — no PPE detection
 - Tapping and Deslagging use **no ML model** — pure CuPy GPU brightness analysis
 - YOLO26 uses end-to-end TensorRT (NMS built into model), output is `[x1,y1,x2,y2,conf,class_id]`
 - Pouring YOLO uses standard TensorRT with external ByteTrack tracking
@@ -695,7 +695,7 @@ CREATE TABLE melting_events (
     created_at          TEXT NOT NULL
 );
 
--- Pouring Events (Extended from TRSL)
+-- Pouring Events (Extended from legacy baseline)
 CREATE TABLE pouring_events (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     sync_id                 TEXT UNIQUE NOT NULL,
@@ -759,7 +759,7 @@ S001, session_end, 2026-02-09 14:32:35, 2, , ,
 
 ### 8.3 Data Lifecycle
 
-Same as TRSL: SQLite INSERT → 30s sync cycle → HMAC-authenticated POST → 7-day cleanup. See TRSL design doc §7.2 for full flow.
+Same sync lifecycle: SQLite INSERT → 30s sync cycle → HMAC-authenticated POST → 7-day cleanup.
 
 ---
 
@@ -767,7 +767,7 @@ Same as TRSL: SQLite INSERT → 30s sync cycle → HMAC-authenticated POST → 7
 
 ### 9.1 Authentication
 
-Identical to TRSL: HMAC-SHA256 on request body → `X-HMAC-Signature` header.
+Authentication uses HMAC-SHA256 on request body → `X-HMAC-Signature` header.
 
 ### 9.2 API Payloads
 
@@ -982,7 +982,7 @@ HiCon tracks operations at the **heat level** — a complete furnace cycle from 
 
 ## 12. Resilience & Fault Tolerance
 
-Adapted from TRSL baseline for standalone detector architecture:
+Adapted from the earlier baseline for standalone detector architecture:
 
 | Failure | Detection | Recovery | Downtime |
 |---------|-----------|----------|----------|

@@ -1,6 +1,6 @@
 %YAML:1.0
 ####################################################################################################
-# TRSL Custom Tracker Configuration
+# HiCon Custom Tracker Configuration
 # Based on NvDCF Performance config with INCREASED persistence for pouring detection
 #
 # Key changes from default:
@@ -22,7 +22,7 @@ TargetManagement:
   minTrackerConfidence: 0.4009    # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
   probationAge: 2    # If the target's age exceeds this, the target will be considered to be valid.
 
-  # TRSL CUSTOM: Increased from 51 to 600 frames (~30 seconds at 20 FPS)
+  # HiCon custom: increased from 51 to 600 frames (~30 seconds at 20 FPS)
   # Prevents new ID assignment when ladle temporarily leaves frame during pouring
   maxShadowTrackingAge: 600    # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated.
 

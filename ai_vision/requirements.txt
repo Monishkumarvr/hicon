@@ -1,8 +1,8 @@
-# TRSL Edge AI Vision System - Python Dependencies
+# HiCon Edge AI Vision System - Python Dependencies
 # Install with: pip3 install -r requirements.txt
 
 # ===================================================================
-# Core Dependencies (REQUIRED for trsl_pipeline.py)
+# Core Dependencies (REQUIRED for hicon_pipeline.py)
 # ===================================================================
 opencv-python>=4.8.0           # Computer vision (cv2)
 numpy>=1.24.0                  # Array operations
@@ -23,7 +23,7 @@ nvidia-ml-py>=12.535.0
 # System Dependencies (pre-installed via JetPack 6.2+)
 # These are NOT pip-installable and must be installed via JetPack SDK
 # ===================================================================
-# Required for trsl_pipeline.py:
+# Required for hicon_pipeline.py:
 # - pyds (DeepStream Python bindings) - CRITICAL for production pipeline
 # - pygobject (gi.repository) - GStreamer Python bindings
 # - GStreamer 1.0 - Video processing framework
