@@ -65,6 +65,11 @@ class BrightnessProcessor:
         self._tapping_pixel_count = 0
         self._deslagging_pixel_count = 0
         self._spectro_pixel_count = 0
+        self._last_white_ratios = {
+            "tapping": 0.0,
+            "deslagging": 0.0,
+            "spectro": 0.0,
+        }
 
         # State machines
         self.tapping_tracker = BrightnessTracker(
@@ -203,12 +208,94 @@ class BrightnessProcessor:
         # Threshold: white pixels where Y > threshold within ROI
         white_pixels = np.sum((gray > threshold) & (mask > 0))
         white_ratio = white_pixels / pixel_count if pixel_count > 0 else 0.0
+        self._last_white_ratios[tracker.name] = white_ratio
 
         # Update state machine
         event = tracker.update(white_ratio)
 
         if event:
             self._handle_event(event, frame_rgba, white_ratio)
+
+    def add_inference_display_meta(self, batch_meta, frame_meta):
+        """Attach DS-native overlay for tapping/deslagging/spectro status + ROI bounds."""
+        try:
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if not display_meta:
+                return
+
+            # Text overlays
+            labels = []
+            header = "MELTING EVENTS"
+            labels.append((header, (1.0, 1.0, 1.0, 1.0)))
+
+            def _status_line(name, active, ratio):
+                state = "ON" if active else "OFF"
+                return f"{name}: {state}  ratio={ratio:.3f}"
+
+            labels.append((
+                _status_line("TAPPING", self.tapping_tracker.is_active,
+                             self._last_white_ratios.get("tapping", 0.0)),
+                (1.0, 0.65, 0.0, 1.0),
+            ))
+            labels.append((
+                _status_line("DESLAG", self.deslagging_tracker.is_active,
+                             self._last_white_ratios.get("deslagging", 0.0)),
+                (1.0, 0.0, 0.0, 1.0),
+            ))
+            labels.append((
+                _status_line("SPECTRO", self.spectro_tracker.is_active,
+                             self._last_white_ratios.get("spectro", 0.0)),
+                (0.0, 1.0, 1.0, 1.0),
+            ))
+
+            base_x = 10
+            base_y = 45
+            line_h = 18
+            display_meta.num_labels = min(len(labels), len(display_meta.text_params))
+            for i in range(display_meta.num_labels):
+                txt = display_meta.text_params[i]
+                txt.display_text = labels[i][0]
+                txt.x_offset = base_x
+                txt.y_offset = base_y + i * line_h
+                txt.font_params.font_name = "Serif"
+                txt.font_params.font_size = 12
+                r, g, b, a = labels[i][1]
+                txt.font_params.font_color.set(r, g, b, a)
+                txt.set_bg_clr = 1
+                txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.55)
+
+            # ROI bounding rectangles (approximate)
+            rect_idx = 0
+            max_rects = len(display_meta.rect_params)
+
+            def _add_roi_rect(roi_pts, color):
+                nonlocal rect_idx
+                if not roi_pts or rect_idx >= max_rects:
+                    return
+                xs = [p[0] for p in roi_pts]
+                ys = [p[1] for p in roi_pts]
+                if not xs or not ys:
+                    return
+                x1, y1 = min(xs), min(ys)
+                x2, y2 = max(xs), max(ys)
+                rect = display_meta.rect_params[rect_idx]
+                rect.left = int(max(0, x1))
+                rect.top = int(max(0, y1))
+                rect.width = int(max(1, x2 - x1))
+                rect.height = int(max(1, y2 - y1))
+                rect.border_width = 2
+                rect.has_bg_color = 0
+                rect.border_color.set(*color)
+                rect_idx += 1
+
+            _add_roi_rect(self._tapping_config.get('roi_points', []), (1.0, 0.65, 0.0, 1.0))
+            _add_roi_rect(self._deslagging_config.get('roi_points', []), (1.0, 0.0, 0.0, 1.0))
+            _add_roi_rect(self._spectro_config.get('roi_points', []), (0.0, 1.0, 1.0, 1.0))
+
+            display_meta.num_rects = rect_idx
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        except Exception as exc:
+            logger.error(f"[osd] Failed to attach brightness display meta: {exc}", exc_info=True)
 
     def _handle_event(self, event, frame_rgba, white_ratio=0.0):
         """Handle a completed tapping/deslagging/spectro event."""

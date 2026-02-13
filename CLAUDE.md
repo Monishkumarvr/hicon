@@ -21,8 +21,12 @@ HiCon is a 2-camera edge AI vision system for induction furnace monitoring on **
 - **Pouring parity updates applied:** top-only trolley edge expand, HSV-V probe brightness sampling, probe points on all pouring event screenshots.
 - **MIN_CLUSTER_POUR_S implemented:** mould clusters with low cumulative pour time are filtered before final mould count.
 - **DS-native inference overlays added:** custom status/probe overlays are attached via `nvds_acquire_display_meta_from_pool` and rendered by `nvosd`.
+- **Brightness OSD overlays added:** tapping/deslagging/spectro status + ROI bounds are rendered on Stream 0 inference video.
 - **DS-native recording branch added:** post-OSD tee branch configured through `RecordingManager`.
 - **Automated tests added:** tracker max-threshold discard, pouring session/cycle transitions, probe-point screenshot rendering, DS-native overlay and recording smoke coverage.
+- **Trolley relock behavior added:** when locked trolley ID disappears, padding re-locks to the best match (IoU/ confidence) so expand follows the active trolley.
+- **API payloads aligned to new format:** `/pouring` and `/melting` payloads are built from `heat_cycles` with `mould_count`, `heat_no`, and cycle-level flags.
+- **Furnace ID config added:** `HICON_FURNACE_ID` (defaults to `LOCATION`) used in melting payloads.
 
 ### Changes made but still requiring live validation closure
 - DS-native recording path has been actively iterated to address zero-byte outputs.
@@ -59,6 +63,7 @@ Stream 0 (Process Camera — single NVDEC decode)
           ├── Tapping check (quad ROI, Y>180, white_ratio)
           ├── Deslagging check (polygon ROI, Y>250, white_ratio)
           ├── Spectro check (polygon ROI, Y>250, white_ratio + max ratio discard)
+          ├── DS-native OSD overlay (tapping/deslagging/spectro status + ROI bounds)
           └── unmap_nvds_buf_surface()  ← MANDATORY on Jetson
 
 Stream 1 (Pyrometer Camera — single NVDEC decode)

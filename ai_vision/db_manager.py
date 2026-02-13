@@ -303,6 +303,34 @@ class HiConDatabase:
         conn.close()
         logger.debug(f"Marked {len(sync_ids)} melting events as synced")
 
+    def mark_melting_events_synced_by_window(self, start_time: str, end_time: str):
+        """Mark melting events as synced within a time window (inclusive)."""
+        if not start_time or not end_time:
+            return
+        conn = self._get_connection()
+        c = conn.cursor()
+        c.execute('''UPDATE melting_events
+                     SET synced = 1, sync_attempts = 0, last_sync_error = NULL
+                     WHERE start_time >= ? AND start_time <= ?''',
+                  (start_time, end_time))
+        conn.commit()
+        conn.close()
+
+    def has_melting_event_type_in_window(self, event_type: str, start_time: str, end_time: str) -> bool:
+        """Check if a melting event of a given type exists in a time window."""
+        if not event_type or not start_time or not end_time:
+            return False
+        conn = self._get_connection()
+        c = conn.cursor()
+        c.execute('''SELECT 1 FROM melting_events
+                     WHERE event_type = ?
+                       AND start_time >= ? AND start_time <= ?
+                     LIMIT 1''',
+                  (event_type, start_time, end_time))
+        row = c.fetchone()
+        conn.close()
+        return row is not None
+
     # === POURING EVENTS ===
 
     def insert_pouring_event(self, sync_id: str, customer_id: str, date: str,

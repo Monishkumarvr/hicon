@@ -50,7 +50,7 @@ class SyncManager:
     """
     
     def __init__(self, database, api_client, customer_id: str,
-                 camera_id: str, location: str,
+                 camera_id: str, location: str, furnace_id: str = "",
                  sync_interval: int = 30, batch_size: int = 50):
         """
         Initialize sync manager.
@@ -69,6 +69,7 @@ class SyncManager:
         self.customer_id = customer_id
         self.camera_id = camera_id
         self.location = location
+        self.furnace_id = furnace_id
         self.sync_interval = sync_interval
         self.batch_size = batch_size
         
@@ -108,20 +109,20 @@ class SyncManager:
         self.stats['total_sync_attempts'] += 1
         
         try:
-            # Sync melting events (tapping, deslagging, pyrometer, spectro)
-            melting_synced = self._sync_melting_events()
-
-            # Sync heat cycles (aggregated pouring data)
-            heat_cycles_synced = self._sync_heat_cycles()
+            # Sync heat cycles (aggregated pouring + melting cycle payloads)
+            melting_synced, pouring_synced, finalized_synced = self._sync_heat_cycles()
 
             # Update stats
             self.stats['total_melting_synced'] += melting_synced
-            self.stats['total_heat_cycles_synced'] += heat_cycles_synced
-            self.stats['total_pouring_synced'] += heat_cycles_synced
+            self.stats['total_heat_cycles_synced'] += finalized_synced
+            self.stats['total_pouring_synced'] += pouring_synced
             self.stats['last_sync_success'] = datetime.now().isoformat()
 
-            if melting_synced > 0 or heat_cycles_synced > 0:
-                logger.info(f"Sync complete - Melting: {melting_synced}, Heat Cycles: {heat_cycles_synced}")
+            if melting_synced > 0 or pouring_synced > 0:
+                logger.info(
+                    "Sync complete - Melting: %s, Pouring: %s, Finalized cycles: %s",
+                    melting_synced, pouring_synced, finalized_synced,
+                )
             
         except Exception as e:
             self.stats['total_sync_failures'] += 1
@@ -132,74 +133,40 @@ class SyncManager:
         if self.should_cleanup(current_time):
             self._run_cleanup()
     
-    def _sync_melting_events(self) -> int:
-        """Sync pending melting events (tapping, deslagging, pyrometer, spectro)."""
-        records = self.db.get_unsynced_melting_events(limit=self.batch_size)
-
-        if not records:
-            return 0
-
-        items = []
-        for record in records:
-            item = {
-                'sync_id': record['sync_id'],
-                'customer_id': record['customer_id'],
-                'slno': record['slno'],
-                'date': record['date'],
-                'event_type': record['event_type'],
-                'start_time': format_timestamp_for_api(record['start_time']),
-                'end_time': format_timestamp_for_api(record.get('end_time')),
-                'duration_sec': record.get('duration_sec', 0),
-                'camera_id': record['camera_id'],
-                'location': record['location'],
-            }
-
-            # Encode screenshot if present
-            screenshot_path = record.get('screenshot_path', '')
-            if screenshot_path:
-                screenshot_b64 = self._encode_image(screenshot_path)
-                if screenshot_b64:
-                    item['screenshot'] = screenshot_b64
-
-            items.append(item)
-
-        if not items:
-            return 0
-
-        result = self.api.send_melting_data(items)
-
-        results = result.get('results', [])
-        successful_ids = [r['sync_id'] for r in results if r.get('success', False)]
-
-        failed_ids = [
-            (r['sync_id'], r.get('error', 'Unknown error'))
-            for r in results if not r.get('success', False)
-        ]
-
-        if failed_ids:
-            for sync_id, error in failed_ids:
-                logger.warning(f"  Failed to sync melting {sync_id}: {error}")
-            failed_sync_ids = [sync_id for sync_id, _ in failed_ids]
-            error_msg = failed_ids[0][1] if failed_ids else 'Sync failed'
-            self.db.increment_sync_attempts('melting_events', failed_sync_ids, error_msg)
-
-        if successful_ids:
-            self.db.mark_melting_events_synced(successful_ids)
-            logger.info(f"  Marked {len(successful_ids)} melting events as synced")
-
-        return len(successful_ids)
+    @staticmethod
+    def _format_duration_hhmmss(start_iso: str, end_iso: str) -> str:
+        """Format duration between ISO timestamps as HH:MM:SS."""
+        if not start_iso or not end_iso:
+            return ""
+        try:
+            start_dt = datetime.fromisoformat(start_iso)
+            end_dt = datetime.fromisoformat(end_iso)
+            total_seconds = int(max(0, (end_dt - start_dt).total_seconds()))
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        except Exception:
+            return ""
     
-    def _sync_heat_cycles(self) -> int:
-        """Sync pending heat cycles (aggregated pouring data)"""
+    def _sync_heat_cycles(self) -> tuple:
+        """
+        Sync pending heat cycles to both endpoints:
+        - /pouring (mould-wise pouring payload)
+        - /melting (melting cycle summary payload)
+        """
         # Get unsynced heat cycles
         cycles = self.db.get_unsynced_heat_cycles(limit=self.batch_size)
 
         if not cycles:
-            return 0
+            return 0, 0, 0
 
         # Prepare API payload
-        items = []
+        pouring_items = []
+        melting_items = []
+        cycle_by_sync = {}
         for cycle in cycles:
+            cycle_by_sync[cycle['sync_id']] = cycle
             # Parse JSON mould_wise_pouring_time array
             # Handle both single and double-encoded JSON (for backward compatibility)
             mould_wise_timing = []
@@ -225,42 +192,73 @@ class SyncManager:
                 except (json.JSONDecodeError, TypeError):
                     return []
 
-            item = {
+            mould_count = len(mould_wise_timing) if mould_wise_timing else 0
+
+            # Pouring payload (new API format)
+            pouring_items.append({
                 'sync_id': cycle['sync_id'],
                 'customer_id': cycle['customer_id'],
-                'slno': str(cycle.get('slno', '01')),
                 'date': cycle['date'],
-                'shift': cycle.get('shift') or "",
                 'heat_no': cycle.get('heat_no') or "",
-                'ladle_number': cycle.get('ladle_number') or "",
                 'location': cycle['location'],
                 'camera_id': cycle['camera_id'],
+                'mould_count': mould_count,
                 'pouring_start_time': format_timestamp_for_api(cycle['pouring_start_time']),
                 'pouring_end_time': format_timestamp_for_api(cycle.get('pouring_end_time')),
                 'total_pouring_time': str(cycle.get('total_pouring_time', '0')),  # Seconds as string
                 'mould_wise_pouring_time': mould_wise_timing,  # Array of {mould_id, start, end, duration}
-                'tapping_start_time': format_timestamp_for_api(cycle.get('tapping_start_time')),
-                'tapping_end_time': format_timestamp_for_api(cycle.get('tapping_end_time')),
-                'tapping_events': _parse_json_list(cycle.get('tapping_events')),
-                'deslagging_events': _parse_json_list(cycle.get('deslagging_events')),
-                'spectro_events': _parse_json_list(cycle.get('spectro_events')),
-            }
-            items.append(item)
+            })
+
+            # Melting payload (new API format)
+            tapping_start = format_timestamp_for_api(cycle.get('tapping_start_time'))
+            tapping_end = format_timestamp_for_api(cycle.get('tapping_end_time'))
+            deslag_events = _parse_json_list(cycle.get('deslagging_events'))
+            spectro_events = _parse_json_list(cycle.get('spectro_events'))
+
+            cycle_start_iso = cycle.get('cycle_start_time')
+            cycle_end_iso = cycle.get('cycle_end_time')
+            pyrometer_present = self.db.has_melting_event_type_in_window(
+                "pyrometer", cycle_start_iso, cycle_end_iso
+            )
+
+            melting_items.append({
+                'sync_id': cycle['sync_id'],
+                'customer_id': cycle['customer_id'],
+                'date': cycle['date'],
+                'camera_id': cycle['camera_id'],
+                'location': cycle['location'],
+                'pyrometer': bool(pyrometer_present),
+                'spectro': bool(len(spectro_events) > 0),
+                'furnace': self.furnace_id or "",
+                'heat_no': cycle.get('heat_no') or "",
+                'heat_start_time': format_timestamp_for_api(cycle_start_iso),
+                'heat_end_time': format_timestamp_for_api(cycle_end_iso),
+                'heat_duration': self._format_duration_hhmmss(cycle_start_iso, cycle_end_iso),
+                'tapping_start_time': tapping_start,
+                'tapping_end_time': tapping_end,
+                'deslagging': bool(len(deslag_events) > 0),
+            })
 
         # Send to API
-        result = self.api.send_pouring_data(items)
+        pouring_result = self.api.send_pouring_data(pouring_items)
+        melting_result = self.api.send_melting_data(melting_items)
 
         # Extract successful sync_ids from results array
-        results = result.get('results', [])
-        successful_ids = [
-            r['sync_id'] for r in results
+        pouring_results = pouring_result.get('results', [])
+        pouring_success = [
+            r['sync_id'] for r in pouring_results
+            if r.get('success', False)
+        ]
+        melting_results = melting_result.get('results', [])
+        melting_success = [
+            r['sync_id'] for r in melting_results
             if r.get('success', False)
         ]
 
         # Log any failures for debugging
         failed_ids = [
             (r['sync_id'], r.get('error', 'Unknown error'))
-            for r in results
+            for r in pouring_results
             if not r.get('success', False)
         ]
 
@@ -272,12 +270,32 @@ class SyncManager:
             for sync_id, error_msg in failed_ids:
                 self.db.update_heat_cycle_sync_status(sync_id, error_msg)
 
-        # Mark successful records as synced
-        if successful_ids:
-            self.db.mark_heat_cycles_synced(successful_ids)
-            logger.info(f"  ✓ Marked {len(successful_ids)} heat cycles as synced")
+        failed_melting_ids = [
+            (r['sync_id'], r.get('error', 'Unknown error'))
+            for r in melting_results
+            if not r.get('success', False)
+        ]
+        if failed_melting_ids:
+            for sync_id, error in failed_melting_ids:
+                logger.warning(f"    Failed to sync melting cycle {sync_id}: {error}")
+            for sync_id, error_msg in failed_melting_ids:
+                self.db.update_heat_cycle_sync_status(sync_id, error_msg)
 
-        return len(successful_ids)
+        # Mark successful records as synced
+        successful_ids = set(pouring_success) & set(melting_success)
+        if successful_ids:
+            self.db.mark_heat_cycles_synced(list(successful_ids))
+            logger.info(f"  ✓ Marked {len(successful_ids)} heat cycles as synced")
+            # Mark melting events within cycle window as synced (tapping/deslagging/spectro/pyrometer)
+            for sync_id in successful_ids:
+                cycle = cycle_by_sync.get(sync_id)
+                if cycle:
+                    self.db.mark_melting_events_synced_by_window(
+                        cycle.get('cycle_start_time'),
+                        cycle.get('cycle_end_time'),
+                    )
+
+        return len(melting_success), len(pouring_success), len(successful_ids)
     
     def _encode_image(self, image_path: str) -> str:
         """

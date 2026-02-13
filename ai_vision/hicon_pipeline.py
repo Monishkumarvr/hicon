@@ -123,6 +123,11 @@ def osd_sink_pad_probe_stream0(pad, info):
             if brightness_processor and frame is not None:
                 try:
                     brightness_processor.process_frame_with_array(frame, frame_meta)
+                    if config.ENABLE_INFERENCE_VIDEO:
+                        brightness_processor.add_inference_display_meta(
+                            batch_meta=batch_meta,
+                            frame_meta=frame_meta,
+                        )
                 except Exception as e:
                     logger.error(f"Brightness processor error: {e}", exc_info=True)
         finally:
@@ -289,6 +294,7 @@ def main():
             customer_id=config.CUSTOMER_ID,
             camera_id=config.CAMERA_ID_STREAM_0,
             location=config.LOCATION,
+            furnace_id=getattr(config, 'FURNACE_ID', ''),
             sync_interval=config.SYNC_INTERVAL,
             batch_size=config.BATCH_SIZE,
         )

@@ -26,10 +26,10 @@ API_URL = os.getenv(
 )
 
 # HMAC Secret for API authentication (REQUIRED from environment variable)
-HMAC_SECRET = os.getenv('HICON_HMAC_SECRET')
+HMAC_SECRET = os.getenv('HICON_HMAC_SECRET', 'jIQI1O3rR4QyUceWgTiJ09Xn4Yo-CyiaabLE6vR8R_0lxgkN7or_298cEhOIfg9I0IU-eWA2NKHXkOoHx9shLA')
 
 # Customer and Device Identification
-CUSTOMER_ID = os.getenv('HICON_CUSTOMER_ID', '682')
+CUSTOMER_ID = os.getenv('HICON_CUSTOMER_ID', '1157')
 DEVICE_ID = os.getenv('HICON_DEVICE_ID', 'DEVICE001')
 
 # Camera and Location Identification
@@ -38,6 +38,7 @@ DEVICE_ID = os.getenv('HICON_DEVICE_ID', 'DEVICE001')
 CAMERA_ID_STREAM_0 = os.getenv('HICON_CAMERA_ID_STREAM_0', 'Cam-Process')
 CAMERA_ID_STREAM_1 = os.getenv('HICON_CAMERA_ID_STREAM_1', 'Cam-Pyrometer')
 LOCATION = os.getenv('HICON_LOCATION', 'Casting Section')
+FURNACE_ID = os.getenv('HICON_FURNACE_ID', LOCATION)
 
 # =============================================================================
 # SYNC CONFIGURATION
@@ -235,6 +236,7 @@ def get_config_summary():
         'customer_id': CUSTOMER_ID,
         'device_id': DEVICE_ID,
         'location': LOCATION,
+        'furnace_id': FURNACE_ID,
         'sync_interval': SYNC_INTERVAL,
         'batch_size': BATCH_SIZE,
         'enable_sync': ENABLE_SYNC,

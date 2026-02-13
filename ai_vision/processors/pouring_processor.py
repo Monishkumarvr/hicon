@@ -186,7 +186,7 @@ class PouringProcessor:
             )
 
         # 2. Find the relevant trolley (locked or best candidate)
-        target_trolley = self._get_target_trolley(trolleys)
+        target_trolley = self._get_target_trolley(trolleys, timestamp)
 
         # 3. Check mouth-in-trolley (with EDGE_EXPAND)
         mouth_in_trolley = False
@@ -296,7 +296,7 @@ class PouringProcessor:
     # Trolley targeting (locking)
     # =========================================================================
 
-    def _get_target_trolley(self, trolleys):
+    def _get_target_trolley(self, trolleys, timestamp=None):
         """Get the target trolley: locked one if exists, else best candidate."""
         if not trolleys:
             return None
@@ -306,11 +306,62 @@ class PouringProcessor:
             for t in trolleys:
                 if t['track_id'] == self.locked_trolley_id:
                     return t
-            # Locked trolley not detected this frame — return None
+            # Locked trolley missing — relock to best match so padding tracks current trolley
+            relock = self._select_relock_trolley(trolleys)
+            if relock:
+                self._relock_trolley(relock, timestamp or time.time(), reason="missing_locked_id")
+                return relock
             return None
 
         # No lock yet — return highest-confidence trolley
         return max(trolleys, key=lambda t: t['confidence'])
+
+    @staticmethod
+    def _bbox_iou(a, b):
+        """Compute IoU between two bboxes (x1,y1,x2,y2)."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0:
+            return 0.0
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        denom = area_a + area_b - inter_area
+        return inter_area / denom if denom > 0 else 0.0
+
+    def _select_relock_trolley(self, trolleys):
+        """Pick best trolley to relock when locked ID is missing."""
+        if self.locked_trolley_bbox:
+            best = None
+            best_iou = -1.0
+            for t in trolleys:
+                iou = self._bbox_iou(self.locked_trolley_bbox, t['bbox'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best = t
+            if best is not None:
+                return best
+        return max(trolleys, key=lambda t: t['confidence'])
+
+    def _relock_trolley(self, trolley, timestamp, reason=""):
+        """Re-lock to a new trolley (e.g., tracker ID switched)."""
+        prev_id = self.locked_trolley_id
+        self.locked_trolley_id = trolley['track_id']
+        self.locked_trolley_bbox = trolley['bbox']
+        self.trolley_locked = True
+        self.mouth_last_seen_in_trolley = timestamp
+        if self.heat_cycle_manager:
+            self.heat_cycle_manager.lock_trolley(trolley['track_id'])
+        logger.info(
+            f"[trolley] RELOCK T{prev_id} -> T{trolley['track_id']} "
+            f"at bbox {trolley['bbox']} ({reason})"
+        )
 
     def _is_mouth_in_expanded_trolley(self, mouth, trolley):
         """Check if mouth center is inside trolley bbox expanded on top edge only.
