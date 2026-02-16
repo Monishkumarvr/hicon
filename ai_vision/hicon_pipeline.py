@@ -265,6 +265,7 @@ def main():
         db_manager=db,
         config=config,
         screenshot_dir=str(config.SCREENSHOT_DIR),
+        heat_cycle_manager=heat_cycle_manager,
     )
 
     # Pouring processor — import conditionally to avoid issues if not adapted yet

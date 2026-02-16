@@ -30,7 +30,7 @@ class PyrometerProcessor:
                  N consecutive absent frames → EVENT END
     """
 
-    def __init__(self, zone_config, db_manager, config, screenshot_dir):
+    def __init__(self, zone_config, db_manager, config, screenshot_dir, heat_cycle_manager=None):
         """
         Args:
             zone_config: Pyrometer zone config from zones.json
@@ -40,6 +40,7 @@ class PyrometerProcessor:
         """
         self.db_manager = db_manager
         self.config = config
+        self.heat_cycle_manager = heat_cycle_manager
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.customer_id = config.CUSTOMER_ID
@@ -196,6 +197,19 @@ class PyrometerProcessor:
             )
         except Exception as e:
             logger.error(f"Failed to insert pyrometer event: {e}")
+
+        # Push to heat cycle manager for aggregation
+        if self.heat_cycle_manager:
+            try:
+                self.heat_cycle_manager.add_pyrometer_event(
+                    start_wall=self.event_start_time,
+                    start_dt=self.event_start_datetime,
+                    end_wall=end_time,
+                    end_dt=end_datetime,
+                    duration=round(duration, 1),
+                )
+            except Exception as e:
+                logger.error(f"Failed to push pyrometer to heat cycle manager: {e}")
 
         self.event_start_time = None
         self.event_start_datetime = None

@@ -214,7 +214,10 @@ class BrightnessProcessor:
         event = tracker.update(white_ratio)
 
         if event:
-            self._handle_event(event, frame_rgba, white_ratio)
+            if event.get("phase") == "start":
+                self._handle_event_start(event, frame_rgba, white_ratio)
+            else:
+                self._handle_event(event, frame_rgba, white_ratio)
 
     def add_inference_display_meta(self, batch_meta, frame_meta):
         """Attach DS-native overlay for tapping/deslagging/spectro status + ROI bounds."""
@@ -223,10 +226,29 @@ class BrightnessProcessor:
             if not display_meta:
                 return
 
+            # Scale overlay text when recording is downscaled
+            scale_up = 1.0
+            try:
+                target_w = int(getattr(self.config, "INFERENCE_VIDEO_WIDTH", 0) or 0)
+                if self._frame_shape and target_w and target_w < self._frame_shape[1]:
+                    scale_up = min(3.0, self._frame_shape[1] / float(target_w))
+            except Exception:
+                scale_up = 1.0
+
             # Text overlays
             labels = []
             header = "MELTING EVENTS"
             labels.append((header, (1.0, 1.0, 1.0, 1.0)))
+
+            active_events = []
+            if self.tapping_tracker.is_active:
+                active_events.append("TAPPING")
+            if self.deslagging_tracker.is_active:
+                active_events.append("DESLAG")
+            if self.spectro_tracker.is_active:
+                active_events.append("SPECTRO")
+            active_txt = "ACTIVE: " + (", ".join(active_events) if active_events else "NONE")
+            labels.append((active_txt, (0.0, 1.0, 0.0, 1.0)))
 
             def _status_line(name, active, ratio):
                 state = "ON" if active else "OFF"
@@ -249,8 +271,8 @@ class BrightnessProcessor:
             ))
 
             base_x = 10
-            base_y = 45
-            line_h = 18
+            base_y = max(45, int(round(45 * scale_up)))
+            line_h = max(18, int(round(18 * scale_up)))
             display_meta.num_labels = min(len(labels), len(display_meta.text_params))
             for i in range(display_meta.num_labels):
                 txt = display_meta.text_params[i]
@@ -258,44 +280,86 @@ class BrightnessProcessor:
                 txt.x_offset = base_x
                 txt.y_offset = base_y + i * line_h
                 txt.font_params.font_name = "Serif"
-                txt.font_params.font_size = 12
+                txt.font_params.font_size = max(12, int(round(12 * scale_up)))
                 r, g, b, a = labels[i][1]
                 txt.font_params.font_color.set(r, g, b, a)
                 txt.set_bg_clr = 1
                 txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.55)
 
-            # ROI bounding rectangles (approximate)
-            rect_idx = 0
-            max_rects = len(display_meta.rect_params)
+            # ROI polygon lines (tilted to match screenshots)
+            line_idx = 0
+            max_lines = len(getattr(display_meta, "line_params", []))
 
-            def _add_roi_rect(roi_pts, color):
-                nonlocal rect_idx
-                if not roi_pts or rect_idx >= max_rects:
+            def _add_roi_poly(roi_pts, color):
+                nonlocal line_idx
+                if not roi_pts or max_lines == 0:
                     return
-                xs = [p[0] for p in roi_pts]
-                ys = [p[1] for p in roi_pts]
-                if not xs or not ys:
+                n = len(roi_pts)
+                if n < 2:
                     return
-                x1, y1 = min(xs), min(ys)
-                x2, y2 = max(xs), max(ys)
-                rect = display_meta.rect_params[rect_idx]
-                rect.left = int(max(0, x1))
-                rect.top = int(max(0, y1))
-                rect.width = int(max(1, x2 - x1))
-                rect.height = int(max(1, y2 - y1))
-                rect.border_width = 2
-                rect.has_bg_color = 0
-                rect.border_color.set(*color)
-                rect_idx += 1
+                for i in range(n):
+                    if line_idx >= max_lines:
+                        break
+                    x1, y1 = roi_pts[i]
+                    x2, y2 = roi_pts[(i + 1) % n]
+                    line = display_meta.line_params[line_idx]
+                    line.x1 = int(max(0, x1))
+                    line.y1 = int(max(0, y1))
+                    line.x2 = int(max(0, x2))
+                    line.y2 = int(max(0, y2))
+                    line.line_width = max(2, int(round(2 * scale_up)))
+                    line.line_color.set(*color)
+                    line_idx += 1
 
-            _add_roi_rect(self._tapping_config.get('roi_points', []), (1.0, 0.65, 0.0, 1.0))
-            _add_roi_rect(self._deslagging_config.get('roi_points', []), (1.0, 0.0, 0.0, 1.0))
-            _add_roi_rect(self._spectro_config.get('roi_points', []), (0.0, 1.0, 1.0, 1.0))
+            if max_lines > 0:
+                _add_roi_poly(self._tapping_config.get('roi_points', []), (1.0, 0.65, 0.0, 1.0))
+                _add_roi_poly(self._deslagging_config.get('roi_points', []), (1.0, 0.0, 0.0, 1.0))
+                _add_roi_poly(self._spectro_config.get('roi_points', []), (0.0, 1.0, 1.0, 1.0))
+                display_meta.num_lines = line_idx
+                display_meta.num_rects = 0
+            else:
+                # Fallback: ROI bounding rectangles if line params unavailable
+                rect_idx = 0
+                max_rects = len(display_meta.rect_params)
 
-            display_meta.num_rects = rect_idx
+                def _add_roi_rect(roi_pts, color):
+                    nonlocal rect_idx
+                    if not roi_pts or rect_idx >= max_rects:
+                        return
+                    xs = [p[0] for p in roi_pts]
+                    ys = [p[1] for p in roi_pts]
+                    if not xs or not ys:
+                        return
+                    x1, y1 = min(xs), min(ys)
+                    x2, y2 = max(xs), max(ys)
+                    rect = display_meta.rect_params[rect_idx]
+                    rect.left = int(max(0, x1))
+                    rect.top = int(max(0, y1))
+                    rect.width = int(max(1, x2 - x1))
+                    rect.height = int(max(1, y2 - y1))
+                    rect.border_width = max(2, int(round(2 * scale_up)))
+                    rect.has_bg_color = 0
+                    rect.border_color.set(*color)
+                    rect_idx += 1
+
+                _add_roi_rect(self._tapping_config.get('roi_points', []), (1.0, 0.65, 0.0, 1.0))
+                _add_roi_rect(self._deslagging_config.get('roi_points', []), (1.0, 0.0, 0.0, 1.0))
+                _add_roi_rect(self._spectro_config.get('roi_points', []), (0.0, 1.0, 1.0, 1.0))
+
+                display_meta.num_rects = rect_idx
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
         except Exception as exc:
             logger.error(f"[osd] Failed to attach brightness display meta: {exc}", exc_info=True)
+
+    def _handle_event_start(self, event, frame_rgba, white_ratio=0.0):
+        """Handle tapping start screenshot."""
+        event_type = event["type"]
+        if event_type != "tapping":
+            return
+        logger.info(f"[{event_type}] Start detected: {event['start']}")
+        self._save_annotated_screenshot(
+            frame_rgba, event, white_ratio, phase="start"
+        )
 
     def _handle_event(self, event, frame_rgba, white_ratio=0.0):
         """Handle a completed tapping/deslagging/spectro event."""
@@ -307,7 +371,7 @@ class BrightnessProcessor:
 
         # Save annotated screenshot with ROI regions and event details
         screenshot_path = self._save_annotated_screenshot(
-            frame_rgba, event, white_ratio
+            frame_rgba, event, white_ratio, phase="end"
         )
 
         # Insert melting event into database
@@ -357,13 +421,14 @@ class BrightnessProcessor:
             except Exception as e:
                 logger.error(f"Failed to push {event_type} to heat cycle manager: {e}")
 
-    def _save_annotated_screenshot(self, frame_rgba, event, white_ratio):
+    def _save_annotated_screenshot(self, frame_rgba, event, white_ratio, phase="end"):
         """Save screenshot with ROI region overlay, event details, and annotations."""
         try:
             frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
             annotated = frame_bgr.copy()
             h, w = annotated.shape[:2]
             event_type = event["type"]
+            phase = phase or event.get("phase", "end")
 
             # Pick ROI config and color per event type
             if event_type == "tapping":
@@ -394,17 +459,23 @@ class BrightnessProcessor:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, roi_color, 2)
 
             # Event title bar
-            cv2.putText(annotated, f"{event_type.upper()} EVENT END", (10, 30),
+            cv2.putText(annotated, f"{event_type.upper()} EVENT {phase.upper()}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
             # Duration
-            cv2.putText(annotated, f"Duration: {event['duration_sec']}s", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if phase == "end" and "duration_sec" in event:
+                cv2.putText(annotated, f"Duration: {event['duration_sec']}s", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             # Start/end times
-            cv2.putText(annotated,
-                       f"Start: {event['start']}  End: {event['end']}",
-                       (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            if phase == "end":
+                cv2.putText(annotated,
+                           f"Start: {event['start']}  End: {event['end']}",
+                           (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            else:
+                cv2.putText(annotated,
+                           f"Start: {event['start']}",
+                           (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             # Brightness analysis info
             cv2.putText(annotated,
@@ -417,7 +488,7 @@ class BrightnessProcessor:
 
             # Save
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{event_type}_end_{timestamp}.jpg"
+            filename = f"{event_type}_{phase}_{timestamp}.jpg"
             filepath = self.screenshot_dir / filename
             cv2.imwrite(str(filepath), annotated)
             logger.info(f"Saved {event_type} screenshot: {filename}")

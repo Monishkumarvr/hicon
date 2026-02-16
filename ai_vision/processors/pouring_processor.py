@@ -84,6 +84,8 @@ class PouringProcessor:
         self.r_merge = config.CLUSTER_R_MERGE
         self.mould_switch_min_pour = config.MOULD_SWITCH_MIN_POUR_S
         self.min_cluster_pour_s = config.MIN_CLUSTER_POUR_S
+        self.log_mould_displacement = bool(getattr(config, 'LOG_MOULD_DISPLACEMENT', False))
+        self.mould_disp_log_interval_s = float(getattr(config, 'MOULD_DISP_LOG_INTERVAL_S', 0.25))
 
         # Edge expand and tolerances
         self.edge_expand = config.EDGE_EXPAND_PX
@@ -97,6 +99,7 @@ class PouringProcessor:
         self.locked_trolley_id: Optional[int] = None
         self.locked_trolley_bbox: Optional[Tuple[int, int, int, int]] = None
         self.trolley_locked = False
+        self.relock_hold_s = 0.8
 
         # --- Session state ---
         self.session_active = False
@@ -113,6 +116,7 @@ class PouringProcessor:
         self.pour_start_datetime: Optional[datetime] = None
         self.pour_sync_id: Optional[str] = None
         self.pour_slno: Optional[int] = None
+        self.active_mould_id: Optional[int] = None  # mould id tied to current active pour record
         self.last_pour_duration: float = 0.0  # duration of last completed pour
 
         # --- Mould counter state ---
@@ -121,6 +125,7 @@ class PouringProcessor:
         self.displacement_since: Optional[float] = None  # timestamp when displacement exceeded threshold
         self.moved_positions: List[Tuple[float, float, float]] = []  # normalized (x, y) + pour duration
         self.mould_count = 0
+        self._last_mould_disp_log_ts: Optional[float] = None
 
         # --- Last known probe state (for screenshot annotations) ---
         self._last_probe_base: Optional[Tuple[int, int]] = None  # (base_x, base_y) before offsets
@@ -137,6 +142,8 @@ class PouringProcessor:
 
         # Frame counter
         self._frame_count = 0
+        self._relock_candidate_id: Optional[int] = None
+        self._relock_candidate_since: Optional[float] = None
 
         # --- DS-native inference overlay toggle (recorded post-OSD via tee branch) ---
         self.enable_inference_video = bool(getattr(config, 'ENABLE_INFERENCE_VIDEO', False))
@@ -149,6 +156,10 @@ class PouringProcessor:
         logger.info(f"  Pour timing: start={self.pour_start_dur}s, end={self.pour_end_dur}s, min={self.pour_min_dur}s")
         logger.info(f"  Mould: disp>{self.displacement_thresh}, sustained={self.sustained_dur}s, min_pour={self.mould_switch_min_pour}s")
         logger.info(f"  Mould cluster filter: min_cluster_pour={self.min_cluster_pour_s}s")
+        logger.info(
+            f"  Mould displacement logging: enabled={self.log_mould_displacement}, "
+            f"interval={self.mould_disp_log_interval_s}s"
+        )
         logger.info(f"  Edge expand: {self.edge_expand}px, Mouth missing tol: {self.mouth_missing_tol}s")
         logger.info(f"  Cycle timeout: {self.cycle_timeout}s")
         logger.info(f"  DS-native inference overlay enabled={self.enable_inference_video}")
@@ -186,19 +197,22 @@ class PouringProcessor:
             )
 
         # 2. Find the relevant trolley (locked or best candidate)
-        target_trolley = self._get_target_trolley(trolleys, timestamp)
+        target_trolley = self._get_target_trolley(trolleys, timestamp, mouths)
 
         # 3. Check mouth-in-trolley (with EDGE_EXPAND)
         mouth_in_trolley = False
         best_mouth = None
         if target_trolley and mouths:
-            best_mouth = max(mouths, key=lambda m: m['confidence'])
-            mouth_in_trolley = self._is_mouth_in_expanded_trolley(best_mouth, target_trolley)
-            # Keep latest probe base available for session/pour screenshots and OSD overlay.
-            mx, my_bottom = best_mouth['bottom_center']
-            self._last_probe_base = (mx, my_bottom + self.probe_below_px)
-            if not self.session_active:
-                self._last_probe_brightness = None
+            # IMPORTANT: choose mouth only from the target trolley expanded region.
+            # This prevents global max-confidence mouth in other areas from driving pour logic.
+            best_mouth = self._select_best_mouth_for_trolley(mouths, target_trolley)
+            mouth_in_trolley = best_mouth is not None
+            if best_mouth:
+                # Keep latest probe base available for session/pour screenshots and OSD overlay.
+                mx, my_bottom = best_mouth['bottom_center']
+                self._last_probe_base = (mx, my_bottom + self.probe_below_px)
+                if not self.session_active:
+                    self._last_probe_brightness = None
 
         # 4. Update trolley bbox (keep latest position for locked trolley)
         if target_trolley and self.trolley_locked:
@@ -214,7 +228,7 @@ class PouringProcessor:
                               mouths, trolleys, target_trolley)
 
         # 7. Mould counter (during active session)
-        if self.session_active and best_mouth and target_trolley:
+        if self.session_active and self.pour_active and best_mouth and target_trolley:
             self._update_mould_counter(best_mouth, target_trolley, timestamp)
 
         # 8. Update heat cycle ladle presence
@@ -296,7 +310,7 @@ class PouringProcessor:
     # Trolley targeting (locking)
     # =========================================================================
 
-    def _get_target_trolley(self, trolleys, timestamp=None):
+    def _get_target_trolley(self, trolleys, timestamp=None, mouths=None):
         """Get the target trolley: locked one if exists, else best candidate."""
         if not trolleys:
             return None
@@ -305,11 +319,17 @@ class PouringProcessor:
             # Find locked trolley by track_id
             for t in trolleys:
                 if t['track_id'] == self.locked_trolley_id:
+                    self._relock_candidate_id = None
+                    self._relock_candidate_since = None
                     return t
-            # Locked trolley missing — relock to best match so padding tracks current trolley
-            relock = self._select_relock_trolley(trolleys)
-            if relock:
+
+            # Locked trolley missing: relock only when candidate is stable and
+            # movement/new-trolley conditions indicate a genuine transition.
+            relock = self._select_relock_trolley(trolleys, mouths=mouths)
+            if relock and self._should_relock_trolley(relock, trolleys, timestamp or time.time()):
                 self._relock_trolley(relock, timestamp or time.time(), reason="missing_locked_id")
+                self._relock_candidate_id = None
+                self._relock_candidate_since = None
                 return relock
             return None
 
@@ -335,19 +355,67 @@ class PouringProcessor:
         denom = area_a + area_b - inter_area
         return inter_area / denom if denom > 0 else 0.0
 
-    def _select_relock_trolley(self, trolleys):
+    def _select_relock_trolley(self, trolleys, mouths=None):
         """Pick best trolley to relock when locked ID is missing."""
+        def _has_mouth_inside(trolley):
+            if not mouths:
+                return False
+            return any(self._is_mouth_in_expanded_trolley(m, trolley) for m in mouths)
+
+        # Prefer candidates that currently contain a mouth.
+        candidates = [t for t in trolleys if _has_mouth_inside(t)]
+        if not candidates:
+            # No strong relock signal in this frame.
+            return None
+
         if self.locked_trolley_bbox:
             best = None
             best_iou = -1.0
-            for t in trolleys:
+            for t in candidates:
                 iou = self._bbox_iou(self.locked_trolley_bbox, t['bbox'])
                 if iou > best_iou:
                     best_iou = iou
                     best = t
             if best is not None:
                 return best
-        return max(trolleys, key=lambda t: t['confidence'])
+        return max(candidates, key=lambda t: t['confidence'])
+
+    @staticmethod
+    def _bbox_center_distance_norm(a, b):
+        """Center distance normalized by locked bbox max dimension."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        acx = (ax1 + ax2) / 2.0
+        acy = (ay1 + ay2) / 2.0
+        bcx = (bx1 + bx2) / 2.0
+        bcy = (by1 + by2) / 2.0
+        base = max(ax2 - ax1, ay2 - ay1, 1)
+        return math.sqrt((acx - bcx) ** 2 + (acy - bcy) ** 2) / float(base)
+
+    def _should_relock_trolley(self, candidate, trolleys, timestamp):
+        """Gate relock to avoid jitter while allowing move/new trolley transitions."""
+        cid = candidate['track_id']
+        if self._relock_candidate_id != cid:
+            self._relock_candidate_id = cid
+            self._relock_candidate_since = timestamp
+            return False
+
+        if self._relock_candidate_since is None:
+            self._relock_candidate_since = timestamp
+            return False
+
+        if timestamp - self._relock_candidate_since < self.relock_hold_s:
+            return False
+
+        if not self.locked_trolley_bbox:
+            return True
+
+        iou = self._bbox_iou(self.locked_trolley_bbox, candidate['bbox'])
+        moved_norm = self._bbox_center_distance_norm(self.locked_trolley_bbox, candidate['bbox'])
+        moved = moved_norm >= self.displacement_thresh
+        same_physical = iou >= 0.25
+        new_trolley_present = len(trolleys) >= 2
+        return same_physical or moved or new_trolley_present
 
     def _relock_trolley(self, trolley, timestamp, reason=""):
         """Re-lock to a new trolley (e.g., tracker ID switched)."""
@@ -392,6 +460,24 @@ class PouringProcessor:
         # Also lock in heat cycle manager
         if self.heat_cycle_manager:
             self.heat_cycle_manager.lock_trolley(trolley['track_id'])
+
+    def _select_best_mouth_for_trolley(self, mouths, trolley):
+        """Select highest-confidence mouth inside target trolley expanded region."""
+        if not mouths or not trolley:
+            return None
+        candidates = [m for m in mouths if self._is_mouth_in_expanded_trolley(m, trolley)]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m['confidence'])
+
+    def _get_locked_trolley(self, trolleys):
+        """Return locked trolley from current detections if available."""
+        if not self.trolley_locked or self.locked_trolley_id is None or not trolleys:
+            return None
+        for trolley in trolleys:
+            if trolley['track_id'] == self.locked_trolley_id:
+                return trolley
+        return None
 
     # =========================================================================
     # Sub-system 1: Session Manager (with mouth missing tolerance)
@@ -511,7 +597,7 @@ class PouringProcessor:
                     self.brightness_above_since = timestamp
                 elif timestamp - self.brightness_above_since >= self.pour_start_dur:
                     self._start_pour(timestamp, datetime_obj, mouths, trolleys,
-                                     frame, brightness, mx, probe_y, target_trolley)
+                                     frame, brightness, mx, probe_y, target_trolley, best_mouth)
             else:
                 self.brightness_above_since = None
         else:
@@ -520,7 +606,7 @@ class PouringProcessor:
                 if self.brightness_below_since is None:
                     self.brightness_below_since = timestamp
                 elif timestamp - self.brightness_below_since >= self.pour_end_dur:
-                    self._end_pour(timestamp, datetime_obj, mouths, trolleys, frame)
+                    self._end_pour(timestamp, datetime_obj, mouths, trolleys, frame, best_mouth=best_mouth)
             else:
                 self.brightness_below_since = None
 
@@ -560,12 +646,13 @@ class PouringProcessor:
         return sum(values) / len(values) if values else 0.0
 
     def _start_pour(self, timestamp, datetime_obj, mouths, trolleys, frame,
-                    brightness, probe_x, probe_y, target_trolley):
+                    brightness, probe_x, probe_y, target_trolley, best_mouth):
         """Start a pouring event. Lock trolley on first pour."""
         self.pour_active = True
         self.pour_start_time = timestamp
         self.pour_start_datetime = datetime_obj
         self.pour_sync_id = generate_sync_id('pour')
+        self.active_mould_id = self.mould_count + 1
         self.brightness_above_since = None
         self.brightness_below_since = None
 
@@ -574,8 +661,7 @@ class PouringProcessor:
             self._lock_trolley(target_trolley, timestamp)
 
         # Set mould anchor on pour start (mouth position relative to trolley)
-        if target_trolley:
-            best_mouth = max(mouths, key=lambda m: m['confidence'])
+        if target_trolley and best_mouth:
             self._set_anchor_on_pour_start(best_mouth, target_trolley)
 
         logger.info(
@@ -608,11 +694,10 @@ class PouringProcessor:
             logger.error(f"Failed to insert pour start: {e}")
 
         # Add to heat cycle
-        if self.heat_cycle_manager:
-            best_mouth = max(mouths, key=lambda m: m['confidence'])
+        if self.heat_cycle_manager and best_mouth:
             self.heat_cycle_manager.add_pouring_to_cycle(
                 ladle_track_id=best_mouth['track_id'],
-                mould_id=f"MOULD_{self.mould_count + 1}",
+                mould_id=f"MOULD_{self.active_mould_id}",
                 mould_track_id=best_mouth['track_id'],
                 start_time=timestamp,
                 start_datetime=datetime_obj,
@@ -626,7 +711,7 @@ class PouringProcessor:
             probe_point=(probe_x, probe_y), probe_brightness=brightness
         )
 
-    def _end_pour(self, timestamp, datetime_obj, mouths, trolleys, frame):
+    def _end_pour(self, timestamp, datetime_obj, mouths, trolleys, frame, best_mouth=None):
         """End the current pouring event."""
         if not self.pour_active or self.pour_start_time is None:
             return
@@ -640,6 +725,7 @@ class PouringProcessor:
             logger.info(f"[pour] DISCARDED - duration={duration:.1f}s < {self.pour_min_dur}s minimum")
             self.pour_start_time = None
             self.pour_start_datetime = None
+            self.active_mould_id = None
             return
 
         self.last_pour_duration = duration
@@ -667,11 +753,16 @@ class PouringProcessor:
 
         # Update heat cycle
         if self.heat_cycle_manager:
-            best_mouth = max(mouths, key=lambda m: m['confidence']) if mouths else None
-            if best_mouth:
+            bm = best_mouth
+            if bm is None and mouths:
+                locked_trolley = self._get_locked_trolley(trolleys)
+                bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
+            if bm is None and mouths:
+                bm = max(mouths, key=lambda m: m['confidence'])
+            if bm:
                 self.heat_cycle_manager.update_pouring_end(
-                    ladle_track_id=best_mouth['track_id'],
-                    mould_id=f"MOULD_{self.mould_count}",
+                    ladle_track_id=bm['track_id'],
+                    mould_id=f"MOULD_{self.active_mould_id or self.mould_count}",
                     end_time=timestamp,
                     end_datetime=datetime_obj,
                     duration_seconds=duration,
@@ -689,6 +780,8 @@ class PouringProcessor:
         self.pour_start_time = None
         self.pour_start_datetime = None
         self.pour_sync_id = None
+        self.active_mould_id = None
+        self.displacement_since = None
 
     # =========================================================================
     # Sub-system 3: Mould Counter (trolley-relative anchor)
@@ -724,7 +817,30 @@ class PouringProcessor:
 
         # Displacement from anchor
         ax, ay = self.anchor_position
-        displacement = math.sqrt((norm_x - ax) ** 2 + (norm_y - ay) ** 2)
+        dx_norm = norm_x - ax
+        dy_norm = norm_y - ay
+        dx_px = dx_norm * tw
+        dy_px = dy_norm * th
+        displacement = math.sqrt(dx_norm ** 2 + dy_norm ** 2)
+
+        if self.log_mould_displacement:
+            should_log = (
+                self._last_mould_disp_log_ts is None or
+                (timestamp - self._last_mould_disp_log_ts) >= self.mould_disp_log_interval_s
+            )
+            if should_log:
+                hold_s = (timestamp - self.displacement_since) if self.displacement_since else 0.0
+                logger.info(
+                    "[mould-disp] T%s M%s dx_norm=%.4f dy_norm=%.4f dx_px=%.1f dy_px=%.1f "
+                    "mag=%.4f thr=%.4f above=%s hold=%.2fs anchor=(%.4f,%.4f) curr=(%.4f,%.4f)",
+                    trolley.get('track_id', '?'),
+                    self.active_mould_id if self.active_mould_id is not None else self.mould_count,
+                    dx_norm, dy_norm, dx_px, dy_px,
+                    displacement, self.displacement_thresh,
+                    displacement > self.displacement_thresh, hold_s,
+                    ax, ay, norm_x, norm_y
+                )
+                self._last_mould_disp_log_ts = timestamp
 
         if displacement > self.displacement_thresh:
             if self.displacement_since is None:
@@ -738,8 +854,10 @@ class PouringProcessor:
                     self.displacement_since = None
                     self._recompute_clusters()
                     logger.info(
-                        f"[mould] Displacement={displacement:.3f} sustained {self.sustained_dur}s, "
-                        f"mould_count={self.mould_count}"
+                        f"[mould] Displacement={displacement:.3f} "
+                        f"(dx_norm={dx_norm:.4f}, dy_norm={dy_norm:.4f}, "
+                        f"dx_px={dx_px:.1f}, dy_px={dy_px:.1f}) "
+                        f"sustained {self.sustained_dur}s, mould_count={self.mould_count}"
                     )
                 else:
                     logger.debug(
@@ -853,17 +971,21 @@ class PouringProcessor:
         self.pour_start_datetime = None
         self.pour_sync_id = None
         self.pour_slno = None
+        self.active_mould_id = None
         self.last_pour_duration = 0.0
         self.anchor_position = None
         self.anchor_set = False
         self.displacement_since = None
         self.moved_positions.clear()
         self.mould_count = 0
+        self._last_mould_disp_log_ts = None
         self.mouth_last_seen_in_trolley = None
         self.cycle_start_time = None
         self.cycle_start_datetime = None
         self._last_probe_base = None
         self._last_probe_brightness = None
+        self._relock_candidate_id = None
+        self._relock_candidate_since = None
         logger.info("[cycle] All state reset — ready for new pouring cycle")
 
     # =========================================================================
@@ -901,6 +1023,7 @@ class PouringProcessor:
                 tapping_events=cycle.tapping_events if cycle.tapping_events else None,
                 deslagging_events=cycle.deslagging_events if cycle.deslagging_events else None,
                 spectro_events=cycle.spectro_events if cycle.spectro_events else None,
+                pyrometer_events=cycle.pyrometer_events if cycle.pyrometer_events else None,
             )
             logger.info(
                 f"HEAT CYCLE FINALIZED: {cycle.heat_no} - "
@@ -917,7 +1040,12 @@ class PouringProcessor:
         """Derive probe base from best mouth in-frame when no measured probe is cached."""
         if not mouths:
             return None
-        best_mouth = max(mouths, key=lambda m: m['confidence'])
+        best_mouth = None
+        if self.trolley_locked and self.locked_trolley_bbox:
+            pseudo_locked = {'bbox': self.locked_trolley_bbox}
+            best_mouth = self._select_best_mouth_for_trolley(mouths, pseudo_locked)
+        if best_mouth is None:
+            best_mouth = max(mouths, key=lambda m: m['confidence'])
         mx, my_bottom = best_mouth['bottom_center']
         return (mx, my_bottom + self.probe_below_px)
 
@@ -949,6 +1077,15 @@ class PouringProcessor:
             if not display_meta:
                 return
 
+            # Scale overlay text when recording is downscaled
+            scale_up = 1.0
+            try:
+                target_w = int(getattr(self.config, "INFERENCE_VIDEO_WIDTH", 0) or 0)
+                if self._frame_w and target_w and target_w < self._frame_w:
+                    scale_up = min(3.0, self._frame_w / float(target_w))
+            except Exception:
+                scale_up = 1.0
+
             # 1) Status text block
             cycle_age = (timestamp - self.cycle_start_time) if self.cycle_start_time else 0.0
             absence = (timestamp - self.mouth_last_seen_in_trolley) if self.mouth_last_seen_in_trolley else 0.0
@@ -966,16 +1103,34 @@ class PouringProcessor:
                 f"TARGET_T:{target_tid} LOCK_T:{lock_tid} "
                 f"CYCLE_AGE:{cycle_age:.1f}s ABSENCE:{absence:.1f}s"
             )
+            # Label 0: full status line
             display_meta.num_labels = 1
             txt = display_meta.text_params[0]
             txt.display_text = text
             txt.x_offset = 10
             txt.y_offset = 20
             txt.font_params.font_name = "Serif"
-            txt.font_params.font_size = 12
+            txt.font_params.font_size = max(12, int(round(12 * scale_up)))
             txt.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
             txt.set_bg_clr = 1
             txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
+
+            # Label 1: large POURING ACTIVE banner
+            if len(display_meta.text_params) > 1:
+                display_meta.num_labels = 2
+                banner = display_meta.text_params[1]
+                banner.display_text = "POURING ACTIVE" if self.pour_active else "POURING IDLE"
+                banner.x_offset = 10
+                banner.y_offset = 20 + max(12, int(round(12 * scale_up))) + 4
+                banner.font_params.font_name = "Serif"
+                banner.font_params.font_size = max(20, int(round(20 * scale_up)))
+                if self.pour_active:
+                    banner.font_params.font_color.set(0.0, 1.0, 0.0, 1.0)
+                    banner.text_bg_clr.set(0.0, 0.2, 0.0, 0.75)
+                else:
+                    banner.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                    banner.text_bg_clr.set(0.0, 0.0, 0.0, 0.5)
+                banner.set_bg_clr = 1
 
             # 2) Probe points + expanded lock region as rectangle overlays
             rect_idx = 0
@@ -995,7 +1150,7 @@ class PouringProcessor:
                     rect.top = max(0, py - size // 2)
                     rect.width = size
                     rect.height = size
-                    rect.border_width = 1
+                    rect.border_width = max(1, int(round(1 * scale_up)))
                     rect.has_bg_color = 1
                     if probe_on:
                         rect.border_color.set(0.0, 1.0, 0.0, 1.0)
@@ -1013,7 +1168,7 @@ class PouringProcessor:
                 rect.top = int(max(0, ey1))
                 rect.width = int(max(1, x2 - x1))
                 rect.height = int(max(1, y2 - ey1))
-                rect.border_width = 1
+                rect.border_width = max(1, int(round(1 * scale_up)))
                 rect.has_bg_color = 0
                 rect.border_color.set(0.0, 1.0, 0.0, 1.0)
                 rect_idx += 1

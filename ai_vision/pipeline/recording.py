@@ -61,6 +61,18 @@ class RecordingManager:
             queue.set_property("max-size-buffers", 120)
             queue.set_property("leaky", 2)
 
+        conv = Gst.ElementFactory.make("nvvideoconvert", f"rec-conv-{sid}")
+        if not conv:
+            logger.error("nvvideoconvert not available - recording disabled")
+            return False
+
+        capsfilter = Gst.ElementFactory.make("capsfilter", f"rec-caps-{sid}")
+        if not capsfilter:
+            logger.error("capsfilter not available - recording disabled")
+            return False
+        caps = f"video/x-raw(memory:NVMM), format=NV12, width={self.target_width}, height={self.target_height}"
+        capsfilter.set_property("caps", Gst.Caps.from_string(caps))
+
         encoder = Gst.ElementFactory.make("nvjpegenc", f"rec-enc-{sid}")
         if not encoder:
             logger.error("nvjpegenc not available - recording disabled")
@@ -77,7 +89,7 @@ class RecordingManager:
         self.filesink.set_property("sync", False)
         self.filesink.set_property("async", False)
 
-        elements = [queue, encoder, muxer, self.filesink]
+        elements = [queue, conv, capsfilter, encoder, muxer, self.filesink]
 
         for el in elements:
             if not el:
@@ -85,8 +97,10 @@ class RecordingManager:
                 return False
             pipeline.add(el)
 
-        # Link: queue -> nvjpegenc -> matroskamux -> filesink
-        if not (queue.link(encoder) and
+        # Link: queue -> nvvideoconvert -> capsfilter -> nvjpegenc -> matroskamux -> filesink
+        if not (queue.link(conv) and
+                conv.link(capsfilter) and
+                capsfilter.link(encoder) and
                 encoder.link(muxer) and
                 muxer.link(self.filesink)):
             logger.error("Failed to link recording branch")

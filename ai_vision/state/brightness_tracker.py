@@ -88,6 +88,13 @@ class BrightnessTracker:
                         f"[{self.name}] ACTIVE - white_ratio={white_ratio:.3f} "
                         f"sustained for {self.start_frame_count} frames"
                     )
+                    return {
+                        "type": self.name,
+                        "phase": "start",
+                        "start": self.event_start_datetime.isoformat(),
+                        "start_wall": self.event_start_time,
+                        "start_datetime": self.event_start_datetime,
+                    }
             else:
                 self.start_counter = 0
 
@@ -120,6 +127,7 @@ class BrightnessTracker:
 
                     event = {
                         "type": self.name,
+                        "phase": "end",
                         "start": self.event_start_datetime.isoformat(),
                         "end": end_datetime.isoformat(),
                         "duration_sec": round(duration, 1),

@@ -214,20 +214,17 @@ class SyncManager:
             tapping_end = format_timestamp_for_api(cycle.get('tapping_end_time'))
             deslag_events = _parse_json_list(cycle.get('deslagging_events'))
             spectro_events = _parse_json_list(cycle.get('spectro_events'))
+            pyro_events = _parse_json_list(cycle.get('pyrometer_events'))
 
             cycle_start_iso = cycle.get('cycle_start_time')
             cycle_end_iso = cycle.get('cycle_end_time')
-            pyrometer_present = self.db.has_melting_event_type_in_window(
-                "pyrometer", cycle_start_iso, cycle_end_iso
-            )
-
             melting_items.append({
                 'sync_id': cycle['sync_id'],
                 'customer_id': cycle['customer_id'],
                 'date': cycle['date'],
                 'camera_id': cycle['camera_id'],
                 'location': cycle['location'],
-                'pyrometer': bool(pyrometer_present),
+                'pyrometer': bool(len(pyro_events) > 0),
                 'spectro': bool(len(spectro_events) > 0),
                 'furnace': self.furnace_id or "",
                 'heat_no': cycle.get('heat_no') or "",

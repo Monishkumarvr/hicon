@@ -87,6 +87,8 @@ MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15
 MOULD_SUSTAINED_DURATION = float(os.getenv('HICON_MOULD_SUSTAINED', '1.5'))
 CLUSTER_R_CLUSTER = float(os.getenv('HICON_CLUSTER_R_CLUSTER', '0.08'))
 CLUSTER_R_MERGE = float(os.getenv('HICON_CLUSTER_R_MERGE', '0.05'))
+LOG_MOULD_DISPLACEMENT = os.getenv('HICON_LOG_MOULD_DISPLACEMENT', 'false').lower() == 'true'
+MOULD_DISP_LOG_INTERVAL_S = float(os.getenv('HICON_MOULD_DISP_LOG_INTERVAL_S', '0.25'))
 
 # Trolley bbox expansion for mouth-inside check (top edge only, ladle above trolley)
 EDGE_EXPAND_PX = int(os.getenv('HICON_EDGE_EXPAND_PX', '200'))
@@ -125,8 +127,8 @@ INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))
 ENABLE_RTSP_STREAM_0 = os.getenv('HICON_ENABLE_RTSP_STREAM_0', 'true').lower() == 'true'
 ENABLE_RTSP_STREAM_1 = os.getenv('HICON_ENABLE_RTSP_STREAM_1', 'true').lower() == 'true'
 
-RTSP_STREAM_0 = os.getenv('HICON_RTSP_STREAM_0', 'rtsp://100.78.173.43:10554/mystream') if ENABLE_RTSP_STREAM_0 else ''
-RTSP_STREAM_1 = os.getenv('HICON_RTSP_STREAM_1', 'rtsp://100.78.173.43:10554/mystream1') if ENABLE_RTSP_STREAM_1 else ''
+RTSP_STREAM_0 = os.getenv('HICON_RTSP_STREAM_0', 'rtsp://100.78.173.43:8554/mystream') if ENABLE_RTSP_STREAM_0 else ''
+RTSP_STREAM_1 = os.getenv('HICON_RTSP_STREAM_1', 'rtsp://100.78.173.43:8554/mystream1') if ENABLE_RTSP_STREAM_1 else ''
 
 # RTSP connection timeout (microseconds, 0 disables)
 RTSP_TCP_TIMEOUT_US = int(os.getenv('HICON_RTSP_TCP_TIMEOUT_US', '60000000'))
@@ -259,6 +261,8 @@ def get_config_summary():
         'pouring_cycle_timeout_s': POURING_CYCLE_TIMEOUT_S,
         'mould_switch_min_pour_s': MOULD_SWITCH_MIN_POUR_S,
         'min_cluster_pour_s': MIN_CLUSTER_POUR_S,
+        'log_mould_displacement': LOG_MOULD_DISPLACEMENT,
+        'mould_disp_log_interval_s': MOULD_DISP_LOG_INTERVAL_S,
         'enable_inference_video': ENABLE_INFERENCE_VIDEO,
         'inference_video_fps': INFERENCE_VIDEO_FPS,
         'inference_video_width': INFERENCE_VIDEO_WIDTH,

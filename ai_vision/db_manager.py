@@ -103,6 +103,12 @@ class HiConDatabase:
             pouring_end_time TEXT NOT NULL,
             total_pouring_time TEXT NOT NULL,
             mould_wise_pouring_time TEXT NOT NULL,
+            tapping_start_time TEXT NOT NULL,
+            tapping_end_time TEXT NOT NULL,
+            tapping_events TEXT,
+            deslagging_events TEXT,
+            spectro_events TEXT,
+            pyrometer_events TEXT,
             synced INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         )''')
@@ -165,7 +171,7 @@ class HiConDatabase:
         conn.close()
 
     def migrate_add_heat_cycle_melting_columns(self):
-        """Add tapping/deslagging/spectro columns to heat_cycles if they don't exist."""
+        """Add tapping/deslagging/spectro/pyrometer columns to heat_cycles if they don't exist."""
         conn = self._get_connection()
         c = conn.cursor()
 
@@ -175,6 +181,7 @@ class HiConDatabase:
             ("tapping_events", "TEXT"),
             ("deslagging_events", "TEXT"),
             ("spectro_events", "TEXT"),
+            ("pyrometer_events", "TEXT"),
         ]
         for col_name, col_type in columns:
             try:
@@ -438,7 +445,8 @@ class HiConDatabase:
                          tapping_end_time: Optional[str] = None,
                          tapping_events: Optional[List] = None,
                          deslagging_events: Optional[List] = None,
-                         spectro_events: Optional[List] = None) -> str:
+                         spectro_events: Optional[List] = None,
+                         pyrometer_events: Optional[List] = None) -> str:
         """
         Insert completed heat cycle record.
 
@@ -478,19 +486,20 @@ class HiConDatabase:
             tapping_events_json = json.dumps(tapping_events) if tapping_events else None
             deslagging_events_json = json.dumps(deslagging_events) if deslagging_events else None
             spectro_events_json = json.dumps(spectro_events) if spectro_events else None
+            pyrometer_events_json = json.dumps(pyrometer_events) if pyrometer_events else None
 
             c.execute('''INSERT INTO heat_cycles
                 (sync_id, heat_no, customer_id, slno, date, shift, ladle_number,
                  location, camera_id, cycle_start_time, cycle_end_time,
                  pouring_start_time, pouring_end_time, total_pouring_time,
                  mould_wise_pouring_time, tapping_start_time, tapping_end_time,
-                 tapping_events, deslagging_events, spectro_events, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 tapping_events, deslagging_events, spectro_events, pyrometer_events, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (sync_id, heat_no, customer_id, slno, date, shift, ladle_number,
                  location, camera_id, cycle_start_time, cycle_end_time,
                  pouring_start_time, pouring_end_time, total_pouring_time,
                  mould_wise_json, tapping_start_time, tapping_end_time,
-                 tapping_events_json, deslagging_events_json, spectro_events_json,
+                 tapping_events_json, deslagging_events_json, spectro_events_json, pyrometer_events_json,
                  datetime.now().isoformat()))
             conn.commit()
             logger.info(f"Inserted heat cycle: {heat_no} (slno: {slno})")
@@ -508,7 +517,7 @@ class HiConDatabase:
                      location, camera_id, cycle_start_time, cycle_end_time,
                      pouring_start_time, pouring_end_time, total_pouring_time,
                      mould_wise_pouring_time, tapping_start_time, tapping_end_time,
-                     tapping_events, deslagging_events, spectro_events
+                     tapping_events, deslagging_events, spectro_events, pyrometer_events
                      FROM heat_cycles
                      WHERE synced = 0
                      ORDER BY created_at ASC

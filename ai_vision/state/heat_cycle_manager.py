@@ -58,6 +58,9 @@ class HeatCycle:
     # Spectro aggregation
     spectro_events: List[Dict] = field(default_factory=list)
 
+    # Pyrometer aggregation (rod events)
+    pyrometer_events: List[Dict] = field(default_factory=list)
+
     # Trolley locking for pouring cycle
     locked_trolley_id: Optional[int] = None
 
@@ -253,6 +256,25 @@ class HeatCycleManager:
         cycle.spectro_events.append(event)
         logger.info(
             f"  {cycle.heat_no}: Added spectro event ({len(cycle.spectro_events)} total), "
+            f"duration={duration:.1f}s"
+        )
+
+    def add_pyrometer_event(self, start_wall: float, start_dt: datetime,
+                            end_wall: float, end_dt: datetime, duration: float) -> None:
+        """Add a pyrometer event to the active heat cycle."""
+        if self.active_cycle is None:
+            logger.warning("Cannot add pyrometer event: no active cycle")
+            return
+
+        cycle = self.active_cycle
+        event = {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "duration_sec": duration,
+        }
+        cycle.pyrometer_events.append(event)
+        logger.info(
+            f"  {cycle.heat_no}: Added pyrometer event ({len(cycle.pyrometer_events)} total), "
             f"duration={duration:.1f}s"
         )
 
@@ -461,13 +483,14 @@ class HeatCycleManager:
 
         deslag_count = len(cycle.deslagging_events)
         spectro_count = len(cycle.spectro_events)
+        pyro_count = len(cycle.pyrometer_events)
 
         logger.info(
             f"CYCLE COMPLETE: {cycle.heat_no} - "
             f"{len(cycle.mould_pourings)} moulds, "
             f"Total: {cycle.total_pouring_time}s, "
             f"Ladle IDs: {cycle.ladle_track_ids}"
-            f"{tapping_info}, Deslagging: {deslag_count}, Spectro: {spectro_count}"
+            f"{tapping_info}, Deslagging: {deslag_count}, Spectro: {spectro_count}, Pyrometer: {pyro_count}"
         )
     
     def get_finalized_cycles(self) -> List[HeatCycle]:

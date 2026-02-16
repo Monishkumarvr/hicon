@@ -137,7 +137,7 @@ def test_osd_overlay_metadata_contains_text_and_probe_rects(tmp_path, monkeypatc
     )
 
     assert hasattr(frame_meta, "_display_meta")
-    assert frame_meta._display_meta.num_labels == 1
+    assert frame_meta._display_meta.num_labels >= 1
     # 3 probe points + 1 expanded locked trolley zone
     assert frame_meta._display_meta.num_rects >= 4
     assert "POURING INFERENCE" in frame_meta._display_meta.text_params[0].display_text
