@@ -21,12 +21,13 @@ import numpy as np
 import logging
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 import pyds
 
 from utils.utils import generate_sync_id
+from utils.screenshot import prepare_frame, add_header, add_footer, save as save_screenshot
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,23 @@ class PouringProcessor:
         self.displacement_thresh = config.MOULD_DISPLACEMENT_THRESHOLD
         self.sustained_dur = config.MOULD_SUSTAINED_DURATION
         self.r_cluster = config.CLUSTER_R_CLUSTER
+        self.r_merge_x = float(getattr(config, 'CLUSTER_R_MERGE_X', 0.08))
+        self.r_merge_y = float(getattr(config, 'CLUSTER_R_MERGE_Y', 0.08))
         self.r_merge = config.CLUSTER_R_MERGE
         self.mould_switch_min_pour = config.MOULD_SWITCH_MIN_POUR_S
         self.min_cluster_pour_s = config.MIN_CLUSTER_POUR_S
+        self.split_cooldown_s = float(getattr(config, 'MOULD_SPLIT_COOLDOWN_S', 1.5))
+        self.split_rearm_baseline_s = float(getattr(config, 'MOULD_SPLIT_REARM_BASELINE_S', 0.5))
+        self.split_dom_ratio = float(getattr(config, 'MOULD_SPLIT_DOM_RATIO', 1.35))
+        self.axis_only_min_mag = float(getattr(config, 'MOULD_AXIS_ONLY_MIN_MAG', 0.05))
+        self.split_rearm_dx_px = float(getattr(config, 'MOULD_SPLIT_REARM_DX_PX', 10.0))
+        self.split_rearm_dy_px = float(getattr(config, 'MOULD_SPLIT_REARM_DY_PX', 14.0))
+        # Pixel-based axis thresholds for split trigger (OR gate with magnitude)
+        self.split_min_dx_px = float(getattr(config, 'MOULD_SPLIT_MIN_DX_PX', 12.0))
+        self.split_min_dy_px = float(getattr(config, 'MOULD_SPLIT_MIN_DY_PX', 12.0))
         self.log_mould_displacement = bool(getattr(config, 'LOG_MOULD_DISPLACEMENT', False))
         self.mould_disp_log_interval_s = float(getattr(config, 'MOULD_DISP_LOG_INTERVAL_S', 0.25))
+        self.fps = getattr(config, 'RTSP_FPS', 25.0)
 
         # Edge expand and tolerances
         self.edge_expand = config.EDGE_EXPAND_PX
@@ -117,14 +130,26 @@ class PouringProcessor:
         self.pour_sync_id: Optional[str] = None
         self.pour_slno: Optional[int] = None
         self.active_mould_id: Optional[int] = None  # mould id tied to current active pour record
+        self.active_mould_start_time: Optional[float] = None
+        self.active_mould_start_datetime: Optional[datetime] = None
+        self.active_mould_start_norm: Optional[Tuple[float, float]] = None
         self.last_pour_duration: float = 0.0  # duration of last completed pour
 
         # --- Mould counter state ---
         self.anchor_position: Optional[Tuple[float, float]] = None  # normalized mouth pos (trolley-relative)
         self.anchor_set = False  # anchor set on pour start
-        self.displacement_since: Optional[float] = None  # timestamp when displacement exceeded threshold
+        self.displacement_hold_frames: Optional[int] = None  # frame counter for sustained displacement
+        self.sustained_hold_frames = int(round(self.sustained_dur * self.fps))  # Convert 1.5s to frames (~30 frames at 20fps)
+        # Direction consistency guard for split hold
+        self.split_hold_quadrant: Optional[int] = None  # 1, 2, 3, or 4
+        self.split_rearm_required: bool = False
+        self.split_rearm_below_since: Optional[float] = None
+        self.split_rearm_axis: Optional[str] = None  # 'x' or 'y'
         self.moved_positions: List[Tuple[float, float, float]] = []  # normalized (x, y) + pour duration
-        self.mould_count = 0
+        self.mould_count = 0  # monotonic accepted mould count
+        self.clustered_mould_count = 0  # spatial validation metric only
+        self.next_mould_id = 1
+        self.last_split_time: Optional[float] = None
         self._last_mould_disp_log_ts: Optional[float] = None
 
         # --- Last known probe state (for screenshot annotations) ---
@@ -148,6 +173,11 @@ class PouringProcessor:
         # --- DS-native inference overlay toggle (recorded post-OSD via tee branch) ---
         self.enable_inference_video = bool(getattr(config, 'ENABLE_INFERENCE_VIDEO', False))
 
+        # --- Per-mould timing tracker (for live overlay) ---
+        self.mould_completed_times = {}  # mould_id → total frames accumulated
+        self.mould_records: List[Dict[str, Any]] = []  # accepted moulds with timing/axis/cluster metadata
+        self._pour_start_time_wall = None  # Wall-clock timestamp for live overlay display
+
         logger.info("PouringProcessor initialized (aligned with standalone doc)")
         logger.info(f"  Mouth conf: {self.mouth_conf}, Trolley conf: {self.trolley_conf}")
         logger.info(f"  Session: start={self.session_start_dur}s, end={self.session_end_dur}s")
@@ -155,7 +185,16 @@ class PouringProcessor:
         logger.info(f"  Pour brightness: start>{self.brightness_start}, end<{self.brightness_end}")
         logger.info(f"  Pour timing: start={self.pour_start_dur}s, end={self.pour_end_dur}s, min={self.pour_min_dur}s")
         logger.info(f"  Mould: disp>{self.displacement_thresh}, sustained={self.sustained_dur}s, min_pour={self.mould_switch_min_pour}s")
-        logger.info(f"  Mould cluster filter: min_cluster_pour={self.min_cluster_pour_s}s")
+        logger.info(
+            f"  Clustering: r_cluster={self.r_cluster:.3f}, r_merge_x={self.r_merge_x:.3f}, "
+            f"r_merge_y={self.r_merge_y:.3f}, min_cluster_pour={self.min_cluster_pour_s}s"
+        )
+        logger.info(
+            f"  Split gates: min_dx_px={self.split_min_dx_px:.1f}, min_dy_px={self.split_min_dy_px:.1f}, "
+            f"dom_ratio={self.split_dom_ratio:.2f}, axis_only_min_mag={self.axis_only_min_mag:.3f}, "
+            f"rearm_dx_px={self.split_rearm_dx_px:.1f}, rearm_dy_px={self.split_rearm_dy_px:.1f}, "
+            f"rearm_baseline={self.split_rearm_baseline_s:.2f}s, cooldown={self.split_cooldown_s:.2f}s"
+        )
         logger.info(
             f"  Mould displacement logging: enabled={self.log_mould_displacement}, "
             f"interval={self.mould_disp_log_interval_s}s"
@@ -229,7 +268,7 @@ class PouringProcessor:
 
         # 7. Mould counter (during active session)
         if self.session_active and self.pour_active and best_mouth and target_trolley:
-            self._update_mould_counter(best_mouth, target_trolley, timestamp)
+            self._update_mould_counter(best_mouth, target_trolley, timestamp, datetime_obj)
 
         # 8. Update heat cycle ladle presence
         if self.heat_cycle_manager and mouths:
@@ -645,14 +684,114 @@ class PouringProcessor:
 
         return sum(values) / len(values) if values else 0.0
 
+    @staticmethod
+    def _dominant_axis(dx_px: float, dy_px: float) -> str:
+        """Return dominant displacement axis label for split diagnostics."""
+        adx = abs(dx_px)
+        ady = abs(dy_px)
+        if adx > ady:
+            return "x"
+        if ady > adx:
+            return "y"
+        return "xy"
+
+    def _open_active_mould(self, timestamp, datetime_obj, mouth, trolley=None):
+        """Start a new active mould slot with a monotonic ID."""
+        self.active_mould_id = self.next_mould_id
+        self.next_mould_id += 1
+        self.active_mould_start_time = timestamp
+        self.active_mould_start_datetime = datetime_obj
+        self.active_mould_start_norm = None
+        if mouth is not None and trolley is not None:
+            try:
+                norm_x, norm_y, _, _ = self._normalize_mouth_position(mouth, trolley)
+                self.active_mould_start_norm = (norm_x, norm_y)
+            except Exception:
+                self.active_mould_start_norm = None
+
+        if self.heat_cycle_manager and mouth:
+            self.heat_cycle_manager.add_pouring_to_cycle(
+                ladle_track_id=mouth['track_id'],
+                mould_id=f"MOULD_{self.active_mould_id}",
+                mould_track_id=mouth['track_id'],
+                start_time=timestamp,
+                start_datetime=datetime_obj,
+                sync_id=self.pour_sync_id or "",
+                slno=self.pour_slno or 0,
+            )
+
+    def _close_active_mould(
+        self,
+        timestamp,
+        datetime_obj,
+        mouth,
+        min_duration_s,
+        close_axis: str = "end",
+        split_dx_px: float = 0.0,
+        split_dy_px: float = 0.0,
+        trolley=None,
+    ):
+        """Finalize current active mould if it meets duration criteria."""
+        if self.active_mould_id is None or self.active_mould_start_time is None:
+            return None
+
+        duration = max(0.0, timestamp - self.active_mould_start_time)
+        if duration < float(min_duration_s):
+            return None
+
+        mould_slot_id = self.active_mould_id
+        self.mould_count += 1
+
+        end_norm = None
+        if mouth is not None and trolley is not None:
+            try:
+                norm_x, norm_y, _, _ = self._normalize_mouth_position(mouth, trolley)
+                end_norm = (norm_x, norm_y)
+            except Exception:
+                end_norm = None
+        rep_norm = end_norm or self.active_mould_start_norm
+
+        mould_record = {
+            "mould_no": self.mould_count,
+            "slot_id": mould_slot_id,
+            "start_iso": self.active_mould_start_datetime.isoformat() if self.active_mould_start_datetime else "",
+            "end_iso": datetime_obj.isoformat(),
+            "duration_s": float(duration),
+            "split_axis": close_axis,
+            "split_dx_px": float(split_dx_px),
+            "split_dy_px": float(split_dy_px),
+            "start_norm": self.active_mould_start_norm,
+            "end_norm": end_norm,
+            "rep_norm": rep_norm,
+            "cluster_id": None,
+        }
+        self.mould_records.append(mould_record)
+
+        if self.heat_cycle_manager and mouth:
+            self.heat_cycle_manager.update_pouring_end(
+                ladle_track_id=mouth['track_id'],
+                mould_id=f"MOULD_{mould_slot_id}",
+                end_time=timestamp,
+                end_datetime=datetime_obj,
+                duration_seconds=duration,
+            )
+
+        self.mould_completed_times[self.mould_count] = int(max(1, round(duration * self.fps)))
+        self._recompute_clusters()
+        return mould_record
+
     def _start_pour(self, timestamp, datetime_obj, mouths, trolleys, frame,
                     brightness, probe_x, probe_y, target_trolley, best_mouth):
         """Start a pouring event. Lock trolley on first pour."""
         self.pour_active = True
         self.pour_start_time = timestamp
         self.pour_start_datetime = datetime_obj
+        self._pour_start_time_wall = timestamp  # For live overlay display
         self.pour_sync_id = generate_sync_id('pour')
-        self.active_mould_id = self.mould_count + 1
+        self.active_mould_id = None
+        self.active_mould_start_time = None
+        self.active_mould_start_datetime = None
+        self.active_mould_start_norm = None
         self.brightness_above_since = None
         self.brightness_below_since = None
 
@@ -693,17 +832,14 @@ class PouringProcessor:
         except Exception as e:
             logger.error(f"Failed to insert pour start: {e}")
 
-        # Add to heat cycle
-        if self.heat_cycle_manager and best_mouth:
-            self.heat_cycle_manager.add_pouring_to_cycle(
-                ladle_track_id=best_mouth['track_id'],
-                mould_id=f"MOULD_{self.active_mould_id}",
-                mould_track_id=best_mouth['track_id'],
-                start_time=timestamp,
-                start_datetime=datetime_obj,
-                sync_id=self.pour_sync_id,
-                slno=self.pour_slno or 0,
-            )
+        # Start active mould slot for this pour.
+        bm = best_mouth
+        if bm is None and mouths:
+            locked_trolley = self._get_locked_trolley(trolleys)
+            bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
+        if bm is None and mouths:
+            bm = max(mouths, key=lambda m: m['confidence'])
+        self._open_active_mould(timestamp, datetime_obj, bm, target_trolley)
 
         # Screenshot
         self._save_event_screenshot(
@@ -726,21 +862,78 @@ class PouringProcessor:
             self.pour_start_time = None
             self.pour_start_datetime = None
             self.active_mould_id = None
+            self.active_mould_start_time = None
+            self.active_mould_start_datetime = None
+            self.active_mould_start_norm = None
+            self.displacement_hold_frames = None
+            self.split_hold_quadrant = None
+            self.split_rearm_required = False
+            self.split_rearm_below_since = None
+            self.split_rearm_axis = None
             return
 
         self.last_pour_duration = duration
-        # Count this as a mould (first mould doesn't need move validation)
-        if self.mould_count == 0:
-            self.mould_count = 1
-            logger.info(f"[mould] First mould counted (pour duration={duration:.1f}s)")
+
+        bm = best_mouth
+        if bm is None and mouths:
+            locked_trolley = self._get_locked_trolley(trolleys)
+            bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
+        if bm is None and mouths:
+            bm = max(mouths, key=lambda m: m['confidence'])
+
+        locked_trolley = self._get_locked_trolley(trolleys)
+
+        # Finalize current active mould on pour end.
+        closed = self._close_active_mould(
+            timestamp=timestamp,
+            datetime_obj=datetime_obj,
+            mouth=bm,
+            min_duration_s=self.pour_min_dur,
+            close_axis="end",
+            split_dx_px=0.0,
+            split_dy_px=0.0,
+            trolley=locked_trolley,
+        )
+        if not closed:
+            if self.active_mould_start_time is not None:
+                age = timestamp - self.active_mould_start_time
+                logger.info(
+                    f"[mould] Skip finalization at pour end: active_mould={self.active_mould_id}, "
+                    f"duration={age:.1f}s"
+                )
+            else:
+                logger.info(
+                    f"[mould] Skip finalization at pour end: active_mould={self.active_mould_id}, no start"
+                )
+        else:
+            cluster_txt = f"C{closed['cluster_id']}" if closed.get('cluster_id') else "C-"
+            logger.info(
+                "[mould] Mould #%s completed: %.1fs | %s | axis=%s",
+                closed.get("mould_no"),
+                float(closed.get("duration_s", 0.0)),
+                cluster_txt,
+                str(closed.get("split_axis", "-")).upper(),
+            )
 
         logger.info(f"[pour] END - duration={duration:.1f}s, moulds={self.mould_count}")
+        for rec in self._get_mould_breakdown():
+            cluster_txt = f"C{rec['cluster_id']}" if rec.get("cluster_id") is not None else "C-"
+            logger.info(
+                "[mould-summary] M#%s %s axis=%s duration=%.1fs",
+                rec.get("mould_no"),
+                cluster_txt,
+                str(rec.get("axis", "-")).upper(),
+                float(rec.get("duration_s", 0.0)),
+            )
+        self._pour_start_time_wall = None  # Clear for next pour
 
         # DB update
         try:
             mould_wise = {
                 "mould_count": self.mould_count,
+                "clustered_mould_count": self.clustered_mould_count,
                 "last_pour_duration": round(duration, 1),
+                "moulds": self._get_mould_breakdown(),
             }
             self.db_manager.update_pouring_end(
                 sync_id=self.pour_sync_id,
@@ -750,23 +943,6 @@ class PouringProcessor:
             )
         except Exception as e:
             logger.error(f"Failed to update pour end: {e}")
-
-        # Update heat cycle
-        if self.heat_cycle_manager:
-            bm = best_mouth
-            if bm is None and mouths:
-                locked_trolley = self._get_locked_trolley(trolleys)
-                bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
-            if bm is None and mouths:
-                bm = max(mouths, key=lambda m: m['confidence'])
-            if bm:
-                self.heat_cycle_manager.update_pouring_end(
-                    ladle_track_id=bm['track_id'],
-                    mould_id=f"MOULD_{self.active_mould_id or self.mould_count}",
-                    end_time=timestamp,
-                    end_datetime=datetime_obj,
-                    duration_seconds=duration,
-                )
 
         # Screenshot (include last known probe points)
         probe_base = self._last_probe_base or self._get_probe_base_from_mouths(mouths)
@@ -781,39 +957,58 @@ class PouringProcessor:
         self.pour_start_datetime = None
         self.pour_sync_id = None
         self.active_mould_id = None
-        self.displacement_since = None
+        self.active_mould_start_time = None
+        self.active_mould_start_datetime = None
+        self.active_mould_start_norm = None
+        self.displacement_hold_frames = None
+        self.split_hold_quadrant = None
+        self.split_rearm_required = False
+        self.split_rearm_below_since = None
+        self.split_rearm_axis = None
 
     # =========================================================================
     # Sub-system 3: Mould Counter (trolley-relative anchor)
     # =========================================================================
 
-    def _set_anchor_on_pour_start(self, mouth, trolley):
-        """Set mould anchor = mouth position normalized to trolley dimensions."""
-        mx, my = mouth['center']
+    def _get_mould_norm_bbox(self, trolley):
+        """Normalization bbox aligned with mouth-in-expanded-trolley geometry."""
         tx1, ty1, tx2, ty2 = trolley['bbox']
+        ey1 = max(0, ty1 - self.edge_expand)
+        return tx1, ey1, tx2, ty2
+
+    def _normalize_mouth_position(self, mouth, trolley):
+        """Normalize mouth center to [0,1] in the expanded trolley coordinate space."""
+        mx, my = mouth['center']
+        tx1, ty1, tx2, ty2 = self._get_mould_norm_bbox(trolley)
         tw = max(tx2 - tx1, 1)
         th = max(ty2 - ty1, 1)
-
-        # Normalize to trolley-relative coordinates
         norm_x = (mx - tx1) / tw
         norm_y = (my - ty1) / th
+        return (
+            max(0.0, min(1.0, norm_x)),
+            max(0.0, min(1.0, norm_y)),
+            tw,
+            th,
+        )
 
+    def _set_anchor_on_pour_start(self, mouth, trolley):
+        """Set mould anchor = mouth position normalized to expanded trolley dimensions."""
+        norm_x, norm_y, _, _ = self._normalize_mouth_position(mouth, trolley)
         self.anchor_position = (norm_x, norm_y)
         self.anchor_set = True
-        self.displacement_since = None
+        self.displacement_hold_frames = None
+        self.split_hold_quadrant = None
+        self.split_rearm_required = False
+        self.split_rearm_below_since = None
+        self.split_rearm_axis = None
 
-    def _update_mould_counter(self, mouth, trolley, timestamp):
+    def _update_mould_counter(self, mouth, trolley, timestamp, datetime_obj):
         """Track mouth-position displacement relative to trolley for mould counting."""
         if not self.anchor_set or self.anchor_position is None:
             return
 
         # Current mouth position normalized to trolley
-        mx, my = mouth['center']
-        tx1, ty1, tx2, ty2 = trolley['bbox']
-        tw = max(tx2 - tx1, 1)
-        th = max(ty2 - ty1, 1)
-        norm_x = (mx - tx1) / tw
-        norm_y = (my - ty1) / th
+        norm_x, norm_y, tw, th = self._normalize_mouth_position(mouth, trolley)
 
         # Displacement from anchor
         ax, ay = self.anchor_position
@@ -823,108 +1018,274 @@ class PouringProcessor:
         dy_px = dy_norm * th
         displacement = math.sqrt(dx_norm ** 2 + dy_norm ** 2)
 
+        abs_dx = abs(dx_px)
+        abs_dy = abs(dy_px)
+        dominant_axis = 'x' if abs_dx >= abs_dy else 'y'
+        dominant_px = max(abs_dx, abs_dy)
+        secondary_px = min(abs_dx, abs_dy)
+        dominance_ratio = dominant_px / max(secondary_px, 1e-3)
+        dominance_ok = dominance_ratio >= self.split_dom_ratio
+
+        # Axis-dominant hybrid logic: magnitude OR dominant-axis-qualified axis-only trigger
+        mag_ok = displacement >= self.displacement_thresh
+        axis_dx_ok = abs_dx >= self.split_min_dx_px
+        axis_dy_ok = abs_dy >= self.split_min_dy_px
+        axis_dom_ok = axis_dx_ok if dominant_axis == 'x' else axis_dy_ok
+        axis_only_ok = axis_dom_ok and dominance_ok and (displacement >= self.axis_only_min_mag)
+        split_candidate = mag_ok or axis_only_ok
+
+        below_dx = abs_dx < self.split_min_dx_px
+        below_dy = abs_dy < self.split_min_dy_px
+        below_both = below_dx and below_dy
+        rearm_below_ok = below_both
+
+        in_cooldown = self.last_split_time is not None and (timestamp - self.last_split_time) < self.split_cooldown_s
+
+        # Re-arm gate: after a split, require baseline return on the split axis.
+        if self.split_rearm_required:
+            if self.split_rearm_axis == 'x':
+                rearm_below_ok = abs_dx < self.split_rearm_dx_px
+            elif self.split_rearm_axis == 'y':
+                rearm_below_ok = abs_dy < self.split_rearm_dy_px
+            else:
+                rearm_below_ok = below_both
+
+            if rearm_below_ok:
+                if self.split_rearm_below_since is None:
+                    self.split_rearm_below_since = timestamp
+                elif (timestamp - self.split_rearm_below_since) >= self.split_rearm_baseline_s:
+                    self.split_rearm_required = False
+                    self.split_rearm_below_since = None
+                    self.split_rearm_axis = None
+            else:
+                self.split_rearm_below_since = None
+
+        rearm_below_s = (
+            (timestamp - self.split_rearm_below_since)
+            if self.split_rearm_below_since is not None else 0.0
+        )
+        if self.split_rearm_required:
+            split_candidate = False
+            self.displacement_hold_frames = None
+            self.split_hold_quadrant = None
+
         if self.log_mould_displacement:
             should_log = (
                 self._last_mould_disp_log_ts is None or
                 (timestamp - self._last_mould_disp_log_ts) >= self.mould_disp_log_interval_s
             )
             if should_log:
-                hold_s = (timestamp - self.displacement_since) if self.displacement_since else 0.0
+                hold_frames = self.displacement_hold_frames if self.displacement_hold_frames is not None else 0
+                hold_quadrant_str = f"Q{self.split_hold_quadrant}" if self.split_hold_quadrant else 'None'
                 logger.info(
                     "[mould-disp] T%s M%s dx_norm=%.4f dy_norm=%.4f dx_px=%.1f dy_px=%.1f "
-                    "mag=%.4f thr=%.4f above=%s hold=%.2fs anchor=(%.4f,%.4f) curr=(%.4f,%.4f)",
+                    "mag=%.4f thr=%.4f mag_ok=%s axis_dx_ok=%s axis_dy_ok=%s axis_only_ok=%s candidate=%s "
+                    "hold_quadrant=%s cooldown=%s rearm_required=%s rearm_below_s=%.2f "
+                    "below_both=%s rearm_axis=%s rearm_below_ok=%s dominant_axis=%s dominance_ratio=%.2f hold=%d frames "
+                    "anchor=(%.4f,%.4f) curr=(%.4f,%.4f)",
                     trolley.get('track_id', '?'),
                     self.active_mould_id if self.active_mould_id is not None else self.mould_count,
                     dx_norm, dy_norm, dx_px, dy_px,
                     displacement, self.displacement_thresh,
-                    displacement > self.displacement_thresh, hold_s,
+                    mag_ok, axis_dx_ok, axis_dy_ok, axis_only_ok, split_candidate,
+                    hold_quadrant_str,
+                    in_cooldown, self.split_rearm_required, rearm_below_s, below_both,
+                    self.split_rearm_axis or 'None', rearm_below_ok, dominant_axis, dominance_ratio, hold_frames,
                     ax, ay, norm_x, norm_y
                 )
                 self._last_mould_disp_log_ts = timestamp
 
-        if displacement > self.displacement_thresh:
-            if self.displacement_since is None:
-                self.displacement_since = timestamp
-            elif timestamp - self.displacement_since >= self.sustained_dur:
-                # Mould switch validation: requires last pour >= min duration
-                if self.mould_count == 0 or self.last_pour_duration >= self.mould_switch_min_pour:
-                    # Record move, update anchor, increment mould count
-                    self.moved_positions.append((norm_x, norm_y, self.last_pour_duration))
+        if in_cooldown:
+            self.displacement_hold_frames = None
+            self.split_hold_quadrant = None
+            return
+
+        # Direction consistency guard for split hold (quadrant-based)
+        if split_candidate:
+            # Determine quadrant based on dx and dy signs
+            if dx_px >= 0 and dy_px >= 0:
+                current_quadrant = 1  # Right-up
+            elif dx_px < 0 and dy_px >= 0:
+                current_quadrant = 2  # Left-up
+            elif dx_px < 0 and dy_px < 0:
+                current_quadrant = 3  # Left-down
+            else:  # dx_px >= 0 and dy_px < 0
+                current_quadrant = 4  # Right-down
+
+            # Check quadrant consistency
+            if self.split_hold_quadrant is None:
+                # First frame of new hold sequence
+                self.split_hold_quadrant = current_quadrant
+                self.displacement_hold_frames = 0
+            elif self.split_hold_quadrant == current_quadrant:
+                # Same quadrant, increment hold (allows axis transitions within quadrant)
+                self.displacement_hold_frames += 1
+            else:
+                # Quadrant changed (direction reversal), reset hold
+                logger.debug(
+                    f"[mould] Direction reversal: Q{self.split_hold_quadrant} → Q{current_quadrant}, hold reset"
+                )
+                self.split_hold_quadrant = current_quadrant
+                self.displacement_hold_frames = 0
+        else:
+            # Not a split candidate, reset all hold state
+            self.split_hold_quadrant = None
+            self.displacement_hold_frames = None
+
+        # Check if sustained hold threshold reached
+        if self.displacement_hold_frames is not None and self.displacement_hold_frames >= self.sustained_hold_frames:
+            # Mould switch validation: active mould must be mature enough.
+            active_mould_age = (
+                timestamp - self.active_mould_start_time
+                if self.active_mould_start_time is not None else 0.0
+            )
+            if active_mould_age >= self.mould_switch_min_pour:
+                    split_axis = self._dominant_axis(dx_px, dy_px)
+                    # Close current mould, then open next mould slot.
+                    closed = self._close_active_mould(
+                        timestamp=timestamp,
+                        datetime_obj=datetime_obj,
+                        mouth=mouth,
+                        min_duration_s=self.mould_switch_min_pour,
+                        close_axis=split_axis,
+                        split_dx_px=dx_px,
+                        split_dy_px=dy_px,
+                        trolley=trolley,
+                    )
+                    if not closed:
+                        self.displacement_hold_frames = None
+                        self.split_hold_quadrant = None
+                        self.split_rearm_axis = None
+                        return
+                    self._open_active_mould(timestamp, datetime_obj, mouth, trolley)
+                    self.moved_positions.append((norm_x, norm_y, active_mould_age))
                     self.anchor_position = (norm_x, norm_y)
-                    self.displacement_since = None
-                    self._recompute_clusters()
+                    self.last_split_time = timestamp
+                    self.split_rearm_required = True
+                    self.split_rearm_below_since = None
+                    self.split_rearm_axis = split_axis
+
+                    cluster_txt = f"C{closed['cluster_id']}" if closed.get('cluster_id') else "C-"
+
                     logger.info(
                         f"[mould] Displacement={displacement:.3f} "
                         f"(dx_norm={dx_norm:.4f}, dy_norm={dy_norm:.4f}, "
-                        f"dx_px={dx_px:.1f}, dy_px={dy_px:.1f}) "
-                        f"sustained {self.sustained_dur}s, mould_count={self.mould_count}"
+                        f"dx_px={dx_px:.1f}, dy_px={dy_px:.1f}) sustained {self.sustained_hold_frames} frames, "
+                        f"axis={split_axis.upper()}, closed=M{closed.get('mould_no')}({cluster_txt}) "
+                        f"duration={float(closed.get('duration_s', 0.0)):.1f}s, "
+                        f"total={self.mould_count}"
                     )
-                else:
-                    logger.debug(
-                        f"[mould] Displacement={displacement:.3f} but last_pour={self.last_pour_duration:.1f}s "
-                        f"< min {self.mould_switch_min_pour}s — ignoring"
-                    )
-                    self.displacement_since = None
-        else:
-            self.displacement_since = None
+                    self.displacement_hold_frames = None
+                    self.split_hold_quadrant = None
+            else:
+                logger.debug(
+                    f"[mould] Displacement={displacement:.3f} but active_mould_age={active_mould_age:.1f}s "
+                    f"< min {self.mould_switch_min_pour}s — ignoring"
+                )
+                self.displacement_hold_frames = None
+                self.split_hold_quadrant = None
+                self.split_rearm_required = False
+                self.split_rearm_below_since = None
+                self.split_rearm_axis = None
 
     def _recompute_clusters(self):
-        """Agglomerative clustering of moved positions to count moulds."""
-        if not self.moved_positions:
-            # mould_count stays as-is (at least 1 from first pour)
+        """Cluster accepted mould records and assign per-mould cluster IDs."""
+        for rec in self.mould_records:
+            rec["cluster_id"] = None
+
+        points = []
+        for idx, rec in enumerate(self.mould_records):
+            rep = rec.get("rep_norm")
+            if not rep:
+                continue
+            points.append(
+                {
+                    "idx": idx,
+                    "x": float(rep[0]),
+                    "y": float(rep[1]),
+                    "duration_s": float(rec.get("duration_s", 0.0)),
+                }
+            )
+
+        if not points:
+            self.clustered_mould_count = 0
             return
 
-        # Simple agglomerative clustering
-        clusters = [[pos] for pos in self.moved_positions]
-
-        # Assign to clusters
-        final_clusters = []
-        for points in clusters:
-            pos = points[0]
+        # Agglomerative assignment around cluster centroids.
+        clusters: List[List[Dict[str, Any]]] = []
+        for p in points:
             assigned = False
-            for cluster in final_clusters:
-                cx = sum(p[0] for p in cluster) / len(cluster)
-                cy = sum(p[1] for p in cluster) / len(cluster)
-                dist = math.sqrt((pos[0] - cx) ** 2 + (pos[1] - cy) ** 2)
+            for cluster in clusters:
+                cx = sum(item["x"] for item in cluster) / len(cluster)
+                cy = sum(item["y"] for item in cluster) / len(cluster)
+                dist = math.sqrt((p["x"] - cx) ** 2 + (p["y"] - cy) ** 2)
                 if dist < self.r_cluster:
-                    cluster.append(pos)
+                    cluster.append(p)
                     assigned = True
                     break
             if not assigned:
-                final_clusters.append([pos])
+                clusters.append([p])
 
-        # Merge nearby clusters
+        # Merge nearby clusters using axis-aware rectangular bounds.
         merged = True
         while merged:
             merged = False
             i = 0
-            while i < len(final_clusters):
+            while i < len(clusters):
                 j = i + 1
-                while j < len(final_clusters):
-                    ci = final_clusters[i]
-                    cj = final_clusters[j]
-                    cx_i = sum(p[0] for p in ci) / len(ci)
-                    cy_i = sum(p[1] for p in ci) / len(ci)
-                    cx_j = sum(p[0] for p in cj) / len(cj)
-                    cy_j = sum(p[1] for p in cj) / len(cj)
-                    dist = math.sqrt((cx_i - cx_j) ** 2 + (cy_i - cy_j) ** 2)
-                    if dist < self.r_merge:
-                        final_clusters[i].extend(final_clusters[j])
-                        final_clusters.pop(j)
+                while j < len(clusters):
+                    ci = clusters[i]
+                    cj = clusters[j]
+                    cx_i = sum(item["x"] for item in ci) / len(ci)
+                    cy_i = sum(item["y"] for item in ci) / len(ci)
+                    cx_j = sum(item["x"] for item in cj) / len(cj)
+                    cy_j = sum(item["y"] for item in cj) / len(cj)
+                    dx = abs(cx_i - cx_j)
+                    dy = abs(cy_i - cy_j)
+                    if dx < self.r_merge_x and dy < self.r_merge_y:
+                        clusters[i].extend(clusters[j])
+                        clusters.pop(j)
                         merged = True
                     else:
                         j += 1
                 i += 1
 
-        # Reference parity: discard clusters with too little cumulative pour time
-        kept_clusters = []
-        for cluster in final_clusters:
-            total_cluster_pour = sum(float(p[2] or 0.0) for p in cluster)
+        # Filter tiny clusters by cumulative duration.
+        kept_clusters: List[List[Dict[str, Any]]] = []
+        for cluster in clusters:
+            total_cluster_pour = sum(item["duration_s"] for item in cluster)
             if total_cluster_pour >= self.min_cluster_pour_s:
                 kept_clusters.append(cluster)
 
-        # +1 because first mould is counted on first pour (before any displacement)
-        self.mould_count = len(kept_clusters) + 1
+        for cid, cluster in enumerate(kept_clusters, start=1):
+            for item in cluster:
+                self.mould_records[item["idx"]]["cluster_id"] = cid
+
+        self.clustered_mould_count = len(kept_clusters)
+
+    # =========================================================================
+    # Canonical Merge Helper Methods
+    # =========================================================================
+
+    def _get_mould_breakdown(self):
+        """Return per-mould timings with cluster and split-axis attribution."""
+        breakdown = []
+        for rec in self.mould_records:
+            cluster = rec.get("cluster_id")
+            breakdown.append(
+                {
+                    "mould_no": int(rec.get("mould_no", 0)),
+                    "mould_slot_id": int(rec.get("slot_id", 0)),
+                    "cluster_id": int(cluster) if cluster is not None else None,
+                    "axis": str(rec.get("split_axis", "")),
+                    "duration_s": round(float(rec.get("duration_s", 0.0)), 2),
+                    "start": rec.get("start_iso", ""),
+                    "end": rec.get("end_iso", ""),
+                    "split_dx_px": round(float(rec.get("split_dx_px", 0.0)), 1),
+                    "split_dy_px": round(float(rec.get("split_dy_px", 0.0)), 1),
+                }
+            )
+        return breakdown
 
     # =========================================================================
     # Pouring Cycle Timeout (5 min)
@@ -972,12 +1333,24 @@ class PouringProcessor:
         self.pour_sync_id = None
         self.pour_slno = None
         self.active_mould_id = None
+        self.active_mould_start_time = None
+        self.active_mould_start_datetime = None
+        self.active_mould_start_norm = None
         self.last_pour_duration = 0.0
         self.anchor_position = None
         self.anchor_set = False
-        self.displacement_since = None
+        self.displacement_hold_frames = None
+        self.split_hold_quadrant = None
+        self.split_rearm_required = False
+        self.split_rearm_below_since = None
+        self.split_rearm_axis = None
         self.moved_positions.clear()
+        self.mould_records.clear()
+        self.mould_completed_times.clear()
         self.mould_count = 0
+        self.clustered_mould_count = 0
+        self.next_mould_id = 1
+        self.last_split_time = None
         self._last_mould_disp_log_ts = None
         self.mouth_last_seen_in_trolley = None
         self.cycle_start_time = None
@@ -1071,7 +1444,7 @@ class PouringProcessor:
 
     def _add_inference_display_meta(self, batch_meta, frame_meta, mouths, trolleys,
                                     target_trolley, timestamp, datetime_obj):
-        """Attach custom probe/state overlays that nvosd renders on Stream 0."""
+        """Attach 2-line technical status + clean per-mould panel overlay (nvosd)."""
         try:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
@@ -1082,85 +1455,147 @@ class PouringProcessor:
             try:
                 target_w = int(getattr(self.config, "INFERENCE_VIDEO_WIDTH", 0) or 0)
                 if self._frame_w and target_w and target_w < self._frame_w:
-                    scale_up = min(3.0, self._frame_w / float(target_w))
+                    scale_up = min(2.5, self._frame_w / float(target_w))
             except Exception:
                 scale_up = 1.0
 
-            # 1) Status text block
+            frame_w = int(getattr(frame_meta, "source_frame_width", 0) or self._frame_w or 1280)
+            frame_h = int(getattr(frame_meta, "source_frame_height", 0) or self._frame_h or 720)
+
             cycle_age = (timestamp - self.cycle_start_time) if self.cycle_start_time else 0.0
             absence = (timestamp - self.mouth_last_seen_in_trolley) if self.mouth_last_seen_in_trolley else 0.0
             target_tid = target_trolley['track_id'] if target_trolley else "-"
             lock_tid = self.locked_trolley_id if self.locked_trolley_id is not None else "-"
-            brightness_txt = (
-                f"{self._last_probe_brightness:.0f}"
-                if self._last_probe_brightness is not None else "-"
-            )
-            text = (
-                f"POURING INFERENCE | {datetime_obj.strftime('%Y-%m-%d %H:%M:%S')} | "
-                f"SESSION:{'ON' if self.session_active else 'OFF'} "
-                f"POUR:{'ON' if self.pour_active else 'OFF'} "
-                f"MOULDS:{self.mould_count} B:{brightness_txt} "
-                f"TARGET_T:{target_tid} LOCK_T:{lock_tid} "
-                f"CYCLE_AGE:{cycle_age:.1f}s ABSENCE:{absence:.1f}s"
-            )
-            # Label 0: full status line
-            display_meta.num_labels = 1
-            txt = display_meta.text_params[0]
-            txt.display_text = text
-            txt.x_offset = 10
-            txt.y_offset = 20
-            txt.font_params.font_name = "Serif"
-            txt.font_params.font_size = max(12, int(round(12 * scale_up)))
-            txt.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-            txt.set_bg_clr = 1
-            txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.65)
+            brightness_txt = f"{self._last_probe_brightness:.0f}" if self._last_probe_brightness is not None else "-"
 
-            # Label 1: large POURING ACTIVE banner
-            if len(display_meta.text_params) > 1:
-                display_meta.num_labels = 2
-                banner = display_meta.text_params[1]
-                banner.display_text = "POURING ACTIVE" if self.pour_active else "POURING IDLE"
-                banner.x_offset = 10
-                banner.y_offset = 20 + max(12, int(round(12 * scale_up))) + 4
-                banner.font_params.font_name = "Serif"
-                banner.font_params.font_size = max(20, int(round(20 * scale_up)))
-                if self.pour_active:
-                    banner.font_params.font_color.set(0.0, 1.0, 0.0, 1.0)
-                    banner.text_bg_clr.set(0.0, 0.2, 0.0, 0.75)
-                else:
-                    banner.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-                    banner.text_bg_clr.set(0.0, 0.0, 0.0, 0.5)
-                banner.set_bg_clr = 1
+            line_height = max(16, int(round(18 * scale_up)))
+            font_size = max(11, int(round(12 * scale_up)))
+            max_labels = len(display_meta.text_params)
+            max_lines_by_height = max(6, (frame_h - 20) // line_height)
+            line_budget = max(4, min(max_labels, max_lines_by_height))
 
-            # 2) Probe points + expanded lock region as rectangle overlays
+            # Build right-panel text rows: (text, role)
+            rows = [
+                ("POURING INFERENCE", "title"),
+                (
+                    f"{datetime_obj.strftime('%H:%M:%S')} S:{'ON' if self.session_active else 'OFF'} "
+                    f"P:{'ON' if self.pour_active else 'OFF'} M:{self.mould_count} C:{self.clustered_mould_count} "
+                    f"B:{brightness_txt} T:{target_tid}/{lock_tid}",
+                    "metrics",
+                ),
+            ]
+
+            if self.trolley_locked and self.locked_trolley_id is not None:
+                rows.append((f"Trolley #{self.locked_trolley_id} [LOCKED]", "locked"))
+                rows.append((f"Total Moulds: {self.mould_count}", "totals"))
+
+                records_by_no = {int(r.get("mould_no", -1)): r for r in self.mould_records}
+                mould_rows = []
+                for mid in sorted(self.mould_completed_times.keys()):
+                    frames = self.mould_completed_times[mid]
+                    time_s = frames / self.fps
+                    rec = records_by_no.get(int(mid))
+                    if rec:
+                        cluster = rec.get("cluster_id")
+                        cluster_txt = f"C{cluster}" if cluster is not None else "C-"
+                        axis_txt = str(rec.get("split_axis", "-")).upper()
+                    else:
+                        cluster_txt = "C-"
+                        axis_txt = "-"
+                    mould_rows.append((f"M#{mid}: {time_s:.1f}s {cluster_txt} {axis_txt}", "mould_done"))
+
+                if self.pour_active and self._pour_start_time_wall is not None:
+                    active_s = timestamp - self._pour_start_time_wall
+                    next_mid = self.mould_count + 1
+                    mould_rows.append((f"M#{next_mid}: {active_s:.1f}s ACTIVE", "mould_active"))
+
+                # Keep the latest mould rows when vertical space is limited.
+                remaining = max(0, line_budget - len(rows) - 1)  # reserve 1 line for footer
+                if len(mould_rows) > remaining:
+                    keep = max(0, remaining - 1)
+                    hidden = len(mould_rows) - keep
+                    if keep > 0:
+                        mould_rows = [("... +%d earlier moulds" % hidden, "trimmed")] + mould_rows[-keep:]
+                    else:
+                        mould_rows = [("... +%d mould rows hidden" % hidden, "trimmed")]
+                rows.extend(mould_rows)
+            else:
+                rows.append(("No active trolley", "metrics"))
+
+            session_age = (timestamp - self.session_start_time) if self.session_start_time else 0.0
+            cycle_txt = f"{int(cycle_age // 60)}m" if cycle_age >= 60 else f"{int(cycle_age)}s"
+            rows.append((f"Session:{int(session_age)}s  Cycle:{cycle_txt}  Absence:{absence:.1f}s", "footer"))
+
+            if len(rows) > line_budget:
+                rows = rows[:line_budget]
+
+            # Place pouring panel on the right to avoid overlap with brightness panel on the left.
+            panel_margin = 10
+            panel_w = max(360, int(frame_w * 0.42))
+            panel_w = min(panel_w, max(260, frame_w - panel_margin * 2))
+            panel_x = max(panel_margin, frame_w - panel_w - panel_margin)
+            panel_y = panel_margin
+            panel_h = min(frame_h - panel_margin * 2, max(line_height + 12, len(rows) * line_height + 14))
+
             rect_idx = 0
-            max_rects = 12
+            if len(display_meta.rect_params) > 0:
+                panel_rect = display_meta.rect_params[rect_idx]
+                panel_rect.left = int(panel_x)
+                panel_rect.top = int(panel_y)
+                panel_rect.width = int(max(1, panel_w))
+                panel_rect.height = int(max(1, panel_h))
+                panel_rect.border_width = max(1, int(round(2 * scale_up)))
+                panel_rect.border_color.set(0.0, 1.0, 1.0, 0.65)
+                panel_rect.has_bg_color = 1
+                panel_rect.bg_color.set(0.0, 0.0, 0.0, 0.45)
+                rect_idx += 1
 
-            if self._last_probe_base is not None:
+            display_meta.num_labels = min(len(rows), max_labels)
+            color_map = {
+                "title": (1.0, 1.0, 0.0, 1.0),
+                "metrics": (1.0, 1.0, 1.0, 1.0),
+                "locked": (0.0, 1.0, 1.0, 1.0),
+                "totals": (0.85, 0.85, 0.85, 1.0),
+                "mould_done": (0.85, 0.85, 0.85, 1.0),
+                "mould_active": (0.0, 1.0, 0.0, 1.0),
+                "trimmed": (1.0, 0.8, 0.2, 1.0),
+                "footer": (1.0, 1.0, 1.0, 1.0),
+            }
+            for i in range(display_meta.num_labels):
+                text, role = rows[i]
+                txt = display_meta.text_params[i]
+                txt.display_text = text
+                txt.x_offset = int(panel_x + 12)
+                txt.y_offset = int(panel_y + 4 + (i + 1) * line_height)
+                txt.font_params.font_name = "Serif"
+                txt.font_params.font_size = font_size
+                r, g, b, a = color_map.get(role, color_map["metrics"])
+                txt.font_params.font_color.set(r, g, b, a)
+                txt.set_bg_clr = 0
+
+            # Draw large probe dot (circle). Brightness already appears in panel metrics.
+            if self._last_probe_base is not None and display_meta.num_circles < 16:
                 base_x, base_y = self._last_probe_base
                 probe_on = (self._last_probe_brightness or 0.0) > self.brightness_start
-                for dx, dy in self.probe_offsets:
-                    if rect_idx >= max_rects:
-                        break
-                    px = int(base_x + dx)
-                    py = int(base_y + dy)
-                    size = max(3, self.probe_radius)
-                    rect = display_meta.rect_params[rect_idx]
-                    rect.left = max(0, px - size // 2)
-                    rect.top = max(0, py - size // 2)
-                    rect.width = size
-                    rect.height = size
-                    rect.border_width = max(1, int(round(1 * scale_up)))
-                    rect.has_bg_color = 1
-                    if probe_on:
-                        rect.border_color.set(0.0, 1.0, 0.0, 1.0)
-                        rect.bg_color.set(0.0, 1.0, 0.0, 0.9)
-                    else:
-                        rect.border_color.set(1.0, 0.0, 0.0, 1.0)
-                        rect.bg_color.set(1.0, 0.0, 0.0, 0.9)
-                    rect_idx += 1
 
-            if self.trolley_locked and self.locked_trolley_bbox and rect_idx < max_rects:
+                circle = display_meta.circle_params[0]
+                circle.xc = int(base_x)
+                circle.yc = int(base_y)
+                circle.radius = max(5, int(round(5 * scale_up)))  # Visible but not huge
+
+                if probe_on:
+                    circle.circle_color.set(0.0, 1.0, 0.0, 1.0)
+                    circle.has_bg_color = 1
+                    circle.bg_color.set(0.0, 1.0, 0.0, 0.85)
+                else:
+                    circle.circle_color.set(1.0, 0.0, 0.0, 1.0)
+                    circle.has_bg_color = 1
+                    circle.bg_color.set(1.0, 0.0, 0.0, 0.85)
+
+                display_meta.num_circles = 1
+
+            # Draw expanded trolley bbox (optional dashed outline)
+            if self.trolley_locked and self.locked_trolley_bbox and rect_idx < 12:
                 x1, y1, x2, y2 = self.locked_trolley_bbox
                 ey1 = max(0, y1 - self.edge_expand)
                 rect = display_meta.rect_params[rect_idx]
@@ -1169,8 +1604,8 @@ class PouringProcessor:
                 rect.width = int(max(1, x2 - x1))
                 rect.height = int(max(1, y2 - ey1))
                 rect.border_width = max(1, int(round(1 * scale_up)))
-                rect.has_bg_color = 0
-                rect.border_color.set(0.0, 1.0, 0.0, 1.0)
+                rect.border_color.set(0.0, 1.0, 0.0, 0.5)  # Semi-transparent green
+                rect.has_bg_color = 0  # No fill, just outline
                 rect_idx += 1
 
             display_meta.num_rects = rect_idx
@@ -1198,11 +1633,9 @@ class PouringProcessor:
             return None
 
         try:
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            annotated = frame_bgr.copy()
-            h, w = annotated.shape[:2]
+            annotated = prepare_frame(frame)
 
-            # Draw trolley bboxes (green) + expanded region (dashed green)
+            # Draw trolley bboxes (green) + expanded region
             for t in trolleys:
                 x1, y1, x2, y2 = t['bbox']
                 is_locked = (self.trolley_locked and t['track_id'] == self.locked_trolley_id)
@@ -1214,8 +1647,6 @@ class PouringProcessor:
                     label += " [LOCKED]"
                 cv2.putText(annotated, label, (x1, max(y1 - 8, 15)),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                # Draw expanded region for locked trolley (top edge only)
                 if is_locked:
                     ey1 = max(0, y1 - self.edge_expand)
                     cv2.rectangle(annotated, (x1, ey1), (x2, y2), (0, 255, 0), 1)
@@ -1231,39 +1662,18 @@ class PouringProcessor:
             # Draw probe points
             self._draw_probe_points(annotated, probe_point, probe_brightness)
 
-            # Title
-            cv2.putText(annotated, title, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-
-            # Timestamp
-            ts_str = datetime_obj.strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(annotated, ts_str, (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Extra info
-            if extra_info:
-                cv2.putText(annotated, extra_info, (10, 85),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Mould count + trolley lock status
-            status = f"Moulds: {self.mould_count}"
+            # Standard header/footer
+            extra_lines = [extra_info] if extra_info else None
+            add_header(annotated, title, datetime_obj.strftime("%Y-%m-%d %H:%M:%S"),
+                       extra_lines)
+            status = f"Moulds: {self.mould_count}  Clustered: {self.clustered_mould_count}"
             if self.trolley_locked:
                 status += f"  Trolley: T{self.locked_trolley_id} [LOCKED]"
-            cv2.putText(annotated, status, (10, h - 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+            add_footer(annotated, self.camera_id, status)
 
-            # Camera ID
-            cv2.putText(annotated, f"CAM: {self.camera_id}", (w - 200, h - 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
-
-            # Save
             tag = title.lower().replace(" ", "_")
-            ts = datetime_obj.strftime("%Y%m%d_%H%M%S")
-            filename = f"pouring_{tag}_{ts}.jpg"
-            filepath = self.screenshot_dir / filename
-            cv2.imwrite(str(filepath), annotated)
-            logger.info(f"Saved screenshot: {filename}")
-            return str(filepath)
+            return save_screenshot(annotated, "pouring", tag, datetime_obj,
+                                   self.screenshot_dir)
 
         except Exception as e:
             logger.error(f"Error saving screenshot: {e}")
