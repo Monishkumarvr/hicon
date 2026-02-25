@@ -117,6 +117,8 @@ ENABLE_INFERENCE_VIDEO = os.getenv('HICON_ENABLE_INFERENCE_VIDEO', 'false').lowe
 INFERENCE_VIDEO_FPS = float(os.getenv('HICON_INFERENCE_VIDEO_FPS', '10'))
 INFERENCE_VIDEO_WIDTH = int(os.getenv('HICON_INFERENCE_VIDEO_WIDTH', '640'))
 INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))
+# Duration of each output file in seconds (splitmuxsink auto-rotates, no pipeline restart)
+INFERENCE_VIDEO_SEGMENT_S = int(os.getenv('HICON_INFERENCE_VIDEO_SEGMENT_S', '3600'))
 
 # =============================================================================
 # RTSP STREAMS (2-stream HiCon pipeline)

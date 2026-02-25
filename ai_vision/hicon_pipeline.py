@@ -61,6 +61,7 @@ pyrometer_processor = None
 bus_handler = None
 sync_manager = None
 recording_manager = None
+recording_manager_1 = None
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +224,7 @@ def sync_thread_func(stop_event):
 # ---------------------------------------------------------------------------
 def main():
     global pouring_processor, brightness_processor, pyrometer_processor
-    global bus_handler, sync_manager, recording_manager
+    global bus_handler, sync_manager, recording_manager, recording_manager_1
 
     logger.info("=" * 60)
     logger.info("HiCon Pipeline Starting")
@@ -331,8 +332,9 @@ def main():
     # Attach bus handler
     bus_handler = BusHandler(pipeline, loop)
 
-    # Optional DS-native inference recording branch (post-OSD annotations)
+    # Optional DS-native inference recording branch (post-OSD annotated frames, both streams)
     recording_manager = None
+    recording_manager_1 = None
     if config.ENABLE_INFERENCE_VIDEO:
         tee_0 = elements.get('tee_0')
         if tee_0:
@@ -342,6 +344,7 @@ def main():
                 target_fps=config.INFERENCE_VIDEO_FPS,
                 target_width=config.INFERENCE_VIDEO_WIDTH,
                 target_height=config.INFERENCE_VIDEO_HEIGHT,
+                segment_duration_s=config.INFERENCE_VIDEO_SEGMENT_S,
             )
             if recording_manager.setup_recording_branch(pipeline, tee_0):
                 logger.info("Stream 0: DS-native inference recording branch configured")
@@ -349,7 +352,25 @@ def main():
                 logger.error("Stream 0: failed to configure inference recording branch")
                 recording_manager = None
         else:
-            logger.warning("Inference video enabled but tee_0 is missing; recording disabled")
+            logger.warning("Inference video enabled but tee_0 is missing; Stream 0 recording disabled")
+
+        tee_1 = elements.get('tee_1')
+        if tee_1:
+            recording_manager_1 = RecordingManager(
+                output_dir=str(config.VIDEO_DIR / 'inference'),
+                stream_id=1,
+                target_fps=config.INFERENCE_VIDEO_FPS,
+                target_width=config.INFERENCE_VIDEO_WIDTH,
+                target_height=config.INFERENCE_VIDEO_HEIGHT,
+                segment_duration_s=config.INFERENCE_VIDEO_SEGMENT_S,
+            )
+            if recording_manager_1.setup_recording_branch(pipeline, tee_1):
+                logger.info("Stream 1: DS-native inference recording branch configured")
+            else:
+                logger.error("Stream 1: failed to configure inference recording branch")
+                recording_manager_1 = None
+        else:
+            logger.warning("Inference video enabled but tee_1 is missing; Stream 1 recording disabled")
 
     # Attach pad probes
     # Stream 0: OSD sink pad probe (pouring + brightness)
@@ -391,9 +412,11 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Configure recording file before PLAYING so filesink location is set in NULL/READY state
+    # Arm recording before PLAYING — splitmuxsink begins writing on first buffer
     if recording_manager:
         recording_manager.start_recording(event_prefix="inference_stream0")
+    if recording_manager_1:
+        recording_manager_1.start_recording(event_prefix="inference_stream1")
 
     # Start pipeline
     logger.info("Starting pipeline...")
@@ -418,19 +441,22 @@ def main():
         sync_stop_event.set()
         if sync_thread:
             sync_thread.join(timeout=5)
-        if recording_manager:
+        if recording_manager or recording_manager_1:
             try:
-                # Important for live RTSP: force EOS so mp4mux can finalize MP4 metadata.
-                # Without EOS, files may remain 0 bytes or unplayable on abrupt shutdown.
+                # Force EOS so splitmuxsink finalizes the current MKV segment cleanly.
+                # Without EOS the last segment may be missing its Matroska index.
                 pipeline.send_event(Gst.Event.new_eos())
                 bus = pipeline.get_bus()
                 bus.timed_pop_filtered(
                     5 * Gst.SECOND,
                     Gst.MessageType.EOS | Gst.MessageType.ERROR
                 )
-                recording_manager.stop_recording()
+                if recording_manager:
+                    recording_manager.stop_recording()
+                if recording_manager_1:
+                    recording_manager_1.stop_recording()
             except Exception as e:
-                logger.error(f"Error stopping recording manager: {e}", exc_info=True)
+                logger.error(f"Error stopping recording managers: {e}", exc_info=True)
         if pouring_processor:
             try:
                 pouring_processor.close()

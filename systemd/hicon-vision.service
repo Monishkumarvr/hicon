@@ -1,0 +1,32 @@
+[Unit]
+Description=HiCon Edge AI Vision Pipeline (DeepStream 7.1)
+Documentation=file:/home/hicon/hicon/HiCon_Systems_Design.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hicon
+WorkingDirectory=/home/hicon/hicon/ai_vision
+
+# All tunable parameters live in .env — no code changes needed for site config.
+EnvironmentFile=/home/hicon/hicon/ai_vision/.env
+
+ExecStart=/usr/bin/python3 hicon_pipeline.py
+
+# Restart on crash; give the Jetson time to re-negotiate RTSP sessions.
+Restart=on-failure
+RestartSec=10
+
+# Allow SIGTERM up to 30s for clean MKV segment finalization on shutdown.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=append:/home/hicon/hicon/ai_vision/logs/pipeline.log
+StandardError=append:/home/hicon/hicon/ai_vision/logs/pipeline.log
+
+# Prevent runaway log growth — rotate at 50 MB, keep 4 rotations.
+LogNamespace=hicon
+
+[Install]
+WantedBy=multi-user.target

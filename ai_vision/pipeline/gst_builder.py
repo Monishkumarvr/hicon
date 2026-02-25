@@ -192,6 +192,20 @@ class DeepStreamPipelineBuilder:
             )
             self.elements['nvosd_1'] = Gst.ElementFactory.make("nvdsosd", "nvosd-1")
 
+            # Optional DS-native recording split point for Stream 1 (post-OSD pyrometer frames)
+            if self.enable_inference_video:
+                self.elements['post_osd_conv_1'] = Gst.ElementFactory.make("nvvideoconvert", "post-osd-conv-1")
+                self.elements['post_osd_caps_1'] = Gst.ElementFactory.make("capsfilter", "post-osd-caps-1")
+                if self.elements['post_osd_caps_1']:
+                    self.elements['post_osd_caps_1'].set_property(
+                        'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
+                    )
+                self.elements['tee_1'] = Gst.ElementFactory.make("tee", "tee-1")
+                self.elements['queue_display_1'] = Gst.ElementFactory.make("queue", "queue-display-1")
+                if self.elements['queue_display_1']:
+                    self.elements['queue_display_1'].set_property('leaky', 2)
+                    self.elements['queue_display_1'].set_property('max-size-buffers', 8)
+
             self.elements['sink_1'] = Gst.ElementFactory.make("fakesink", "sink-1")
             self.elements['sink_1'].set_property('sync', 0)
             self.elements['sink_1'].set_property('async', False)
@@ -302,17 +316,37 @@ class DeepStreamPipelineBuilder:
             if not self._link_to_mux('caps1', 'mux_1'):
                 return False
 
-            # mux_1 → pyrometer → nvvidconv → caps_rgba → osd → sink
+            # mux_1 → pyrometer → nvvidconv → caps_rgba → osd
             chain_1 = [
                 ('mux_1', 'pgie_pyrometer'),
                 ('pgie_pyrometer', 'nvvidconv_osd_1'),
                 ('nvvidconv_osd_1', 'caps_osd_1'),
                 ('caps_osd_1', 'nvosd_1'),
-                ('nvosd_1', 'sink_1'),
             ]
             for src_name, dst_name in chain_1:
                 if not self.elements[src_name].link(self.elements[dst_name]):
                     logger.error(f"Failed to link {src_name} -> {dst_name}")
+                    return False
+
+            if self.enable_inference_video:
+                # Split annotated stream: display path + recording path (added by RecordingManager)
+                if not self.elements['nvosd_1'].link(self.elements['post_osd_conv_1']):
+                    logger.error("Failed to link nvosd_1 -> post_osd_conv_1")
+                    return False
+                if not self.elements['post_osd_conv_1'].link(self.elements['post_osd_caps_1']):
+                    logger.error("Failed to link post_osd_conv_1 -> post_osd_caps_1")
+                    return False
+                if not self.elements['post_osd_caps_1'].link(self.elements['tee_1']):
+                    logger.error("Failed to link post_osd_caps_1 -> tee_1")
+                    return False
+                if not self._link_tee_src_to_element('tee_1', 'queue_display_1'):
+                    return False
+                if not self.elements['queue_display_1'].link(self.elements['sink_1']):
+                    logger.error("Failed to link queue_display_1 -> sink_1")
+                    return False
+            else:
+                if not self.elements['nvosd_1'].link(self.elements['sink_1']):
+                    logger.error("Failed to link nvosd_1 -> sink_1")
                     return False
             logger.info("Stream 1: Pyrometer camera chain linked")
 
