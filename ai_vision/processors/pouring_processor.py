@@ -172,6 +172,7 @@ class PouringProcessor:
 
         # --- DS-native inference overlay toggle (recorded post-OSD via tee branch) ---
         self.enable_inference_video = bool(getattr(config, 'ENABLE_INFERENCE_VIDEO', False))
+        self.enable_screenshots = bool(getattr(config, 'ENABLE_SCREENSHOTS', True))
 
         # --- Per-mould timing tracker (for live overlay) ---
         self.mould_completed_times = {}  # mould_id → total frames accumulated
@@ -1629,6 +1630,8 @@ class PouringProcessor:
                                probe_point=None, probe_brightness=None,
                                extra_info=None):
         """Save annotated screenshot with detections, probe, and event details."""
+        if not self.enable_screenshots:
+            return None
         if frame is None:
             return None
 

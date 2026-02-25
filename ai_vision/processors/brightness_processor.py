@@ -52,6 +52,7 @@ class BrightnessProcessor:
         self.customer_id = config.CUSTOMER_ID
         self.camera_id = config.CAMERA_ID_STREAM_0
         self.location = config.LOCATION
+        self.enable_screenshots = bool(getattr(config, 'ENABLE_SCREENSHOTS', True))
 
         # Build ROI masks (will be created on first frame when we know dimensions)
         self._tapping_config = zones_config.get('tapping', {})
@@ -423,6 +424,8 @@ class BrightnessProcessor:
 
     def _save_annotated_screenshot(self, frame_rgba, event, white_ratio, phase="end"):
         """Save screenshot with ROI region overlay, event details, and annotations."""
+        if not self.enable_screenshots:
+            return ""
         try:
             frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
             annotated = frame_bgr.copy()

@@ -114,6 +114,10 @@ ENABLE_FRAME_PROCESSING = os.getenv('HICON_ENABLE_FRAME_PROCESSING', 'true').low
 
 # Annotated inference video (DS-native: tee + nvosd + RecordingManager)
 ENABLE_INFERENCE_VIDEO = os.getenv('HICON_ENABLE_INFERENCE_VIDEO', 'false').lower() == 'true'
+
+# Event screenshots (OpenCV JPEG saved to output/screenshots/ on event transitions)
+# Set false when only MKV video output is needed — saves CPU and disk I/O
+ENABLE_SCREENSHOTS = os.getenv('HICON_ENABLE_SCREENSHOTS', 'true').lower() == 'true'
 INFERENCE_VIDEO_FPS = float(os.getenv('HICON_INFERENCE_VIDEO_FPS', '10'))
 INFERENCE_VIDEO_WIDTH = int(os.getenv('HICON_INFERENCE_VIDEO_WIDTH', '640'))
 INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))

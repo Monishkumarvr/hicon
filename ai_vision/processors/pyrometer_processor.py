@@ -46,6 +46,7 @@ class PyrometerProcessor:
         self.customer_id = config.CUSTOMER_ID
         self.camera_id = config.CAMERA_ID_STREAM_1
         self.location = config.LOCATION
+        self.enable_screenshots = bool(getattr(config, 'ENABLE_SCREENSHOTS', True))
 
         # Zone polygon: list of (x, y) tuples
         self.zone_polygon = zone_config.get('zone_polygon', [])
@@ -217,6 +218,8 @@ class PyrometerProcessor:
 
     def _save_event_screenshot(self, title, duration=None):
         """Save annotated screenshot with zone polygon, detections, and event details."""
+        if not self.enable_screenshots:
+            return None
         if self._last_frame is None:
             return None
 
