@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pyds
 
-from utils.utils import save_screenshot, generate_sync_id
+from utils.utils import generate_sync_id
+from utils.screenshot import (prepare_frame, add_header, add_footer,
+                               draw_roi_overlay, save as save_screenshot)
 
 logger = logging.getLogger(__name__)
 
@@ -221,30 +223,19 @@ class PyrometerProcessor:
             return None
 
         try:
-            frame_bgr = cv2.cvtColor(self._last_frame, cv2.COLOR_RGBA2BGR)
-            annotated = frame_bgr.copy()
-            h, w = annotated.shape[:2]
+            annotated = prepare_frame(self._last_frame)
 
             # Draw zone polygon with semi-transparent fill + outline
             if self.zone_polygon:
-                pts = np.array(self.zone_polygon, dtype=np.int32)
-                overlay = annotated.copy()
-                cv2.fillPoly(overlay, [pts], (255, 200, 0))  # Cyan-ish
-                cv2.addWeighted(overlay, 0.15, annotated, 0.85, 0, annotated)
-                cv2.polylines(annotated, [pts], True, (255, 200, 0), 2)
-                # Label the zone
-                cx = int(np.mean([p[0] for p in self.zone_polygon]))
-                cy = int(np.mean([p[1] for p in self.zone_polygon]))
-                cv2.putText(annotated, "DETECTION ZONE",
-                           (cx - 70, cy - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+                draw_roi_overlay(annotated, self.zone_polygon, (255, 200, 0),
+                                 label="DETECTION ZONE")
 
             # Draw detection bboxes
             for det in self._last_detections:
                 x1, y1, x2, y2 = det['bbox']
                 conf = det['confidence']
                 in_zone = det['in_zone']
-                color = (0, 255, 0) if in_zone else (0, 0, 255)  # Green if in zone, red if not
+                color = (0, 255, 0) if in_zone else (0, 0, 255)
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
                 label = f"Rod {conf:.2f}"
                 if in_zone:
@@ -252,43 +243,95 @@ class PyrometerProcessor:
                 cv2.putText(annotated, label, (x1, max(y1 - 8, 20)),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Event title
-            cv2.putText(annotated, title, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            # Standard header/footer
+            extra_lines = [f"Duration: {duration:.1f}s"] if duration is not None else None
+            add_header(annotated, title, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       extra_lines)
+            status = (f"Conf threshold: {self.confidence_threshold}  "
+                      f"Temporal: {self.temporal_in_frames}in/{self.temporal_out_frames}out frames")
+            add_footer(annotated, self.camera_id, status)
 
-            # Timestamp
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(annotated, now_str, (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Duration (for end events)
-            if duration is not None:
-                cv2.putText(annotated, f"Duration: {duration:.1f}s", (10, 85),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Confidence threshold info
-            cv2.putText(annotated,
-                       f"Conf threshold: {self.confidence_threshold}  "
-                       f"Temporal: {self.temporal_in_frames}in/{self.temporal_out_frames}out frames",
-                       (10, h - 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-
-            # Camera ID
-            cv2.putText(annotated, f"CAM: {self.camera_id}", (w - 200, h - 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
-
-            # Save
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             tag = "start" if "START" in title else "end"
-            filename = f"pyrometer_{tag}_{timestamp}.jpg"
-            filepath = self.screenshot_dir / filename
-            cv2.imwrite(str(filepath), annotated)
-            logger.info(f"Saved pyrometer screenshot: {filename}")
-            return str(filepath)
+            return save_screenshot(annotated, "pyrometer", tag, datetime.now(),
+                                   self.screenshot_dir)
 
         except Exception as e:
             logger.error(f"Error saving pyrometer screenshot: {e}")
             return None
+
+    def add_inference_display_meta(self, batch_meta, frame_meta):
+        """Attach DS-native overlay for pyrometer zone + detection status."""
+        try:
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if not display_meta:
+                return
+
+            # Scale overlay for downscaled recording
+            scale_up = 1.0
+            try:
+                target_w = int(getattr(self.config, "INFERENCE_VIDEO_WIDTH", 0) or 0)
+                # Pyrometer is 1920x1080, use frame_meta dimensions
+                frame_w = frame_meta.source_frame_width or 1920
+                if target_w and target_w < frame_w:
+                    scale_up = min(3.0, frame_w / float(target_w))
+            except Exception:
+                scale_up = 1.0
+
+            # Status text
+            labels = []
+            header = "PYROMETER ROD"
+            labels.append((header, (1.0, 1.0, 1.0, 1.0)))
+
+            state_txt = f"STATE: {'INSERTED' if self.state == 'ACTIVE' else 'NOT DETECTED'}"
+            state_color = (0.0, 1.0, 0.0, 1.0) if self.state == 'ACTIVE' else (0.8, 0.8, 0.8, 1.0)
+            labels.append((state_txt, state_color))
+
+            if self.state == 'ACTIVE' and self.event_start_time:
+                duration = time.time() - self.event_start_time
+                labels.append((f"Duration: {duration:.1f}s", (0.0, 1.0, 1.0, 1.0)))
+
+            # Render text
+            base_x = 10
+            base_y = max(45, int(round(45 * scale_up)))
+            line_h = max(18, int(round(18 * scale_up)))
+            display_meta.num_labels = min(len(labels), len(display_meta.text_params))
+            for i in range(display_meta.num_labels):
+                txt = display_meta.text_params[i]
+                txt.display_text = labels[i][0]
+                txt.x_offset = base_x
+                txt.y_offset = base_y + i * line_h
+                txt.font_params.font_name = "Serif"
+                txt.font_params.font_size = max(12, int(round(12 * scale_up)))
+                r, g, b, a = labels[i][1]
+                txt.font_params.font_color.set(r, g, b, a)
+                txt.set_bg_clr = 1
+                txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.55)
+
+            # Draw zone polygon
+            line_idx = 0
+            max_lines = len(getattr(display_meta, "line_params", []))
+            if max_lines > 0 and self.zone_polygon:
+                n = len(self.zone_polygon)
+                for i in range(n):
+                    if line_idx >= max_lines:
+                        break
+                    x1, y1 = self.zone_polygon[i]
+                    x2, y2 = self.zone_polygon[(i + 1) % n]
+                    line = display_meta.line_params[line_idx]
+                    line.x1 = int(max(0, x1))
+                    line.y1 = int(max(0, y1))
+                    line.x2 = int(max(0, x2))
+                    line.y2 = int(max(0, y2))
+                    line.line_width = max(2, int(round(2 * scale_up)))
+                    # Magenta color for pyrometer zone
+                    line.line_color.set(1.0, 0.0, 1.0, 1.0)
+                    line_idx += 1
+
+            display_meta.num_lines = line_idx
+            display_meta.num_rects = 0
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        except Exception as exc:
+            logger.error(f"[pyrometer] Failed to attach display meta: {exc}", exc_info=True)
 
     @staticmethod
     def _point_in_polygon(point, polygon):

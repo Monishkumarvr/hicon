@@ -1,8 +1,10 @@
 """
-HiCon Pipeline - Main entry point for 2-camera DeepStream pipeline.
+HiCon Pipeline - Main entry point for 3-camera DeepStream pipeline.
 
-Stream 0 (Process Camera): pouring (nvinfer + tracker) + brightness (tapping, deslagging, spectro)
-Stream 1 (Pyrometer Camera): rod detection (nvinfer)
+Stream 0 (Process Camera):   pouring (nvinfer GIE-1 + tracker) + brightness (tapping, deslagging, spectro)
+Stream 1 (Pyrometer Camera): rod detection (nvinfer GIE-2)
+Stream 2 (Pouring2 Camera):  pouring only (nvinfer GIE-3 + tracker, no brightness)
+All cameras decode H.265/HEVC via nvv4l2decoder.
 """
 import sys
 import os
@@ -34,6 +36,7 @@ from state.heat_cycle_manager import HeatCycleManager
 from sync.api_client import APIClient
 from sync.sync_manager import SyncManager
 from utils.zone_loader import load_zones_config
+from streaming.mjpeg_server import MJPEGServer
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -56,11 +59,14 @@ logger = logging.getLogger('hicon')
 # Globals (set during init)
 # ---------------------------------------------------------------------------
 pouring_processor = None
+pouring_processor_2 = None       # Stream 2: second pouring camera (pouring-only, no brightness)
+heat_cycle_manager_2 = None      # Stream 2: independent heat cycle state
 brightness_processor = None
 pyrometer_processor = None
 bus_handler = None
 sync_manager = None
 recording_manager = None
+mjpeg_server = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +152,50 @@ def osd_sink_pad_probe_stream0(pad, info):
     return Gst.PadProbeReturn.OK
 
 
+def post_osd_probe_stream0_for_streaming(pad, info):
+    """
+    Probe on post-OSD path (after nvosd rendering) for live streaming.
+    Extracts frames WITH overlays for MJPEG server.
+    This runs AFTER all display_meta has been rendered by nvosd.
+    """
+    if not mjpeg_server:
+        return Gst.PadProbeReturn.OK
+
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if not batch_meta:
+        return Gst.PadProbeReturn.OK
+
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        # Extract annotated frame (post-OSD, WITH overlays)
+        try:
+            import numpy as np
+            import cv2
+            n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            frame_rgba = np.array(n_frame, copy=True, order='C')
+            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+            mjpeg_server.update_frame(stream_id=0, frame_bgr=frame_bgr)
+            pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        except Exception as e:
+            logger.error(f"Post-OSD frame extraction error: {e}", exc_info=True)
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK
+
+
 def nvinfer_src_pad_probe_stream1(pad, info):
     """
     Probe on nvosd_1 sink pad (Stream 1 — Pyrometer Camera).
@@ -185,8 +235,118 @@ def nvinfer_src_pad_probe_stream1(pad, info):
             if pyrometer_processor:
                 try:
                     pyrometer_processor.process_frame(frame_meta, frame=frame)
+                    # Add DS-native overlay for pyrometer zone + status
+                    if config.ENABLE_INFERENCE_VIDEO and batch_meta is not None:
+                        pyrometer_processor.add_inference_display_meta(
+                            batch_meta=batch_meta,
+                            frame_meta=frame_meta,
+                        )
                 except Exception as e:
                     logger.error(f"Pyrometer processor error: {e}", exc_info=True)
+        finally:
+            if frame is not None:
+                try:
+                    pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+                except Exception:
+                    pass
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK
+
+
+def post_osd_probe_stream1_for_streaming(pad, info):
+    """
+    Probe on Stream 1 sink (after nvosd rendering) for live streaming.
+    Extracts frames WITH nvosd-rendered bounding boxes for MJPEG server.
+    """
+    if not mjpeg_server:
+        return Gst.PadProbeReturn.OK
+
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if not batch_meta:
+        return Gst.PadProbeReturn.OK
+
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        # Extract annotated frame (post-OSD, WITH bounding boxes)
+        try:
+            import numpy as np
+            import cv2
+            n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            frame_rgba = np.array(n_frame, copy=True, order='C')
+            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+            mjpeg_server.update_frame(stream_id=1, frame_bgr=frame_bgr)
+            pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        except Exception as e:
+            logger.error(f"Stream 1 post-OSD frame extraction error: {e}", exc_info=True)
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK
+
+
+def osd_sink_pad_probe_stream2(pad, info):
+    """
+    Probe on nvosd_2 sink pad (Stream 2 — Second Pouring Camera).
+    Handles pouring detection only — no brightness (tapping/deslagging/spectro).
+    Frame is extracted for pour brightness probe and event screenshots.
+    CRITICAL: unmap_nvds_buf_surface() MUST be called on Jetson.
+    """
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if not batch_meta:
+        return Gst.PadProbeReturn.OK
+
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        if bus_handler:
+            bus_handler.update_frame_time(2)
+
+        frame = None
+        if config.ENABLE_FRAME_PROCESSING:
+            try:
+                import numpy as np
+                n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+                frame = np.array(n_frame, copy=True, order='C')
+            except Exception as e:
+                logger.error(f"Stream 2 frame extraction error: {e}", exc_info=True)
+
+        try:
+            if pouring_processor_2:
+                try:
+                    pouring_processor_2.process_frame(
+                        frame_meta=frame_meta,
+                        frame=frame,
+                        batch_meta=batch_meta,
+                        timestamp=time.time(),
+                        datetime_obj=datetime.now(),
+                    )
+                except Exception as e:
+                    logger.error(f"Stream 2 pouring processor error: {e}", exc_info=True)
         finally:
             if frame is not None:
                 try:
@@ -222,8 +382,9 @@ def sync_thread_func(stop_event):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    global pouring_processor, brightness_processor, pyrometer_processor
-    global bus_handler, sync_manager, recording_manager
+    global pouring_processor, pouring_processor_2, heat_cycle_manager_2
+    global brightness_processor, pyrometer_processor
+    global bus_handler, sync_manager, recording_manager, mjpeg_server
 
     logger.info("=" * 60)
     logger.info("HiCon Pipeline Starting")
@@ -245,8 +406,14 @@ def main():
     zones_config = load_zones_config(zones_path)
     logger.info(f"Loaded zones config from {zones_path}")
 
-    # Create shared HeatCycleManager (owned by pipeline, shared by processors)
+    # Create shared HeatCycleManager for Stream 0 (owned by pipeline, shared by processors)
     heat_cycle_manager = HeatCycleManager(
+        db_manager=db,
+        ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
+    )
+
+    # Create independent HeatCycleManager for Stream 2 (physically separate camera)
+    heat_cycle_manager_2 = HeatCycleManager(
         db_manager=db,
         ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
     )
@@ -268,7 +435,7 @@ def main():
         heat_cycle_manager=heat_cycle_manager,
     )
 
-    # Pouring processor — import conditionally to avoid issues if not adapted yet
+    # Pouring processor (Stream 0 — Process camera)
     try:
         from processors.pouring_processor import PouringProcessor
         pouring_processor = PouringProcessor(
@@ -277,10 +444,25 @@ def main():
             screenshot_dir=str(config.SCREENSHOT_DIR),
             heat_cycle_manager=heat_cycle_manager,
         )
-        logger.info("Pouring processor initialized")
+        logger.info("Stream 0: Pouring processor initialized")
     except Exception as e:
-        logger.warning(f"Pouring processor not available: {e}")
+        logger.warning(f"Stream 0: Pouring processor not available: {e}")
         pouring_processor = None
+
+    # Pouring processor (Stream 2 — Second pouring camera, pouring-only, no brightness)
+    try:
+        from processors.pouring_processor import PouringProcessor
+        pouring_processor_2 = PouringProcessor(
+            db_manager=db,
+            config=config,
+            screenshot_dir=str(config.SCREENSHOT_DIR),
+            heat_cycle_manager=heat_cycle_manager_2,
+            camera_id_override=config.CAMERA_ID_STREAM_2,
+        )
+        logger.info("Stream 2: Pouring processor initialized")
+    except Exception as e:
+        logger.warning(f"Stream 2: Pouring processor not available: {e}")
+        pouring_processor_2 = None
 
     # Initialize sync manager
     if config.ENABLE_SYNC and config.HMAC_SECRET:
@@ -306,8 +488,13 @@ def main():
     pipeline_config = {
         'rtsp_stream_0': config.RTSP_STREAM_0,
         'rtsp_stream_1': config.RTSP_STREAM_1,
+        'rtsp_stream_2': config.RTSP_STREAM_2,
+        'rtsp_codec_0': config.RTSP_CODEC_0,
+        'rtsp_codec_1': config.RTSP_CODEC_1,
+        'rtsp_codec_2': config.RTSP_CODEC_2,
         'config_pouring': config.CONFIG_POURING,
         'config_pyrometer': config.CONFIG_PYROMETER,
+        'config_pouring_2': config.CONFIG_POURING_2,
         'tracker_lib': config.TRACKER_LIB,
         'tracker_config': config.TRACKER_CONFIG,
         'rtsp_tcp_timeout_us': config.RTSP_TCP_TIMEOUT_US,
@@ -329,7 +516,25 @@ def main():
     loop = GLib.MainLoop()
 
     # Attach bus handler
-    bus_handler = BusHandler(pipeline, loop)
+    bus_handler = BusHandler(pipeline, loop, healthcheck_url=config.HEALTHCHECK_URL)
+
+    # Initialize MJPEG live streaming server (if enabled)
+    mjpeg_server = None
+    if config.ENABLE_LIVE_STREAM:
+        mjpeg_server = MJPEGServer(
+            host=config.LIVE_STREAM_HOST,
+            port=config.LIVE_STREAM_PORT,
+            jpeg_quality=config.LIVE_STREAM_QUALITY,
+            max_fps=config.LIVE_STREAM_FPS
+        )
+        # Only register streams that have pipeline elements (i.e. are enabled and linked)
+        for _sid, _key in [(0, 'nvosd_0'), (1, 'nvosd_1'), (2, 'nvosd_2')]:
+            if _key in elements and elements[_key]:
+                mjpeg_server.register_stream(_sid)
+        mjpeg_server.start()
+        logger.info(f"✓ Live streaming enabled: http://{config.LIVE_STREAM_HOST}:{config.LIVE_STREAM_PORT}/")
+    else:
+        logger.info("Live streaming disabled (ENABLE_LIVE_STREAM=false)")
 
     # Optional DS-native inference recording branch (post-OSD annotations)
     recording_manager = None
@@ -362,6 +567,16 @@ def main():
             )
             logger.info("Stream 0: OSD sink pad probe attached (pouring + brightness + spectro)")
 
+    # Stream 0: Post-OSD probe for live streaming (extracts frames WITH overlays)
+    if mjpeg_server and 'queue_display_0' in elements and elements['queue_display_0']:
+        queue_display_sinkpad = elements['queue_display_0'].get_static_pad("sink")
+        if queue_display_sinkpad:
+            queue_display_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                post_osd_probe_stream0_for_streaming,
+            )
+            logger.info("Stream 0: Post-OSD probe attached for live streaming (WITH overlays)")
+
     # Stream 1: OSD sink pad probe (pyrometer) — must be after RGBA conversion
     if 'nvosd_1' in elements and elements['nvosd_1']:
         osd1_sinkpad = elements['nvosd_1'].get_static_pad("sink")
@@ -370,7 +585,29 @@ def main():
                 Gst.PadProbeType.BUFFER,
                 nvinfer_src_pad_probe_stream1,
             )
-            logger.info("Stream 1: OSD sink pad probe attached (pyrometer + frame extraction)")
+            logger.info("Stream 1: OSD sink pad probe attached (pyrometer)")
+
+    # Stream 1: Post-OSD probe for live streaming (extracts frames WITH overlays)
+    if mjpeg_server and config.ENABLE_LIVE_STREAM_1 and 'sink_1' in elements and elements['sink_1']:
+        sink1_sinkpad = elements['sink_1'].get_static_pad("sink")
+        if sink1_sinkpad:
+            sink1_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                post_osd_probe_stream1_for_streaming,
+            )
+            logger.info("Stream 1: Post-OSD probe attached for live streaming (WITH bboxes)")
+    elif mjpeg_server and not config.ENABLE_LIVE_STREAM_1:
+        logger.info("Stream 1: Live streaming disabled (ENABLE_LIVE_STREAM_1=false)")
+
+    # Stream 2: OSD sink pad probe (second pouring camera — pouring only, no brightness)
+    if 'nvosd_2' in elements and elements['nvosd_2']:
+        osd2_sinkpad = elements['nvosd_2'].get_static_pad("sink")
+        if osd2_sinkpad:
+            osd2_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                osd_sink_pad_probe_stream2,
+            )
+            logger.info("Stream 2: OSD sink pad probe attached (pouring)")
 
     # Start sync thread
     sync_stop_event = threading.Event()
@@ -405,6 +642,13 @@ def main():
 
     logger.info("Pipeline PLAYING — waiting for streams...")
 
+    # Seed frame times for enabled streams only (disabled streams must not be tracked,
+    # otherwise the watchdog fires false stale alerts for streams with no probe)
+    for _sid, _key in [(0, 'nvosd_0'), (1, 'nvosd_1'), (2, 'nvosd_2')]:
+        if _key in elements and elements[_key]:
+            bus_handler.update_frame_time(_sid)
+    bus_handler.start_watchdog(interval_sec=60)
+
     # Log config summary
     summary = config.get_config_summary()
     logger.info(f"Config: {json.dumps(summary, indent=2, default=str)}")
@@ -436,6 +680,11 @@ def main():
                 pouring_processor.close()
             except Exception as e:
                 logger.error(f"Error closing pouring processor: {e}", exc_info=True)
+        if pouring_processor_2:
+            try:
+                pouring_processor_2.close()
+            except Exception as e:
+                logger.error(f"Error closing pouring processor 2: {e}", exc_info=True)
         pipeline.set_state(Gst.State.NULL)
         logger.info("Pipeline stopped")
 

@@ -15,7 +15,9 @@ from pathlib import Path
 import pyds
 
 from state.brightness_tracker import BrightnessTracker
-from utils.utils import save_screenshot, generate_sync_id
+from utils.utils import generate_sync_id
+from utils.screenshot import (prepare_frame, add_header, add_footer,
+                               draw_roi_overlay, save as save_screenshot)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,15 @@ class BrightnessProcessor:
         self._tapping_pixel_count = 0
         self._deslagging_pixel_count = 0
         self._spectro_pixel_count = 0
+
+        # Coordinate scaling: zones.json ROI points are calibrated at ref_width x ref_height.
+        # Scale factors are computed on first frame so overlays and masks match the actual
+        # mux output resolution (e.g., if main stream differs from calibration resolution).
+        meta = zones_config.get('metadata', {})
+        self._ref_w = int(meta.get('ref_width', 1920))
+        self._ref_h = int(meta.get('ref_height', 1080))
+        self._sx = 1.0
+        self._sy = 1.0
         self._last_white_ratios = {
             "tapping": 0.0,
             "deslagging": 0.0,
@@ -102,10 +113,25 @@ class BrightnessProcessor:
 
         logger.info("BrightnessProcessor initialized (tapping + deslagging + spectro)")
 
+    def _scale_pts(self, pts):
+        """Scale zone coordinates from calibration resolution to actual frame resolution."""
+        if self._sx == 1.0 and self._sy == 1.0:
+            return pts
+        return [[int(round(x * self._sx)), int(round(y * self._sy))] for x, y in pts]
+
     def _build_masks(self, frame_h, frame_w):
         """Build ROI masks once we know frame dimensions."""
+        self._frame_shape = (frame_h, frame_w)
+        self._sx = frame_w / self._ref_w if self._ref_w > 0 else 1.0
+        self._sy = frame_h / self._ref_h if self._ref_h > 0 else 1.0
+        if self._sx != 1.0 or self._sy != 1.0:
+            logger.info(
+                f"Zone scaling: {self._ref_w}x{self._ref_h} (calibration) → "
+                f"{frame_w}x{frame_h} (frame) — sx={self._sx:.3f}, sy={self._sy:.3f}"
+            )
+
         # Tapping quad ROI
-        tapping_pts = self._tapping_config.get('roi_points', [])
+        tapping_pts = self._scale_pts(self._tapping_config.get('roi_points', []))
         if tapping_pts:
             pts = np.array(tapping_pts, dtype=np.int32)
             self._tapping_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
@@ -114,7 +140,7 @@ class BrightnessProcessor:
             logger.info(f"Tapping ROI mask: {self._tapping_pixel_count} pixels")
 
         # Deslagging polygon ROI
-        deslag_pts = self._deslagging_config.get('roi_points', [])
+        deslag_pts = self._scale_pts(self._deslagging_config.get('roi_points', []))
         if deslag_pts:
             pts = np.array(deslag_pts, dtype=np.int32)
             self._deslagging_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
@@ -123,7 +149,7 @@ class BrightnessProcessor:
             logger.info(f"Deslagging ROI mask: {self._deslagging_pixel_count} pixels")
 
         # Spectro polygon ROI
-        spectro_pts = self._spectro_config.get('roi_points', [])
+        spectro_pts = self._scale_pts(self._spectro_config.get('roi_points', []))
         if spectro_pts:
             pts = np.array(spectro_pts, dtype=np.int32)
             self._spectro_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
@@ -312,9 +338,9 @@ class BrightnessProcessor:
                     line_idx += 1
 
             if max_lines > 0:
-                _add_roi_poly(self._tapping_config.get('roi_points', []), (1.0, 0.65, 0.0, 1.0))
-                _add_roi_poly(self._deslagging_config.get('roi_points', []), (1.0, 0.0, 0.0, 1.0))
-                _add_roi_poly(self._spectro_config.get('roi_points', []), (0.0, 1.0, 1.0, 1.0))
+                _add_roi_poly(self._scale_pts(self._tapping_config.get('roi_points', [])), (1.0, 0.65, 0.0, 1.0))
+                _add_roi_poly(self._scale_pts(self._deslagging_config.get('roi_points', [])), (1.0, 0.0, 0.0, 1.0))
+                _add_roi_poly(self._scale_pts(self._spectro_config.get('roi_points', [])), (0.0, 1.0, 1.0, 1.0))
                 display_meta.num_lines = line_idx
                 display_meta.num_rects = 0
             else:
@@ -342,9 +368,9 @@ class BrightnessProcessor:
                     rect.border_color.set(*color)
                     rect_idx += 1
 
-                _add_roi_rect(self._tapping_config.get('roi_points', []), (1.0, 0.65, 0.0, 1.0))
-                _add_roi_rect(self._deslagging_config.get('roi_points', []), (1.0, 0.0, 0.0, 1.0))
-                _add_roi_rect(self._spectro_config.get('roi_points', []), (0.0, 1.0, 1.0, 1.0))
+                _add_roi_rect(self._scale_pts(self._tapping_config.get('roi_points', [])), (1.0, 0.65, 0.0, 1.0))
+                _add_roi_rect(self._scale_pts(self._deslagging_config.get('roi_points', [])), (1.0, 0.0, 0.0, 1.0))
+                _add_roi_rect(self._scale_pts(self._spectro_config.get('roi_points', [])), (0.0, 1.0, 1.0, 1.0))
 
                 display_meta.num_rects = rect_idx
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
@@ -423,76 +449,49 @@ class BrightnessProcessor:
 
     def _save_annotated_screenshot(self, frame_rgba, event, white_ratio, phase="end"):
         """Save screenshot with ROI region overlay, event details, and annotations."""
+        event_type = event["type"]
         try:
-            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
-            annotated = frame_bgr.copy()
-            h, w = annotated.shape[:2]
-            event_type = event["type"]
+            annotated = prepare_frame(frame_rgba)
             phase = phase or event.get("phase", "end")
 
-            # Pick ROI config and color per event type
+            # Pick ROI config and color per event type (coordinates scaled to frame resolution)
             if event_type == "tapping":
-                roi_pts = self._tapping_config.get('roi_points', [])
+                roi_pts = self._scale_pts(self._tapping_config.get('roi_points', []))
                 roi_color = (0, 165, 255)  # Orange
                 threshold = self.tapping_tracker.brightness_threshold
             elif event_type == "spectro":
-                roi_pts = self._spectro_config.get('roi_points', [])
+                roi_pts = self._scale_pts(self._spectro_config.get('roi_points', []))
                 roi_color = (255, 255, 0)  # Cyan
                 threshold = self.spectro_tracker.brightness_threshold
             else:
-                roi_pts = self._deslagging_config.get('roi_points', [])
+                roi_pts = self._scale_pts(self._deslagging_config.get('roi_points', []))
                 roi_color = (0, 0, 255)  # Red
                 threshold = self.deslagging_tracker.brightness_threshold
 
             # Draw ROI region with semi-transparent fill + outline
             if roi_pts:
-                pts = np.array(roi_pts, dtype=np.int32)
-                overlay = annotated.copy()
-                cv2.fillPoly(overlay, [pts], roi_color)
-                cv2.addWeighted(overlay, 0.2, annotated, 0.8, 0, annotated)
-                cv2.polylines(annotated, [pts], True, roi_color, 2)
-                # Label inside ROI
-                cx = int(np.mean([p[0] for p in roi_pts]))
-                cy = int(np.mean([p[1] for p in roi_pts]))
-                cv2.putText(annotated, f"{event_type.upper()} ROI",
-                           (cx - 60, cy),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, roi_color, 2)
+                draw_roi_overlay(annotated, roi_pts, roi_color,
+                                 label=f"{event_type.upper()} ROI", alpha=0.2)
 
-            # Event title bar
-            cv2.putText(annotated, f"{event_type.upper()} EVENT {phase.upper()}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-
-            # Duration
+            # Build extra info lines
+            extra_lines = []
             if phase == "end" and "duration_sec" in event:
-                cv2.putText(annotated, f"Duration: {event['duration_sec']}s", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Start/end times
+                extra_lines.append(f"Duration: {event['duration_sec']}s")
             if phase == "end":
-                cv2.putText(annotated,
-                           f"Start: {event['start']}  End: {event['end']}",
-                           (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                extra_lines.append(f"Start: {event['start']}  End: {event['end']}")
             else:
-                cv2.putText(annotated,
-                           f"Start: {event['start']}",
-                           (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                extra_lines.append(f"Start: {event['start']}")
+            extra_lines.append(f"Threshold: Y>{threshold}  White ratio: {white_ratio:.3f}")
 
-            # Brightness analysis info
-            cv2.putText(annotated,
-                       f"Threshold: Y>{threshold}  White ratio: {white_ratio:.3f}",
-                       (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            # Standard header/footer
+            title = f"{event_type.upper()} EVENT {phase.upper()}"
+            add_header(annotated, title,
+                       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       extra_lines)
+            add_footer(annotated, self.camera_id)
 
-            # Camera ID
-            cv2.putText(annotated, f"CAM: {self.camera_id}", (w - 200, h - 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
-
-            # Save
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{event_type}_{phase}_{timestamp}.jpg"
-            filepath = self.screenshot_dir / filename
-            cv2.imwrite(str(filepath), annotated)
-            logger.info(f"Saved {event_type} screenshot: {filename}")
-            return str(filepath)
+            return save_screenshot(annotated, event_type, phase, datetime.now(),
+                                   self.screenshot_dir)
 
         except Exception as e:
             logger.error(f"Error saving {event_type} screenshot: {e}")

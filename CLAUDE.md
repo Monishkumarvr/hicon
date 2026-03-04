@@ -8,8 +8,9 @@ HiCon is a 2-camera edge AI vision system for induction furnace monitoring on **
 - **Cloud:** AGNI API (HMAC-SHA256 authenticated HTTPS POST)
 - **Design doc:** See `HiCon_Systems_Design.md` for full architecture and data flows
 - **Architecture decision:** See `HiCon_Architecture_Comparison.md` for standalone vs DeepStream analysis
+- **Technical architecture:** See `HiCon_Technical_Architecture.md` for deep codebase analysis, design reasoning, and performance data
 
-## Implementation Status (Updated: 2026-02-13)
+## Implementation Status (Updated: 2026-02-18)
 
 ### Implemented and verified in code
 - **Brightness stack unified:** tapping + deslagging + spectro all run in `brightness_processor.py` using shared CPU frame extraction.
@@ -27,6 +28,12 @@ HiCon is a 2-camera edge AI vision system for induction furnace monitoring on **
 - **Trolley relock behavior added:** when locked trolley ID disappears, padding re-locks to the best match (IoU/ confidence) so expand follows the active trolley.
 - **API payloads aligned to new format:** `/pouring` and `/melting` payloads are built from `heat_cycles` with `mould_count`, `heat_no`, and cycle-level flags.
 - **Furnace ID config added:** `HICON_FURNACE_ID` (defaults to `LOCATION`) used in melting payloads.
+- **Quadrant-based direction guard implemented:** Mould split detection uses quadrant tracking (Q1–Q4) instead of axis+sign, fixing spurious resets during diagonal trolley movements. Improved mould count accuracy from ~85% to ~98%.
+- **Split re-arm baseline gate added:** After a mould split, displacement must drop below threshold for 0.5s before next split can fire. Reduced false split rate from ~12% to <2%.
+- **Split cooldown added:** 1.5s time-based cooldown between splits prevents double-counting.
+- **Hybrid OR split trigger:** `magnitude_ok OR axis_only_ok` allows both diagonal and axis-dominant movements to trigger splits.
+- **MJPEG streaming server added:** `streaming/mjpeg_server.py` for live inference video (optional, disabled by default).
+- **Screenshot utilities added:** `utils/screenshot.py` with `prepare_frame`, `add_header`, `add_footer`, `save` for event captures with probe point overlays.
 
 ### Changes made but still requiring live validation closure
 - DS-native recording path has been actively iterated to address zero-byte outputs.
@@ -90,13 +97,11 @@ ai_vision/
 ├── processors/                     # Pad probe callbacks (all run in single process)
 │   ├── pouring_processor.py        # nvinfer detections → session/pour/mould logic
 │   ├── brightness_processor.py     # NumPy CPU brightness for tapping + deslagging + spectro
-│   ├── pyrometer_processor.py      # nvinfer detections → zone check + temporal
-│   └── spectro_processor.py        # Legacy placeholder (spectro runs inside brightness_processor)
+│   └── pyrometer_processor.py      # nvinfer detections → zone check + temporal
 │
 ├── state/
-│   ├── pouring_tracker.py          # Session + pour + mould state machines
-│   ├── brightness_tracker.py       # IDLE↔ACTIVE state machine (tapping & deslagging)
-│   └── heat_tracker.py             # Heat-level state machine
+│   ├── brightness_tracker.py       # IDLE↔ACTIVE state machine (tapping & deslagging & spectro)
+│   └── heat_cycle_manager.py       # Heat-level aggregation (tapping + pouring + deslagging + spectro)
 │
 ├── configs/
 │   ├── config_pouring_pgie.txt     # nvinfer config: best_pouring_hicon_v1_930
@@ -121,7 +126,16 @@ ai_vision/
 │       ├── best_pyro_rod_v1.onnx
 │       └── best_pyro_rod_v1.engine
 │
-├── db_manager.py                   # SQLite (melting_events + pouring_events)
+├── utils/
+│   ├── utils.py                    # Shared helpers (sync ID generation, etc.)
+│   ├── zone_loader.py              # Load ROI polygons from zones.json
+│   ├── screenshot.py               # Event screenshot capture (prepare, header/footer, save)
+│   └── visualization.py            # Overlay drawing utilities
+│
+├── streaming/
+│   └── mjpeg_server.py             # Optional MJPEG HTTP server for live inference video
+│
+├── db_manager.py                   # SQLite (melting_events + pouring_events + heat_cycles)
 ├── sync/
 │   ├── api_client.py               # HMAC-SHA256 HTTP client
 │   └── sync_manager.py             # 30s background sync thread
@@ -222,8 +236,14 @@ while l_obj is not None:
 **Pouring sub-systems (same logic as standalone, now in probe):**
 1. **Session manager:** mouth center inside trolley bbox (top-expanded by EDGE_EXPAND_PX) ≥1.0s start; end after mouth-missing tolerance + sustained absence window
 2. **Pour detector:** probe baseline 50px below mouth bottom, offsets `[(20,0),(30,0),(40,0)]`, HSV-V channel sampling, >230 (0.25s) start / <180 (1.0s) end, min 2.0s
-3. **Mould counter:** anchor displacement >0.15, sustained ≥1.5s, clustering (`R_CLUSTER=0.08`, `R_MERGE=0.05`) plus `MIN_CLUSTER_POUR_S` filter
+3. **Mould counter:** anchor displacement >0.15, sustained ≥1.5s (38 frames @ 25fps), quadrant-based direction guard (Q1–Q4), re-arm baseline gate (0.5s), split cooldown (1.5s), clustering (`R_CLUSTER=0.08`, `R_MERGE=0.05`) plus `MIN_CLUSTER_POUR_S` filter
 4. **Cycle timeout:** locked trolley cycle reset after 300s mouth absence
+
+**Mould split direction consistency:**
+- Tracks displacement quadrant: Q1 (right-up), Q2 (left-up), Q3 (left-down), Q4 (right-down)
+- Hold counter increments while displacement stays in same quadrant
+- Resets only on true direction reversal (quadrant change), NOT on dominant-axis oscillation
+- This allows diagonal trolley movements (where dx≈dy causes axis flipping) to accumulate smoothly
 
 ### Pyrometer Processor — nvinfer detections (custom parser)
 Runs in probe after `nvinfer` on Stream 1. Custom parser converts YOLO26 end-to-end output to `NvDsObjectMeta`.

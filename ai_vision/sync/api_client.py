@@ -58,7 +58,7 @@ class APIClient:
             API response dictionary
         """
         payload = {"items": items}
-        return self._post_with_hmac("/melting", payload)
+        return self._post_with_hmac("/agni", payload)
     
     def send_pouring_data(self, items: List[Dict]) -> Dict:
         """
@@ -78,7 +78,7 @@ class APIClient:
         POST request with HMAC authentication.
         
         Args:
-            endpoint: API endpoint (e.g., "/safety")
+            endpoint: API endpoint (e.g., "/pouring")
             payload: Request payload
         
         Returns:

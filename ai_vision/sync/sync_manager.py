@@ -153,7 +153,7 @@ class SyncManager:
         """
         Sync pending heat cycles to both endpoints:
         - /pouring (mould-wise pouring payload)
-        - /melting (melting cycle summary payload)
+        - /agni (melting cycle summary payload)
         """
         # Get unsynced heat cycles
         cycles = self.db.get_unsynced_heat_cycles(limit=self.batch_size)

@@ -2,35 +2,67 @@
   "metadata": {
     "version": "4.0",
     "created_at": "2026-02-10",
-    "updated_at": "2026-02-10",
+    "updated_at": "2026-03-02",
     "description": "Zone configuration for HiCon 2-stream system (Process + Pyrometer)",
-    "notes": "ROI points calibrated from 2560x1440 standalone coords, scaled 0.75 for 1920x1080 mux"
+    "notes": "All Stream 0 ROI points in native 2560x1440 camera resolution (ref_width/ref_height). Pyrometer zone_polygon is stream-native (no scaling).",
+    "ref_width": 1920,
+    "ref_height": 1080
   },
   "tapping": {
     "description": "Tapping detection zone on Stream 0 (Process Camera)",
     "roi_type": "quadrilateral",
     "roi_points": [
-      [1378, 268],
-      [1430, 236],
-      [1481, 320],
-      [1428, 352]
+      [
+        1378,
+        268
+      ],
+      [
+        1430,
+        236
+      ],
+      [
+        1481,
+        320
+      ],
+      [
+        1428,
+        352
+      ]
     ],
     "brightness_threshold": 180,
-    "start_white_ratio": 0.80,
+    "start_white_ratio": 0.8,
     "start_frame_count": 10,
-    "end_white_ratio": 0.60,
+    "end_white_ratio": 0.6,
     "end_frame_count": 20
   },
   "deslagging": {
     "description": "Deslagging detection zone on Stream 0 (Process Camera)",
     "roi_type": "polygon",
     "roi_points": [
-      [1207, 379],
-      [1357, 380],
-      [1375, 424],
-      [1304, 428],
-      [1288, 550],
-      [1262, 552]
+      [
+        1206,
+        354
+      ],
+      [
+        1356,
+        356
+      ],
+      [
+        1374,
+        400
+      ],
+      [
+        1304,
+        404
+      ],
+      [
+        1287,
+        526
+      ],
+      [
+        1262,
+        528
+      ]
     ],
     "brightness_threshold": 250,
     "start_white_ratio": 0.01,
@@ -41,10 +73,22 @@
   "pyrometer": {
     "description": "Pyrometer rod detection zone on Stream 1 (Pyrometer Camera)",
     "zone_polygon": [
-      [303, 151],
-      [303, 568],
-      [724, 568],
-      [724, 151]
+      [
+        303,
+        151
+      ],
+      [
+        303,
+        568
+      ],
+      [
+        724,
+        568
+      ],
+      [
+        724,
+        151
+      ]
     ],
     "confidence_threshold": 0.25,
     "temporal_in_frames": 10,
@@ -54,19 +98,37 @@
     "description": "Spectrometer reading detection zone on Stream 0 (Process Camera)",
     "roi_type": "polygon",
     "roi_points": [
-      [1535, 448],
-      [1527, 510],
-      [1550, 545],
-      [1558, 496],
-      [1595, 495],
-      [1600, 449]
+      [
+        1485,
+        459
+      ],
+      [
+        1477,
+        521
+      ],
+      [
+        1500,
+        556
+      ],
+      [
+        1508,
+        507
+      ],
+      [
+        1545,
+        506
+      ],
+      [
+        1550,
+        460
+      ]
     ],
     "brightness_threshold": 250,
     "start_white_ratio": 0.03,
     "start_frame_count": 10,
     "end_white_ratio": 0.03,
     "end_frame_count": 15,
-    "max_white_ratio": 0.20
+    "max_white_ratio": 0.2
   },
   "pouring": {
     "description": "Pouring detection parameters for Stream 0 (Process Camera)",
@@ -83,7 +145,7 @@
     "mould_sustained_duration": 1.5,
     "cluster_r_cluster": 0.08,
     "cluster_r_merge": 0.05,
-    "ladle_mouth_confidence": 0.40,
+    "ladle_mouth_confidence": 0.4,
     "trolley_confidence": 0.25
   }
 }

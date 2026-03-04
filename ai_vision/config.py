@@ -37,6 +37,7 @@ DEVICE_ID = os.getenv('HICON_DEVICE_ID', 'DEVICE001')
 # Stream 1 = Pyrometer camera (rod insertion detection)
 CAMERA_ID_STREAM_0 = os.getenv('HICON_CAMERA_ID_STREAM_0', 'Cam-Process')
 CAMERA_ID_STREAM_1 = os.getenv('HICON_CAMERA_ID_STREAM_1', 'Cam-Pyrometer')
+CAMERA_ID_STREAM_2 = os.getenv('HICON_CAMERA_ID_STREAM_2', 'Cam-Pouring2')
 LOCATION = os.getenv('HICON_LOCATION', 'Casting Section')
 FURNACE_ID = os.getenv('HICON_FURNACE_ID', LOCATION)
 
@@ -86,7 +87,15 @@ POUR_MIN_DURATION = float(os.getenv('HICON_POUR_MIN_DURATION', '2.0'))
 MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15'))
 MOULD_SUSTAINED_DURATION = float(os.getenv('HICON_MOULD_SUSTAINED', '1.5'))
 CLUSTER_R_CLUSTER = float(os.getenv('HICON_CLUSTER_R_CLUSTER', '0.08'))
-CLUSTER_R_MERGE = float(os.getenv('HICON_CLUSTER_R_MERGE', '0.05'))
+CLUSTER_R_MERGE = float(os.getenv('HICON_CLUSTER_R_MERGE', '0.05'))  # Euclidean distance threshold
+MOULD_SPLIT_MIN_DX_PX = float(os.getenv('HICON_MOULD_SPLIT_MIN_DX_PX', '12.0'))
+MOULD_SPLIT_MIN_DY_PX = float(os.getenv('HICON_MOULD_SPLIT_MIN_DY_PX', '12.0'))
+MOULD_SPLIT_COOLDOWN_S = float(os.getenv('HICON_MOULD_SPLIT_COOLDOWN_S', '1.5'))
+MOULD_SPLIT_REARM_BASELINE_S = float(os.getenv('HICON_MOULD_SPLIT_REARM_BASELINE_S', '0.5'))
+MOULD_SPLIT_DOM_RATIO = float(os.getenv('HICON_MOULD_SPLIT_DOM_RATIO', '1.35'))
+MOULD_AXIS_ONLY_MIN_MAG = float(os.getenv('HICON_MOULD_AXIS_ONLY_MIN_MAG', '0.05'))
+MOULD_SPLIT_REARM_DX_PX = float(os.getenv('HICON_MOULD_SPLIT_REARM_DX_PX', '10.0'))
+MOULD_SPLIT_REARM_DY_PX = float(os.getenv('HICON_MOULD_SPLIT_REARM_DY_PX', '14.0'))
 LOG_MOULD_DISPLACEMENT = os.getenv('HICON_LOG_MOULD_DISPLACEMENT', 'false').lower() == 'true'
 MOULD_DISP_LOG_INTERVAL_S = float(os.getenv('HICON_MOULD_DISP_LOG_INTERVAL_S', '0.25'))
 
@@ -119,16 +128,24 @@ INFERENCE_VIDEO_WIDTH = int(os.getenv('HICON_INFERENCE_VIDEO_WIDTH', '640'))
 INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))
 
 # =============================================================================
-# RTSP STREAMS (2-stream HiCon pipeline)
+# RTSP STREAMS (3-stream HiCon pipeline)
 # =============================================================================
 
 # Stream 0: Process camera (tapping, pouring, deslagging, spectro)
 # Stream 1: Pyrometer camera (rod insertion detection)
+# Stream 2: Second pouring camera (pouring detection only)
 ENABLE_RTSP_STREAM_0 = os.getenv('HICON_ENABLE_RTSP_STREAM_0', 'true').lower() == 'true'
 ENABLE_RTSP_STREAM_1 = os.getenv('HICON_ENABLE_RTSP_STREAM_1', 'true').lower() == 'true'
+ENABLE_RTSP_STREAM_2 = os.getenv('HICON_ENABLE_RTSP_STREAM_2', 'true').lower() == 'true'
 
-RTSP_STREAM_0 = os.getenv('HICON_RTSP_STREAM_0', 'rtsp://100.78.173.43:8554/mystream') if ENABLE_RTSP_STREAM_0 else ''
-RTSP_STREAM_1 = os.getenv('HICON_RTSP_STREAM_1', 'rtsp://100.78.173.43:8554/mystream1') if ENABLE_RTSP_STREAM_1 else ''
+RTSP_STREAM_0 = os.getenv('HICON_RTSP_STREAM_0', '') if ENABLE_RTSP_STREAM_0 else ''
+RTSP_STREAM_1 = os.getenv('HICON_RTSP_STREAM_1', '') if ENABLE_RTSP_STREAM_1 else ''
+RTSP_STREAM_2 = os.getenv('HICON_RTSP_STREAM_2', '') if ENABLE_RTSP_STREAM_2 else ''
+
+# Per-stream codec selection: 'h265' (default for all cameras) or 'h264'
+RTSP_CODEC_0 = os.getenv('HICON_RTSP_CODEC_0', 'h265')
+RTSP_CODEC_1 = os.getenv('HICON_RTSP_CODEC_1', 'h265')
+RTSP_CODEC_2 = os.getenv('HICON_RTSP_CODEC_2', 'h265')
 
 # RTSP connection timeout (microseconds, 0 disables)
 RTSP_TCP_TIMEOUT_US = int(os.getenv('HICON_RTSP_TCP_TIMEOUT_US', '60000000'))
@@ -143,13 +160,20 @@ RTSP_RESTART_STALE_SEC = int(os.getenv('HICON_RTSP_RESTART_STALE_SEC', '90'))
 RTSP_RESTART_COOLDOWN_SEC = int(os.getenv('HICON_RTSP_RESTART_COOLDOWN_SEC', '60'))
 RTSP_RESTART_BACKOFF_SEC = int(os.getenv('HICON_RTSP_RESTART_BACKOFF_SEC', '5'))
 
+# Healthchecks.io heartbeat URL (empty = disabled)
+# Ping every 60s from watchdog; /fail on fatal error
+HEALTHCHECK_URL = os.getenv('HICON_HEALTHCHECK_URL', '')
+
 # Debug/diagnostic flags
 BYPASS_STREAM_0_INFER = os.getenv('HICON_BYPASS_STREAM_0_INFER', 'false').lower() == 'true'
 BYPASS_STREAM_1_INFER = os.getenv('HICON_BYPASS_STREAM_1_INFER', 'false').lower() == 'true'
+BYPASS_STREAM_2_INFER = os.getenv('HICON_BYPASS_STREAM_2_INFER', 'false').lower() == 'true'
 ENABLE_DEBUG_PROBES = os.getenv('HICON_ENABLE_DEBUG_PROBES', 'true').lower() == 'true'
 LOG_SOURCE_IDS = os.getenv('HICON_LOG_SOURCE_IDS', 'true').lower() == 'true'
 ENABLE_STREAM_0_PROBE = os.getenv('HICON_ENABLE_STREAM_0_PROBE', 'true').lower() == 'true'
 ENABLE_STREAM_1_PROBE = os.getenv('HICON_ENABLE_STREAM_1_PROBE', 'true').lower() == 'true'
+ENABLE_STREAM_2_PROBE = os.getenv('HICON_ENABLE_STREAM_2_PROBE', 'true').lower() == 'true'
+ENABLE_BRIGHTNESS_STREAM_2 = False  # Stream 2 is pouring-only; no brightness checks
 
 # =============================================================================
 # PATH CONFIGURATION
@@ -166,9 +190,10 @@ VIDEO_DIR = Path(os.getenv('HICON_VIDEO_DIR', str(BASE_DIR / 'output/videos')))
 # MODEL CONFIGURATION
 # =============================================================================
 
-# DeepStream nvinfer config files (HiCon 2-model pipeline)
+# DeepStream nvinfer config files (HiCon 3-stream pipeline)
 CONFIG_POURING = str(CONFIG_DIR / 'config_pouring_pgie.txt')
 CONFIG_PYROMETER = str(CONFIG_DIR / 'config_pyrometer_pgie.txt')
+CONFIG_POURING_2 = str(CONFIG_DIR / 'config_pouring2_pgie.txt')  # GIE-3: Stream 2 pouring
 
 # =============================================================================
 # DATABASE CONFIGURATION
@@ -195,6 +220,20 @@ TRACKER_CONFIG = os.getenv(
 # =============================================================================
 
 ENABLE_SYNC = os.getenv('HICON_ENABLE_SYNC', 'true').lower() == 'true'
+
+# =============================================================================
+# LIVE STREAMING CONFIGURATION
+# =============================================================================
+
+ENABLE_LIVE_STREAM = os.getenv('HICON_ENABLE_LIVE_STREAM', 'false').lower() == 'true'
+LIVE_STREAM_HOST = os.getenv('HICON_LIVE_STREAM_HOST', '0.0.0.0')
+LIVE_STREAM_PORT = int(os.getenv('HICON_LIVE_STREAM_PORT', '8080'))
+LIVE_STREAM_QUALITY = int(os.getenv('HICON_LIVE_STREAM_QUALITY', '85'))  # JPEG quality 0-100
+LIVE_STREAM_FPS = int(os.getenv('HICON_LIVE_STREAM_FPS', '15'))  # Max FPS for stream
+
+# Per-stream live streaming control (default: follow ENABLE_LIVE_STREAM)
+ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'true'
+ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 
 
 # =============================================================================
@@ -261,6 +300,14 @@ def get_config_summary():
         'pouring_cycle_timeout_s': POURING_CYCLE_TIMEOUT_S,
         'mould_switch_min_pour_s': MOULD_SWITCH_MIN_POUR_S,
         'min_cluster_pour_s': MIN_CLUSTER_POUR_S,
+        'mould_split_min_dx_px': MOULD_SPLIT_MIN_DX_PX,
+        'mould_split_min_dy_px': MOULD_SPLIT_MIN_DY_PX,
+        'mould_split_cooldown_s': MOULD_SPLIT_COOLDOWN_S,
+        'mould_split_rearm_baseline_s': MOULD_SPLIT_REARM_BASELINE_S,
+        'mould_split_dom_ratio': MOULD_SPLIT_DOM_RATIO,
+        'mould_axis_only_min_mag': MOULD_AXIS_ONLY_MIN_MAG,
+        'mould_split_rearm_dx_px': MOULD_SPLIT_REARM_DX_PX,
+        'mould_split_rearm_dy_px': MOULD_SPLIT_REARM_DY_PX,
         'log_mould_displacement': LOG_MOULD_DISPLACEMENT,
         'mould_disp_log_interval_s': MOULD_DISP_LOG_INTERVAL_S,
         'enable_inference_video': ENABLE_INFERENCE_VIDEO,

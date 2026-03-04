@@ -49,7 +49,8 @@ class PouringProcessor:
     ANY → mouth absent from locked trolley 5 min → CYCLE END (reset everything)
     """
 
-    def __init__(self, db_manager, config, screenshot_dir: str, heat_cycle_manager=None):
+    def __init__(self, db_manager, config, screenshot_dir: str, heat_cycle_manager=None,
+                 camera_id_override: str = None):
         self.db_manager = db_manager
         self.config = config
         self.screenshot_dir = Path(screenshot_dir)
@@ -58,7 +59,7 @@ class PouringProcessor:
         # Customer/location
         self.customer_id = config.CUSTOMER_ID
         self.location = config.LOCATION
-        self.camera_id = config.CAMERA_ID_STREAM_0
+        self.camera_id = camera_id_override if camera_id_override else config.CAMERA_ID_STREAM_0
 
         # Detection thresholds
         self.mouth_conf = config.MOUTH_CONFIDENCE
