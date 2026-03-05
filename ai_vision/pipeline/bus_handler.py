@@ -213,9 +213,9 @@ class BusHandler:
             stale = self.check_stale_streams()
             total = len(self.last_frame_time)
 
-            if len(stale) == total and total > 0:
+            if stale:
                 logger.critical(
-                    f"[WATCHDOG] All {total} streams stale for "
+                    f"[WATCHDOG] Stream(s) {stale} stale for "
                     f">{self.stale_threshold_sec}s — quitting pipeline"
                 )
                 self._ping_healthcheck("/fail")
