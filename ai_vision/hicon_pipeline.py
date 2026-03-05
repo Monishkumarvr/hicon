@@ -557,7 +557,7 @@ def main():
             logger.warning("Inference video enabled but tee_0 is missing; recording disabled")
 
     recording_manager_1 = None
-    if config.ENABLE_INFERENCE_VIDEO and 1 in enabled_streams:
+    if config.ENABLE_INFERENCE_VIDEO:
         tee_1 = elements.get('tee_1')
         if tee_1:
             recording_manager_1 = RecordingManager(
