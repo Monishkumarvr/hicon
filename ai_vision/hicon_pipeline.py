@@ -556,6 +556,25 @@ def main():
         else:
             logger.warning("Inference video enabled but tee_0 is missing; recording disabled")
 
+    recording_manager_1 = None
+    if config.ENABLE_INFERENCE_VIDEO and 1 in enabled_streams:
+        tee_1 = elements.get('tee_1')
+        if tee_1:
+            recording_manager_1 = RecordingManager(
+                output_dir=str(config.VIDEO_DIR / 'inference'),
+                stream_id=1,
+                target_fps=config.INFERENCE_VIDEO_FPS,
+                target_width=config.INFERENCE_VIDEO_WIDTH,
+                target_height=config.INFERENCE_VIDEO_HEIGHT,
+            )
+            if recording_manager_1.setup_recording_branch(pipeline, tee_1):
+                logger.info("Stream 1: DS-native inference recording branch configured")
+            else:
+                logger.error("Stream 1: failed to configure inference recording branch")
+                recording_manager_1 = None
+        else:
+            logger.warning("Inference video enabled but tee_1 missing; stream 1 recording disabled")
+
     # Attach pad probes
     # Stream 0: OSD sink pad probe (pouring + brightness)
     if 'nvosd_0' in elements and elements['nvosd_0']:
@@ -631,6 +650,8 @@ def main():
     # Configure recording file before PLAYING so filesink location is set in NULL/READY state
     if recording_manager:
         recording_manager.start_recording(event_prefix="inference_stream0")
+    if recording_manager_1:
+        recording_manager_1.start_recording(event_prefix="inference_stream1")
 
     # Start pipeline
     logger.info("Starting pipeline...")
@@ -676,6 +697,11 @@ def main():
                 recording_manager.stop_recording()
             except Exception as e:
                 logger.error(f"Error stopping recording manager: {e}", exc_info=True)
+        if recording_manager_1:
+            try:
+                recording_manager_1.stop_recording()
+            except Exception as e:
+                logger.error(f"Error stopping recording manager 1: {e}", exc_info=True)
         if pouring_processor:
             try:
                 pouring_processor.close()
