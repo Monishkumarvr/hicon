@@ -39,10 +39,16 @@ class BusHandler:
         self.loop = loop
         self.last_frame_time = {}
         self.stale_threshold_sec = 600  # 10 min watchdog
+        self._frame_counts = {}       # {stream_id: int} — rolling 10s counter
+        self._fps_log_interval = 10   # seconds
         self._healthcheck_url = (healthcheck_url or "").rstrip("/")
 
         # Per-source RTSP error timestamps for rate-limiting
         self._rtsp_errors = {}  # {source_name: [timestamp, ...]}
+
+        # Set True when quitting due to error so hicon_pipeline can sys.exit(1)
+        # for systemd Restart=on-failure to trigger. EOS/SIGTERM stay False (clean exit).
+        self.fatal_exit = False
 
         bus = pipeline.get_bus()
         bus.add_signal_watch()
@@ -133,12 +139,14 @@ class BusHandler:
                 if self._track_rtsp_error(src_name):
                     # Rate limit exceeded → fatal
                     self._ping_healthcheck("/fail")
+                    self.fatal_exit = True
                     self.loop.quit()
                 # Otherwise: suppress, let rtspsrc handle reconnection
             else:
                 # Non-RTSP error (nvinfer, decoder, mux, etc.) → fatal
                 logger.error(f"[FATAL] Non-recoverable error from {src_name}")
                 self._ping_healthcheck("/fail")
+                self.fatal_exit = True
                 self.loop.quit()
 
         elif t == Gst.MessageType.WARNING:
@@ -154,8 +162,9 @@ class BusHandler:
                 )
 
     def update_frame_time(self, stream_id):
-        """Call from probe to update last frame timestamp."""
+        """Call from probe to update last frame timestamp and increment frame counter."""
         self.last_frame_time[stream_id] = time.time()
+        self._frame_counts[stream_id] = self._frame_counts.get(stream_id, 0) + 1
 
     def check_stale_streams(self):
         """Check if any stream has gone stale (no frames for threshold)."""
@@ -169,6 +178,25 @@ class BusHandler:
                     f"Stream {sid} stale: no frames for {elapsed:.0f}s"
                 )
         return stale
+
+    def start_fps_logger(self):
+        """Log per-stream frame count and FPS every 10 seconds via GLib timer."""
+        from gi.repository import GLib
+
+        def _fps_tick():
+            if not self._frame_counts:
+                return True
+            parts = []
+            for sid in sorted(self._frame_counts):
+                count = self._frame_counts[sid]
+                fps = count / self._fps_log_interval
+                parts.append(f"Stream {sid}: {count} frames ({fps:.1f} fps)")
+                self._frame_counts[sid] = 0  # reset for next interval
+            logger.info("[FPS] " + " | ".join(parts))
+            return True  # keep timer alive
+
+        GLib.timeout_add_seconds(self._fps_log_interval, _fps_tick)
+        logger.info(f"FPS logger started (every {self._fps_log_interval}s)")
 
     def start_watchdog(self, interval_sec=60):
         """
@@ -191,6 +219,7 @@ class BusHandler:
                     f">{self.stale_threshold_sec}s — quitting pipeline"
                 )
                 self._ping_healthcheck("/fail")
+                self.fatal_exit = True
                 self.loop.quit()
                 return False  # Stop timer
 

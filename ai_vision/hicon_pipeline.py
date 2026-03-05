@@ -648,6 +648,7 @@ def main():
         if _key in elements and elements[_key]:
             bus_handler.update_frame_time(_sid)
     bus_handler.start_watchdog(interval_sec=60)
+    bus_handler.start_fps_logger()
 
     # Log config summary
     summary = config.get_config_summary()
@@ -687,6 +688,9 @@ def main():
                 logger.error(f"Error closing pouring processor 2: {e}", exc_info=True)
         pipeline.set_state(Gst.State.NULL)
         logger.info("Pipeline stopped")
+
+    if bus_handler.fatal_exit:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
