@@ -461,8 +461,26 @@ class DeepStreamPipelineBuilder:
 
         encoding_name = (structure.get_string("encoding-name") or "").upper()
 
-        # Silently skip audio tracks — cameras (CP Plus, Hikvision) multiplex audio+video
+        # Audio tracks must be consumed (not silently dropped) — rtspsrc already did
+        # SETUP/PLAY for the audio RTSP session before this callback fires. Leaving
+        # the pad unlinked causes RTP buffer buildup and RTCP Receiver Report starvation,
+        # which makes the camera time out and drop the entire connection (~4-5 min).
         if encoding_name in self._AUDIO_ENCODINGS:
+            audio_sink = Gst.ElementFactory.make(
+                "fakesink", f"audio-discard-{stream_id}-{id(pad)}"
+            )
+            if audio_sink:
+                audio_sink.set_property('sync', False)
+                audio_sink.set_property('async', False)
+                self.pipeline.add(audio_sink)
+                audio_sink.sync_state_with_parent()
+                try:
+                    pad.link(audio_sink.get_static_pad("sink"))
+                    logger.debug(
+                        f"Stream {stream_id}: audio ({encoding_name}) → discard sink"
+                    )
+                except Exception:
+                    pass
             return
 
         expected_codec = str(self.config.get(f'rtsp_codec_{stream_id}', 'h265')).upper()
