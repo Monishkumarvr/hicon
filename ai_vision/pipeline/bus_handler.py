@@ -41,6 +41,8 @@ class BusHandler:
         self.stale_threshold_sec = 600  # 10 min watchdog
         self._frame_counts = {}       # {stream_id: int} — rolling 10s counter
         self._fps_log_interval = 10   # seconds
+        self._zero_fps_counts = {}    # {stream_id: int} — consecutive 0fps intervals
+        self._zero_fps_limit = 3      # 3 × 10s = 30s of 0fps → restart
         self._healthcheck_url = (healthcheck_url or "").rstrip("/")
 
         # Per-source RTSP error timestamps for rate-limiting
@@ -192,6 +194,23 @@ class BusHandler:
                 fps = count / self._fps_log_interval
                 parts.append(f"Stream {sid}: {count} frames ({fps:.1f} fps)")
                 self._frame_counts[sid] = 0  # reset for next interval
+
+                # Dead stream detection: N consecutive 0fps intervals → restart
+                if count == 0 and sid in self.last_frame_time:
+                    self._zero_fps_counts[sid] = self._zero_fps_counts.get(sid, 0) + 1
+                    if self._zero_fps_counts[sid] >= self._zero_fps_limit:
+                        logger.info("[FPS] " + " | ".join(parts))
+                        logger.critical(
+                            f"[FPS-WATCHDOG] Stream {sid} at 0fps for "
+                            f"{self._zero_fps_limit * self._fps_log_interval}s — restarting"
+                        )
+                        self._ping_healthcheck("/fail")
+                        self.fatal_exit = True
+                        self.loop.quit()
+                        return False
+                else:
+                    self._zero_fps_counts[sid] = 0  # reset on any frames
+
             logger.info("[FPS] " + " | ".join(parts))
             return True  # keep timer alive
 

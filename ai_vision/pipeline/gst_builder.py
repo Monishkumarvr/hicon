@@ -435,11 +435,9 @@ class DeepStreamPipelineBuilder:
         expected_codec = str(self.config.get(f'rtsp_codec_{stream_id}', 'h265')).upper()
         expected_encoding = "H265" if expected_codec == "H265" else "H264"
 
+        # Silently skip non-video tracks (ONVIF metadata, unknown encodings)
         if encoding_name != expected_encoding:
-            logger.warning(
-                f"Stream {stream_id}: RTP encoding={encoding_name!r}, "
-                f"expected={expected_encoding!r}. Attempting to link anyway."
-            )
+            return
 
         depay_sinkpad = self.elements[f'depay{stream_id}'].get_static_pad("sink")
         if not depay_sinkpad.is_linked():
