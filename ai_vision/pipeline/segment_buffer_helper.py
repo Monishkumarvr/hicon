@@ -107,6 +107,7 @@ class SegmentBufferHelper:
         stream_id: int,
         rtsp_url: str,
         codec: str,
+        fps: float = 25.0,
         buffer_dir: str,
         segment_seconds: int,
         delay_seconds: int,
@@ -115,6 +116,7 @@ class SegmentBufferHelper:
         self.stream_id = stream_id
         self.rtsp_url = rtsp_url
         self.codec = codec.lower()
+        self.fps = max(1.0, float(fps))
         self.buffer_dir = Path(buffer_dir)
         self.segments_root = self.buffer_dir / SEGMENTS_DIR_NAME
         self.fifo_path = self.buffer_dir / FIFO_NAME
@@ -123,7 +125,7 @@ class SegmentBufferHelper:
         self.delay_seconds = max(self.segment_seconds, int(delay_seconds))
         self.retention_seconds = max(self.delay_seconds, int(retention_seconds))
         self.target_segments = max(1, math.ceil(self.delay_seconds / self.segment_seconds))
-        self.low_watermark_segments = max(1, self.target_segments // 2)
+        self.low_watermark_segments = max(1, self.target_segments // 4)
 
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
@@ -231,10 +233,16 @@ class SegmentBufferHelper:
         self._last_published_state = state
 
     def _build_ffmpeg_reader_cmd(self) -> list[str]:
-        """RTSP reader: camera → MPEGTS → stdout pipe.
+        """RTSP reader: camera → raw H264 bitstream → stdout pipe.
 
-        No -stimeout: matches the standalone '/dev/null' test that survived 27+ min
-        zero drops. File I/O is fully decoupled — the camera session never blocks.
+        Raw H264 (not MPEGTS) avoids timestamp discontinuity issues: when the camera
+        briefly resets its RTSP session, MPEGTS timestamps jump and confuse the
+        segment muxer. Raw H264 carries no timestamps so the segmenter assigns its
+        own frame-rate-based timestamps and splits cleanly regardless of camera events.
+
+        -stimeout 10000000: exit after 10s of no data so the writer_loop can start a
+        new epoch promptly. Without this the reader can get stuck in TCP FIN-WAIT-1
+        (camera stops RTP but doesn't close TCP) and block the pipe indefinitely.
         """
         return [
             "ffmpeg",
@@ -244,6 +252,8 @@ class SegmentBufferHelper:
             "-nostdin",
             "-rtsp_transport",
             "tcp",
+            "-stimeout",
+            "10000000",
             "-i",
             self.rtsp_url,
             "-map",
@@ -252,24 +262,29 @@ class SegmentBufferHelper:
             "copy",
             "-an",
             "-f",
-            "mpegts",
+            "h264",
             "pipe:1",
         ]
 
     def _build_ffmpeg_segmenter_cmd(self, epoch_dir: Path) -> list[str]:
-        """Segmenter: MPEGTS from stdin pipe → raw H264 segment files.
+        """Segmenter: raw H264 bitstream from stdin pipe → H264 segment files.
 
-        MPEGTS carries PTS/DTS through the pipe so the segmenter can split on
-        time boundaries correctly. NO -nostdin: stdin IS the input pipe.
+        -f h264 -r {fps}: demux as raw H264 and assign timestamps at the camera's
+        native framerate. The segment muxer then splits every segment_seconds based
+        on these assigned timestamps rather than on RTSP PTS values, making it immune
+        to camera timestamp discontinuities. NO -nostdin: stdin IS the input pipe.
         """
         output_pattern = str(epoch_dir / "seg_%06d.h264")
+        fps = str(self.fps)
         return [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
             "-f",
-            "mpegts",
+            "h264",
+            "-r",
+            fps,
             "-i",
             "pipe:0",
             "-map",
@@ -560,6 +575,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-id", type=int, required=True)
     parser.add_argument("--rtsp-url", required=True)
     parser.add_argument("--codec", required=True)
+    parser.add_argument("--fps", type=float, default=25.0)
     parser.add_argument("--buffer-dir", required=True)
     parser.add_argument("--segment-seconds", type=int, required=True)
     parser.add_argument("--delay-seconds", type=int, required=True)
@@ -577,6 +593,7 @@ def main() -> int:
         stream_id=args.stream_id,
         rtsp_url=args.rtsp_url,
         codec=args.codec,
+        fps=args.fps,
         buffer_dir=args.buffer_dir,
         segment_seconds=args.segment_seconds,
         delay_seconds=args.delay_seconds,

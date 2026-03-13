@@ -569,6 +569,7 @@ class DeepStreamPipelineBuilder:
                 fifo_path.unlink()
             except OSError:
                 pass
+        fps = float(self.config.get(f'rtsp_fps_{stream_id}', 25.0) or 25.0)
         helper_cmd = [
             sys.executable,
             str(helper_path),
@@ -578,6 +579,8 @@ class DeepStreamPipelineBuilder:
             rtsp_url,
             "--codec",
             codec,
+            "--fps",
+            str(fps),
             "--buffer-dir",
             str(buffer_dir),
             "--segment-seconds",
