@@ -329,6 +329,45 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 - Full pipeline watchdog: no frames > 10 min → systemd restart
 - Recording: post-OSD tee branch managed by `RecordingManager` for inference video capture
 
+## Stream 0 Segment Buffer (CP Plus drop isolation)
+
+**Problem:** CP Plus (Dahua OEM) firmware gracefully closes TCP RTSP sessions every ~4-5 min
+(code=0). No transport config or keepalive prevents it. Standalone `ffmpeg ... /dev/null` test
+survived 27+ min zero drops; `-f segment` (disk writes) triggers the firmware timeout.
+
+**Solution (deployed):** 60-second segment buffer spool.
+```
+camera (TCP) → ffmpeg (-f segment raw H264) → /dev/shm/hicon/stream0-buffer/segments/
+                                                  ↓ (helper paces at natural bitrate)
+                                                FIFO → fdsrc → h264parse → decoder → pipeline
+```
+- `HICON_USE_SEGMENT_BUFFER_0=true`, `HICON_SEGMENT_BUFFER_DELAY_SEC_0=60`
+- ffmpeg writes `.h264` segments (2s each) to per-epoch tmpfs dirs
+- `pipeline/segment_buffer_helper.py` feeds completed segments into FIFO at real-time pace
+- GStreamer: static chain `fdsrc → segbufq(leaky) → h264parse(config-interval=-1) → decoder`
+- Result: 4 camera drops in 10 min → **0 watchdog fires, 0 0fps events**. Drops fully transparent.
+
+**Known bugs fixed in segment_buffer_helper.py:**
+- **14fps burst**: large FIFO → instant segment write → HW decoder burst → GPU 33%↔1%. Fixed:
+  `_write_segment()` paces writes at `file_size/segment_seconds` bytes/sec in 64KB chunks.
+- **Deadline base**: `_advance_feed_deadline()` uses `write_start` (not write-end) as base, so
+  the 2s rate-limited write duration doesn't add to the 2s feed interval (double-wait bug).
+- **FIFO pipe size**: `F_SETPIPE_SZ` fallback loop 1MB→512KB→256KB (system max=1MB on Jetson).
+  Silent failure on 4MB request fixed.
+- **DTS log flood**: `ffmpeg -loglevel error` (was `warning` — caused Non-monotonous DTS spam).
+- **FIFO race**: `gst_builder.py` deletes leftover FIFO before spawning helper.
+- **tsdemux deadlock**: switched from MPEGTS chain to raw H264 segments + static fdsrc chain.
+
+**Ongoing (planned):** Camera still drops every ~4-5 min (just transparent). To eliminate drops,
+a dual-ffmpeg architecture decouples the RTSP reader from disk I/O:
+1. **Reader**: `ffmpeg -rtsp_transport tcp -i {url} -f mpegts pipe:1` — zero disk I/O, no
+   `-stimeout`. Emulates `/dev/null` test conditions for the camera session.
+2. **Segmenter**: `ffmpeg -f mpegts -i pipe:0 -f segment -segment_time 2 seg_%06d.h264` — reads
+   MPEGTS from stdin, writes segments. Disk I/O fully decoupled from RTSP session.
+A 1MB `F_SETPIPE_SZ` pipe between them absorbs momentary segmenter stalls.
+
+**Investigation doc:** `ai_vision/docs/rtsp_stream0_investigation.md`
+
 ## Cloud Sync (AGNI API)
 - **POST /api/v1/melting** — tapping, deslagging, spectro events
 - **POST /api/v1/pouring** — pouring sessions with mould counts

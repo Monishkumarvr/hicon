@@ -130,6 +130,7 @@ class SegmentBufferHelper:
         self._active_epoch: int | None = None
         self._finalized_epochs: set[int] = set()
         self._ffmpeg_proc: subprocess.Popen | None = None
+        self._ffmpeg_segmenter_proc: subprocess.Popen | None = None
         self._last_fed: SegmentRef | None = None
         self._fed_history: deque[tuple[float, SegmentRef]] = deque()
         self._fifo_guard_read_fd: int | None = None
@@ -229,8 +230,12 @@ class SegmentBufferHelper:
         os.replace(tmp_path, self.state_path)
         self._last_published_state = state
 
-    def _build_ffmpeg_cmd(self, epoch_dir: Path) -> list[str]:
-        output_pattern = str(epoch_dir / "seg_%06d.h264")
+    def _build_ffmpeg_reader_cmd(self) -> list[str]:
+        """RTSP reader: camera → MPEGTS → stdout pipe.
+
+        No -stimeout: matches the standalone '/dev/null' test that survived 27+ min
+        zero drops. File I/O is fully decoupled — the camera session never blocks.
+        """
         return [
             "ffmpeg",
             "-hide_banner",
@@ -239,10 +244,34 @@ class SegmentBufferHelper:
             "-nostdin",
             "-rtsp_transport",
             "tcp",
-            "-stimeout",
-            "10000000",
             "-i",
             self.rtsp_url,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            "-f",
+            "mpegts",
+            "pipe:1",
+        ]
+
+    def _build_ffmpeg_segmenter_cmd(self, epoch_dir: Path) -> list[str]:
+        """Segmenter: MPEGTS from stdin pipe → raw H264 segment files.
+
+        MPEGTS carries PTS/DTS through the pipe so the segmenter can split on
+        time boundaries correctly. NO -nostdin: stdin IS the input pipe.
+        """
+        output_pattern = str(epoch_dir / "seg_%06d.h264")
+        return [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "mpegts",
+            "-i",
+            "pipe:0",
             "-map",
             "0:v:0",
             "-c:v",
@@ -252,6 +281,8 @@ class SegmentBufferHelper:
             "segment",
             "-segment_time",
             str(self.segment_seconds),
+            "-reset_timestamps",
+            "1",
             output_pattern,
         ]
 
@@ -269,16 +300,25 @@ class SegmentBufferHelper:
             proc = self._spawn_ffmpeg(epoch_dir)
             self._ffmpeg_proc = proc
             exit_code = proc.wait()
+            # Reader exited — terminate the segmenter (its stdin pipe is now broken).
+            seg = self._ffmpeg_segmenter_proc
+            if seg and seg.poll() is None:
+                seg.terminate()
+                try:
+                    seg.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    seg.kill()
             with self._state_lock:
                 self._finalized_epochs.add(epoch)
                 self._active_epoch = None
                 self._ffmpeg_proc = None
+                self._ffmpeg_segmenter_proc = None
 
             if self._stop_event.is_set():
                 break
 
             logger.warning(
-                "Stream %s: ffmpeg exited (code=%s), restarting in %.0fs",
+                "Stream %s: ffmpeg reader exited (code=%s), restarting in %.0fs",
                 self.stream_id,
                 exit_code,
                 RESTART_DELAY_SEC,
@@ -287,19 +327,69 @@ class SegmentBufferHelper:
             self._stop_event.wait(RESTART_DELAY_SEC)
 
     def _spawn_ffmpeg(self, epoch_dir: Path) -> subprocess.Popen:
-        cmd = self._build_ffmpeg_cmd(epoch_dir)
+        """Spawn reader + segmenter connected by a pipe. Return the reader process.
+
+        The reader reads RTSP and writes MPEGTS to the pipe — zero disk I/O, no
+        -stimeout, emulating the standalone /dev/null test that survived 27+ min.
+        The segmenter reads MPEGTS from the pipe and writes segment files — disk I/O
+        is completely decoupled from the camera session. A 1MB pipe absorbs brief
+        segmenter stalls without blocking the reader.
+        """
+        pipe_read_fd, pipe_write_fd = os.pipe()
+        for sz in (1024 * 1024, 512 * 1024, 256 * 1024):
+            try:
+                fcntl.fcntl(pipe_write_fd, fcntl.F_SETPIPE_SZ, sz)
+                logger.info(
+                    "Stream %s: inter-ffmpeg pipe size set to %d KB",
+                    self.stream_id,
+                    sz // 1024,
+                )
+                break
+            except OSError:
+                continue
+
+        reader_cmd = self._build_ffmpeg_reader_cmd()
+        segmenter_cmd = self._build_ffmpeg_segmenter_cmd(epoch_dir)
         logger.warning(
-            "Stream %s: ffmpeg segment writer starting (segment=%ss, epoch_dir=%s)",
+            "Stream %s: dual-ffmpeg starting (segment=%ss, epoch_dir=%s)",
             self.stream_id,
             self.segment_seconds,
             epoch_dir,
         )
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=None,
-            start_new_session=False,
+        reader_proc = subprocess.Popen(
+            reader_cmd,
+            stdout=pipe_write_fd,
+            stderr=subprocess.PIPE,
+            close_fds=True,
         )
+        segmenter_proc = subprocess.Popen(
+            segmenter_cmd,
+            stdin=pipe_read_fd,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        os.close(pipe_read_fd)
+        os.close(pipe_write_fd)
+        self._ffmpeg_segmenter_proc = segmenter_proc
+        threading.Thread(
+            target=self._drain_stderr, args=(reader_proc, "reader"), daemon=True
+        ).start()
+        threading.Thread(
+            target=self._drain_stderr, args=(segmenter_proc, "segmenter"), daemon=True
+        ).start()
+        return reader_proc
+
+    def _drain_stderr(self, proc: subprocess.Popen, label: str) -> None:
+        """Drain a subprocess's stderr to the logger to prevent pipe blocking."""
+        if proc.stderr is None:
+            return
+        for line in proc.stderr:
+            msg = line.decode(errors="replace").rstrip()
+            if msg:
+                logger.warning(
+                    "Stream %s: ffmpeg-%s: %s", self.stream_id, label, msg
+                )
+        proc.stderr.close()
 
     def _feeder_loop(self) -> None:
         self._fifo_data_write_fd = os.open(self.fifo_path, os.O_WRONLY)
@@ -455,14 +545,14 @@ class SegmentBufferHelper:
                 pass
 
     def _terminate_ffmpeg(self) -> None:
-        proc = self._ffmpeg_proc
-        if proc is None or proc.poll() is not None:
-            return
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        for proc in (self._ffmpeg_proc, self._ffmpeg_segmenter_proc):
+            if proc is None or proc.poll() is not None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

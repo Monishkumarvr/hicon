@@ -1162,3 +1162,94 @@ At the end of March 12, the repo had moved to an **experimental Stream 0 segment
 - Stream 0 MediaMTX relay is forced to **on-demand** when segment-buffer mode is enabled so it does not hold a second always-on RTSP session.
 - same-day repair for helper pacing, helper state publication, and bus-handler suppression is in code.
 - **Live validation of the repaired segment-buffer path is still pending.**
+
+---
+
+## March 13, 2026: Segment Buffer Validation, Bug Fixes, and /dev/null Emulation Planning
+
+### Validation of Segment Buffer (March 12–13 soak)
+
+**MediaMTX hypothesis disproven.**
+Hypothesis going into March 13 was that `hicon-mediamtx.service` was competing for the same camera
+sub-stream URL, creating two RTSP sessions and halving the drop interval. `hicon-mediamtx` was
+stopped and a soak test was run. Result: ffmpeg `code=0` drops continued at the same ~4-5 minute
+rate. MediaMTX was not the cause.
+
+**Segment buffer validated: drops are fully transparent.**
+With the segment buffer enabled (`HICON_USE_SEGMENT_BUFFER_0=true`, `HICON_SEGMENT_BUFFER_DELAY_SEC_0=60`):
+- Camera drops every ~4-5 min (ffmpeg exits code=0) → ffmpeg restarts, fills new epoch's segments.
+- 60s of buffered segments cover the reconnect window → pipeline FIFO never drains.
+- Result: **0 watchdog fires, 0 0fps events** across multi-hour soak. CP Plus drops completely
+  invisible to the inference pipeline.
+
+### Bug Fixes Applied (March 13)
+
+**Bug 1: 14fps burst (burst-then-idle decode pattern)**
+- **Root cause**: Default Linux FIFO pipe buffer = 64KB. A 2s raw H264 segment at the sub-stream
+  bitrate is ~530KB. The entire segment was written to the FIFO in a single instant (once the pipe
+  buffer was enlarged), causing the HW decoder to receive all ~50 frames at once, burst-decode
+  them in <100ms, then sit idle for ~1.9s. tegrastats showed GPU alternating 33%↔1% in 2s cycles.
+  Average pipeline throughput measured at ~14fps.
+- **Fix**: Rate-limited `_write_segment()` in `segment_buffer_helper.py`. Writes the segment in
+  64KB chunks paced at `file_size / segment_seconds` bytes/sec (matching the stream's natural
+  bitrate). The decoder receives a steady chunk every ~12ms → GPU stays at ~4% continuously →
+  25fps confirmed in logs (`125 frames (25.0 fps)` every 5s window).
+- **Deadline base fix**: `_advance_feed_deadline()` now uses `write_start` (not write-end) as the
+  base. The rate-limited write takes ~2s; using write-end would make the feeder wait 2s after
+  finishing a 2s write, doubling the inter-segment gap and causing rebuffering stalls.
+
+**Bug 2: FIFO pipe size silent failure**
+- **Root cause**: `F_SETPIPE_SZ` was requested at 4MB but the system `pipe-max-size` on this
+  Jetson is 1MB (`/proc/sys/fs/pipe-max-size`). The OSError was caught and passed silently with no
+  fallback — the FIFO stayed at the default 64KB.
+- **Fix**: Fallback loop trying 1MB → 512KB → 256KB, logging success at each level. System cap
+  of 1MB is successfully set.
+
+**Bug 3: DTS log flood making pipeline.log binary**
+- **Root cause**: ffmpeg `-loglevel warning` caused a continuous stream of
+  "Non-monotonous DTS in output stream" messages at every segment boundary. These warnings are
+  cosmetic (the muxer auto-corrects DTS ordering), but they made the log file binary and
+  unreadable with standard tools.
+- **Fix**: Changed to `-loglevel error` in `_build_ffmpeg_cmd()`.
+
+### Standalone /dev/null Test (March 13)
+
+To understand the root cause of persistent ffmpeg `code=0` drops, the following standalone command
+was run directly on the Jetson without any pipeline involvement:
+
+```bash
+ffmpeg -rtsp_transport tcp -i 'rtsp://admin:India%40789@192.168.28.155:554/video/live?channel=1&subtype=1' /dev/null
+```
+
+**Result: survived 27+ minutes with zero drops.**
+
+Key differences from the segment buffer ffmpeg command:
+1. **No `-stimeout`** — no socket timeout configured.
+2. **No `-f segment`** — no disk writes; output is `/dev/null` (instant, zero I/O).
+3. **No `-map`/`-c:v copy`/`-an`** — ffmpeg reads the stream but does no processing beyond
+   the demuxer.
+
+The segment buffer command uses `-f segment -segment_time 2 seg_%06d.h264`, which writes a new
+2-second file to tmpfs (`/dev/shm`) every 2 seconds. Even on tmpfs, brief kernel I/O overhead
+during segment file creation/flushing is sufficient to introduce stalls that trigger the CP Plus
+firmware's TCP control-channel session timeout (graceful close, code=0).
+
+### Root Cause Conclusion
+
+The CP Plus firmware's ~4-5 minute TCP RTSP session timeout is triggered by brief stalls in the
+ffmpeg process caused by `-f segment` disk I/O. When the RTSP TCP control channel goes quiet for
+even a few seconds during a segment rotation, the firmware closes the session gracefully (code=0).
+
+The `/dev/null` test emulates an ideal zero-overhead consumer: the camera session is never starved
+because ffmpeg never blocks. The segment buffer absorbs the resulting drops, but the drops still
+occur.
+
+**Next step (planned, not yet implemented):** Dual-ffmpeg architecture to emulate `/dev/null`
+conditions for the camera session while still producing segments for the pipeline:
+1. **Reader**: `ffmpeg -rtsp_transport tcp -i {url} -f mpegts pipe:1` — reads RTSP, writes MPEGTS
+   to stdout pipe. Zero disk I/O. No `-stimeout`. Camera session never sees a stall.
+2. **Segmenter**: `ffmpeg -f mpegts -i pipe:0 -f segment -segment_time 2 seg_%06d.h264` — reads
+   MPEGTS from stdin pipe, writes segments. Disk I/O fully decoupled from camera session.
+
+A 1MB pipe between reader and segmenter absorbs momentary segmenter stalls. If the segmenter
+stalls, only the pipe fills — the reader's RTSP session is unaffected.
