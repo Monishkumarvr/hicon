@@ -8,9 +8,11 @@ RTSP-aware error classification:
 - Stale stream watchdog: quit if ALL streams silent for 10 min
 - healthchecks.io heartbeat: ping every 60s, /fail on fatal errors
 """
+import json
 import logging
 import time
 import threading
+from pathlib import Path
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
@@ -24,25 +26,70 @@ _RTSP_SOURCE_PREFIX = "source"
 _RTSP_ERROR_LIMIT = 3
 _RTSP_ERROR_WINDOW_SEC = 60.0
 
+# Grace period: skip 0fps watchdog during startup (network may not be ready)
+_STARTUP_GRACE_SEC = 30
+_STREAM0_STAGE_ORDER = (
+    "decoder_src",
+    "nvvidconv_src",
+    "caps_src",
+    "premuxq_src",
+    "mux_src",
+    "postmuxq_src",
+    "pgie_sink",
+    "pgie_src",
+    "tracker_sink",
+    "tracker_src",
+)
+_STREAM0_UPSTREAM_PTS_ORDER = (
+    "decoder_src",
+    "nvvidconv_src",
+    "caps_src",
+    "premuxq_src",
+)
+
 
 class BusHandler:
     """Handle GStreamer bus messages with RTSP-aware error recovery."""
 
-    def __init__(self, pipeline, loop, healthcheck_url=""):
+    def __init__(self, pipeline, loop, healthcheck_url="",
+                 stream0_decoupled_analysis_mode=False, stream_policies=None,
+                 stream0_segment_buffer_mode=False, stream0_segment_buffer_state_path="",
+                 stream0_startup_grace_sec=None):
         """
         Args:
             pipeline: GStreamer pipeline
             loop: GLib MainLoop
             healthcheck_url: healthchecks.io ping URL (empty = disabled)
+            stream0_decoupled_analysis_mode: Whether Stream 0 uses a side analysis branch
+            stream_policies: {stream_id: 'restart'|'warn'} per-stream 0fps policy
+            stream0_segment_buffer_mode: Whether Stream 0 uses delayed segment buffering
+            stream0_segment_buffer_state_path: JSON state file published by the helper
+            stream0_startup_grace_sec: Optional Stream 0 startup grace override
         """
         self.pipeline = pipeline
         self.loop = loop
         self.last_frame_time = {}
+        self.stream0_decoupled_analysis_mode = bool(stream0_decoupled_analysis_mode)
+        self.stream0_segment_buffer_mode = bool(stream0_segment_buffer_mode)
+        self.stream0_segment_buffer_state_path = (
+            Path(stream0_segment_buffer_state_path)
+            if stream0_segment_buffer_state_path else None
+        )
+        self.stream0_analysis_last_time = None
+        self.stream0_analysis_count = 0
+        self.stream0_stage_last_time = {}
+        self.stream0_stage_pts = {}
         self.stale_threshold_sec = 600  # 10 min watchdog
         self._frame_counts = {}       # {stream_id: int} — rolling 10s counter
-        self._fps_log_interval = 10   # seconds
+        self._fps_log_interval = 5    # seconds (tightened for ~5min CP Plus drops)
         self._zero_fps_counts = {}    # {stream_id: int} — consecutive 0fps intervals
-        self._zero_fps_limit = 3      # 3 × 10s = 30s of 0fps → restart
+        self._zero_fps_limit = 1      # 1 × 10s = 10s of 0fps → restart
+        self._stream_zero_fps_policy = stream_policies or {}  # {0: 'warn', 1: 'restart'}
+        self._startup_time = time.time()  # Grace period: skip 0fps watchdog at boot
+        self._stream0_startup_grace_sec = max(
+            _STARTUP_GRACE_SEC,
+            int(stream0_startup_grace_sec or _STARTUP_GRACE_SEC),
+        )
         self._healthcheck_url = (healthcheck_url or "").rstrip("/")
 
         # Per-source RTSP error timestamps for rate-limiting
@@ -56,8 +103,36 @@ class BusHandler:
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
         logger.info("Bus handler attached")
+        if self.stream0_segment_buffer_mode:
+            logger.info(
+                "Stream 0 segment buffer watchdog suppression enabled "
+                "(state=%s, startup_grace=%ss)",
+                self.stream0_segment_buffer_state_path,
+                self._stream0_startup_grace_sec,
+            )
         if self._healthcheck_url:
             logger.info(f"Healthcheck enabled: {self._healthcheck_url}")
+
+    def _stream_startup_grace_sec(self, stream_id: int) -> int:
+        if stream_id == 0 and self.stream0_segment_buffer_mode:
+            return self._stream0_startup_grace_sec
+        return _STARTUP_GRACE_SEC
+
+    def _read_stream0_segment_buffer_state(self) -> dict | None:
+        if not self.stream0_segment_buffer_mode or self.stream0_segment_buffer_state_path is None:
+            return None
+        try:
+            payload = self.stream0_segment_buffer_state_path.read_text(encoding="utf-8")
+            data = json.loads(payload)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _stream0_watchdog_suppressed(self) -> bool:
+        state = self._read_stream0_segment_buffer_state()
+        if not state:
+            return False
+        return state.get("mode") in {"buffering", "rebuffering"}
 
     # ------------------------------------------------------------------
     # healthchecks.io heartbeat
@@ -126,7 +201,9 @@ class BusHandler:
         t = message.type
 
         if t == Gst.MessageType.EOS:
-            logger.info("End of stream received")
+            logger.error("Unexpected end of stream received")
+            self._ping_healthcheck("/fail")
+            self.fatal_exit = True
             self.loop.quit()
 
         elif t == Gst.MessageType.ERROR:
@@ -139,10 +216,21 @@ class BusHandler:
             # Classify: RTSP source errors are non-fatal (rtspsrc retries)
             if self._is_rtsp_source(src_name):
                 if self._track_rtsp_error(src_name):
-                    # Rate limit exceeded → fatal
-                    self._ping_healthcheck("/fail")
-                    self.fatal_exit = True
-                    self.loop.quit()
+                    # Rate limit exceeded — check per-stream policy
+                    try:
+                        stream_id = int(src_name.replace(_RTSP_SOURCE_PREFIX, ''))
+                    except ValueError:
+                        stream_id = -1
+                    policy = self._stream_zero_fps_policy.get(stream_id, 'restart')
+                    if policy == 'warn':
+                        logger.warning(
+                            f"[RTSP-RATE] {src_name}: rate limit exceeded "
+                            f"but policy=warn, continuing"
+                        )
+                    else:
+                        self._ping_healthcheck("/fail")
+                        self.fatal_exit = True
+                        self.loop.quit()
                 # Otherwise: suppress, let rtspsrc handle reconnection
             else:
                 # Non-RTSP error (nvinfer, decoder, mux, etc.) → fatal
@@ -168,6 +256,41 @@ class BusHandler:
         self.last_frame_time[stream_id] = time.time()
         self._frame_counts[stream_id] = self._frame_counts.get(stream_id, 0) + 1
 
+    def update_stream0_analysis_time(self):
+        """Call from the Stream 0 CPU analysis branch to track side-branch liveness."""
+        self.stream0_analysis_last_time = time.time()
+        self.stream0_analysis_count += 1
+
+    def update_stream0_stage_time(self, stage_name):
+        """Track liveness of a specific Stream 0 pipeline stage."""
+        self.update_stream0_stage_sample(stage_name, None)
+
+    def update_stream0_stage_sample(self, stage_name, pts_ns):
+        """Track liveness and latest PTS delta of a specific Stream 0 pipeline stage."""
+        self.stream0_stage_last_time[stage_name] = time.time()
+        if pts_ns is None or pts_ns == Gst.CLOCK_TIME_NONE:
+            return
+
+        prev = self.stream0_stage_pts.get(stage_name)
+        delta_ns = None
+        regressed = False
+        if prev and prev.get("last_pts_ns") is not None:
+            delta_ns = pts_ns - prev["last_pts_ns"]
+            regressed = delta_ns < 0
+
+        self.stream0_stage_pts[stage_name] = {
+            "last_pts_ns": pts_ns,
+            "delta_ns": delta_ns,
+            "regressed": regressed,
+        }
+
+    @staticmethod
+    def _format_pts_delta(delta_ns):
+        """Render a PTS delta in milliseconds for diagnostic logging."""
+        if delta_ns is None:
+            return "n/a"
+        return f"{delta_ns / 1_000_000.0:.2f}ms"
+
     def check_stale_streams(self):
         """Check if any stream has gone stale (no frames for threshold)."""
         now = time.time()
@@ -189,29 +312,80 @@ class BusHandler:
             if not self._frame_counts:
                 return True
             parts = []
+            now = time.time()
             for sid in sorted(self._frame_counts):
                 count = self._frame_counts[sid]
                 fps = count / self._fps_log_interval
                 parts.append(f"Stream {sid}: {count} frames ({fps:.1f} fps)")
                 self._frame_counts[sid] = 0  # reset for next interval
 
-                # Dead stream detection: N consecutive 0fps intervals → restart
-                if count == 0 and sid in self.last_frame_time:
+                # Dead stream detection: N consecutive 0fps intervals
+                # Skip during startup grace period (network may not be ready at boot)
+                if count == 0 and sid in self.last_frame_time and (
+                    now - self._startup_time
+                ) >= self._stream_startup_grace_sec(sid):
+                    if sid == 0 and self._stream0_watchdog_suppressed():
+                        self._zero_fps_counts[sid] = 0
+                        continue
                     self._zero_fps_counts[sid] = self._zero_fps_counts.get(sid, 0) + 1
                     if self._zero_fps_counts[sid] >= self._zero_fps_limit:
-                        logger.info("[FPS] " + " | ".join(parts))
-                        logger.critical(
-                            f"[FPS-WATCHDOG] Stream {sid} at 0fps for "
-                            f"{self._zero_fps_limit * self._fps_log_interval}s — restarting"
-                        )
-                        self._ping_healthcheck("/fail")
-                        self.fatal_exit = True
-                        self.loop.quit()
-                        return False
+                        stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
+                        policy = self._stream_zero_fps_policy.get(sid, 'restart')
+                        if policy == 'warn':
+                            logger.warning(
+                                f"[FPS-WATCHDOG] Stream {sid} at 0fps for "
+                                f"{stall_sec}s — policy=warn, waiting for recovery"
+                            )
+                            # Safety cap: 90s stale even in warn mode → restart
+                            # (MediaMTX reconnects in ~5-40s, nvurisrcbin retries every 5s)
+                            if stall_sec >= 90:
+                                logger.critical(
+                                    f"[FPS-WATCHDOG] Stream {sid} stale {stall_sec}s — escalating to restart"
+                                )
+                                self._ping_healthcheck("/fail")
+                                self.fatal_exit = True
+                                self.loop.quit()
+                                return False
+                        else:
+                            logger.info("[FPS] " + " | ".join(parts))
+                            logger.critical(
+                                f"[FPS-WATCHDOG] Stream {sid} at 0fps for "
+                                f"{stall_sec}s — restarting"
+                            )
+                            self._ping_healthcheck("/fail")
+                            self.fatal_exit = True
+                            self.loop.quit()
+                            return False
                 else:
-                    self._zero_fps_counts[sid] = 0  # reset on any frames
+                    if self._zero_fps_counts.get(sid, 0) > 0:
+                        stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
+                        logger.info(f"[FPS-WATCHDOG] Stream {sid} recovered after {stall_sec}s stall")
+                    self._zero_fps_counts[sid] = 0
 
             logger.info("[FPS] " + " | ".join(parts))
+            if self.stream0_decoupled_analysis_mode and 0 in self.last_frame_time:
+                main_last = self.last_frame_time.get(0)
+                analysis_last = self.stream0_analysis_last_time
+                main_age = f"{(now - main_last):.2f}s" if main_last else "n/a"
+                analysis_age = f"{(now - analysis_last):.2f}s" if analysis_last else "n/a"
+                logger.info(f"[S0-DIAG] main_age={main_age} analysis_age={analysis_age}")
+                self.stream0_analysis_count = 0
+            if self.stream0_stage_last_time:
+                stage_parts = []
+                for stage_name in _STREAM0_STAGE_ORDER:
+                    last_t = self.stream0_stage_last_time.get(stage_name)
+                    age = f"{(now - last_t):.2f}s" if last_t else "n/a"
+                    stage_parts.append(f"{stage_name}_age={age}")
+                logger.info("[S0-STAGES] " + " ".join(stage_parts))
+            if self.stream0_stage_pts:
+                pts_parts = []
+                for stage_name in _STREAM0_UPSTREAM_PTS_ORDER:
+                    state = self.stream0_stage_pts.get(stage_name) or {}
+                    delta_ns = state.get("delta_ns")
+                    pts_parts.append(
+                        f"{stage_name}_pts_delta={self._format_pts_delta(delta_ns)}"
+                    )
+                logger.info("[S0-PTS] " + " ".join(pts_parts))
             return True  # keep timer alive
 
         GLib.timeout_add_seconds(self._fps_log_interval, _fps_tick)

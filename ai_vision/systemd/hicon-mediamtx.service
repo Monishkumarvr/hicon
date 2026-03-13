@@ -1,0 +1,20 @@
+[Unit]
+Description=HiCon MediaMTX RTSP Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hicon
+Group=hicon
+WorkingDirectory=/home/hicon/hicon/ai_vision
+ExecStart=/home/hicon/hicon/ai_vision/tools/start_mediamtx_stream0.sh
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hicon-mediamtx
+
+[Install]
+WantedBy=multi-user.target

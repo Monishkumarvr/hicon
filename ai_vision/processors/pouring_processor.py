@@ -50,9 +50,10 @@ class PouringProcessor:
     """
 
     def __init__(self, db_manager, config, screenshot_dir: str, heat_cycle_manager=None,
-                 camera_id_override: str = None):
+                 camera_id_override: str = None, enable_display_meta: bool = True):
         self.db_manager = db_manager
         self.config = config
+        self.enable_display_meta = enable_display_meta
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -202,7 +203,11 @@ class PouringProcessor:
         )
         logger.info(f"  Edge expand: {self.edge_expand}px, Mouth missing tol: {self.mouth_missing_tol}s")
         logger.info(f"  Cycle timeout: {self.cycle_timeout}s")
-        logger.info(f"  DS-native inference overlay enabled={self.enable_inference_video}")
+        logger.info(
+            "  DS-native inference overlay enabled=%s (display_meta=%s)",
+            self.enable_inference_video,
+            self.enable_display_meta,
+        )
 
     # =========================================================================
     # Main entry point (called from OSD sink pad probe)
@@ -290,7 +295,7 @@ class PouringProcessor:
                 self._insert_heat_cycle_to_db(cycle)
 
         # 11. DS-native overlay annotations (rendered by nvosd and captured via tee branch)
-        if self.enable_inference_video and batch_meta is not None:
+        if self.enable_inference_video and self.enable_display_meta and batch_meta is not None:
             self._add_inference_display_meta(
                 batch_meta=batch_meta,
                 frame_meta=frame_meta,

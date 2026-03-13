@@ -37,7 +37,7 @@ class BrightnessProcessor:
     """
 
     def __init__(self, zones_config, db_manager, config, screenshot_dir,
-                 heat_cycle_manager=None):
+                 heat_cycle_manager=None, enable_display_meta=True):
         """
         Args:
             zones_config: Dict with tapping/deslagging/spectro zone configs from zones.json
@@ -45,10 +45,12 @@ class BrightnessProcessor:
             config: Configuration module
             screenshot_dir: Path for event screenshots
             heat_cycle_manager: Optional shared HeatCycleManager for tapping/deslagging aggregation
+            enable_display_meta: Whether to attach CPU-generated live display meta
         """
         self.db_manager = db_manager
         self.config = config
         self.heat_cycle_manager = heat_cycle_manager
+        self.enable_display_meta = enable_display_meta
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.customer_id = config.CUSTOMER_ID
@@ -247,6 +249,8 @@ class BrightnessProcessor:
 
     def add_inference_display_meta(self, batch_meta, frame_meta):
         """Attach DS-native overlay for tapping/deslagging/spectro status + ROI bounds."""
+        if not self.enable_display_meta:
+            return
         try:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:

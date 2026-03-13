@@ -48,7 +48,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.StreamHandler(),
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler(LOG_DIR / 'pipeline.log'),
     ],
 )
@@ -72,16 +72,8 @@ mjpeg_server = None
 # ---------------------------------------------------------------------------
 # Pad probe callbacks
 # ---------------------------------------------------------------------------
-def osd_sink_pad_probe_stream0(pad, info):
-    """
-    Probe on nvosd_0 sink pad (Stream 0 — Process Camera).
-    Handles:
-      1. Pouring detection (nvinfer object meta + CPU brightness)
-      2. Brightness analysis (tapping + deslagging + spectro via CPU frame)
-
-    Frame is extracted once and shared by both processors.
-    CRITICAL: unmap_nvds_buf_surface() MUST be called on Jetson.
-    """
+def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_path=False):
+    """Run Stream 0 CPU frame extraction and processors on the provided buffer."""
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
@@ -97,13 +89,19 @@ def osd_sink_pad_probe_stream0(pad, info):
         except StopIteration:
             break
 
-        # Update bus handler frame counter
         if bus_handler:
-            bus_handler.update_frame_time(0)
+            if update_main_path:
+                bus_handler.update_frame_time(0)
+            if update_analysis_path:
+                bus_handler.update_stream0_analysis_time()
 
-        # Extract CPU frame once for both processors (RGBA uint8)
+        stream0_needs_frame = (
+            config.ENABLE_FRAME_PROCESSING
+            and ((pouring_processor is not None) or (brightness_processor is not None))
+        )
+
         frame = None
-        if config.ENABLE_FRAME_PROCESSING:
+        if stream0_needs_frame:
             try:
                 import numpy as np
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -112,7 +110,6 @@ def osd_sink_pad_probe_stream0(pad, info):
                 logger.error(f"Frame extraction error: {e}", exc_info=True)
 
         try:
-            # 1. Pouring processor (nvinfer detections + brightness)
             if pouring_processor:
                 try:
                     pouring_processor.process_frame(
@@ -125,11 +122,14 @@ def osd_sink_pad_probe_stream0(pad, info):
                 except Exception as e:
                     logger.error(f"Pouring processor error: {e}", exc_info=True)
 
-            # 2. Brightness processor (tapping + deslagging + spectro)
             if brightness_processor and frame is not None:
                 try:
                     brightness_processor.process_frame_with_array(frame, frame_meta)
-                    if config.ENABLE_INFERENCE_VIDEO:
+                    if (
+                        config.ENABLE_INFERENCE_VIDEO
+                        and batch_meta is not None
+                        and getattr(brightness_processor, "enable_display_meta", True)
+                    ):
                         brightness_processor.add_inference_display_meta(
                             batch_meta=batch_meta,
                             frame_meta=frame_meta,
@@ -137,7 +137,6 @@ def osd_sink_pad_probe_stream0(pad, info):
                 except Exception as e:
                     logger.error(f"Brightness processor error: {e}", exc_info=True)
         finally:
-            # MANDATORY on Jetson — prevents memory leak
             if frame is not None:
                 try:
                     pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -150,6 +149,106 @@ def osd_sink_pad_probe_stream0(pad, info):
             break
 
     return Gst.PadProbeReturn.OK
+
+
+def osd_sink_pad_probe_stream0(pad, info):
+    """
+    Probe on nvosd_0 sink pad (Stream 0 — Process Camera).
+    Handles:
+      1. Pouring detection (nvinfer object meta + CPU brightness)
+      2. Brightness analysis (tapping + deslagging + spectro via CPU frame)
+
+    Frame is extracted once and shared by both processors.
+    CRITICAL: unmap_nvds_buf_surface() MUST be called on Jetson.
+    """
+    return _process_stream0_cpu_analysis(
+        info,
+        update_main_path=True,
+        update_analysis_path=False,
+    )
+
+
+def osd_sink_pad_probe_stream0_heartbeat_main(pad, info):
+    """Minimal Stream 0 main-path probe used to preserve FPS/watchdog visibility."""
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    if bus_handler:
+        bus_handler.update_frame_time(0)
+    return Gst.PadProbeReturn.OK
+
+
+def osd_sink_pad_probe_stream0_heartbeat(pad, info):
+    """Backward-compatible Stream 0 heartbeat probe used by diagnostic modes."""
+    return osd_sink_pad_probe_stream0_heartbeat_main(pad, info)
+
+
+def analysis_pad_probe_stream0_cpu(pad, info):
+    """Run Stream 0 CPU analysis on the decoupled RGBA side branch."""
+    return _process_stream0_cpu_analysis(
+        info,
+        update_main_path=False,
+        update_analysis_path=True,
+    )
+
+
+def _mark_stream0_stage(stage_name, info):
+    """Record Stream 0 liveness for a specific boundary if a buffer is present."""
+    gst_buffer = info.get_buffer()
+    if bus_handler and gst_buffer:
+        bus_handler.update_stream0_stage_sample(stage_name, gst_buffer.pts)
+    return Gst.PadProbeReturn.OK
+
+
+def stream0_stage_probe_decoder_src(pad, info):
+    """Track Stream 0 liveness at decoder0.src."""
+    return _mark_stream0_stage("decoder_src", info)
+
+
+def stream0_stage_probe_nvvidconv_src(pad, info):
+    """Track Stream 0 liveness at nvvidconv0.src."""
+    return _mark_stream0_stage("nvvidconv_src", info)
+
+
+def stream0_stage_probe_caps_src(pad, info):
+    """Track Stream 0 liveness at caps0.src."""
+    return _mark_stream0_stage("caps_src", info)
+
+
+def stream0_stage_probe_premuxq_src(pad, info):
+    """Track Stream 0 liveness at premuxq0.src."""
+    return _mark_stream0_stage("premuxq_src", info)
+
+
+def stream0_stage_probe_mux_src(pad, info):
+    """Track Stream 0 liveness at mux_0.src."""
+    return _mark_stream0_stage("mux_src", info)
+
+
+def stream0_stage_probe_postmuxq_src(pad, info):
+    """Track Stream 0 liveness at postmuxq0.src."""
+    return _mark_stream0_stage("postmuxq_src", info)
+
+
+def stream0_stage_probe_pgie_sink(pad, info):
+    """Track Stream 0 liveness at pgie_pouring.sink."""
+    return _mark_stream0_stage("pgie_sink", info)
+
+
+def stream0_stage_probe_pgie_src(pad, info):
+    """Track Stream 0 liveness at pgie_pouring.src."""
+    return _mark_stream0_stage("pgie_src", info)
+
+
+def stream0_stage_probe_tracker_sink(pad, info):
+    """Track Stream 0 liveness at tracker_0.sink."""
+    return _mark_stream0_stage("tracker_sink", info)
+
+
+def stream0_stage_probe_tracker_src(pad, info):
+    """Track Stream 0 liveness at tracker_0.src."""
+    return _mark_stream0_stage("tracker_src", info)
 
 
 def post_osd_probe_stream0_for_streaming(pad, info):
@@ -419,13 +518,24 @@ def main():
     )
 
     # Initialize processors
-    brightness_processor = BrightnessProcessor(
-        zones_config=zones_config,
-        db_manager=db,
-        config=config,
-        screenshot_dir=str(config.SCREENSHOT_DIR),
-        heat_cycle_manager=heat_cycle_manager,
-    )
+    stream0_enable_display_meta = not config.STREAM_0_DECOUPLED_ANALYSIS_MODE
+    if config.STREAM_0_DECOUPLED_ANALYSIS_MODE:
+        logger.info(
+            "Stream 0 (CP Plus): CPU-generated live display meta disabled in decoupled mode"
+        )
+
+    if config.ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR:
+        brightness_processor = BrightnessProcessor(
+            zones_config=zones_config,
+            db_manager=db,
+            config=config,
+            screenshot_dir=str(config.SCREENSHOT_DIR),
+            heat_cycle_manager=heat_cycle_manager,
+            enable_display_meta=stream0_enable_display_meta,
+        )
+    else:
+        brightness_processor = None
+        logger.warning("Stream 0: Brightness processor disabled for diagnostics")
 
     pyrometer_processor = PyrometerProcessor(
         zone_config=zones_config.get('pyrometer', {}),
@@ -436,17 +546,22 @@ def main():
     )
 
     # Pouring processor (Stream 0 — Process camera)
-    try:
-        from processors.pouring_processor import PouringProcessor
-        pouring_processor = PouringProcessor(
-            db_manager=db,
-            config=config,
-            screenshot_dir=str(config.SCREENSHOT_DIR),
-            heat_cycle_manager=heat_cycle_manager,
-        )
-        logger.info("Stream 0: Pouring processor initialized")
-    except Exception as e:
-        logger.warning(f"Stream 0: Pouring processor not available: {e}")
+    if config.ENABLE_STREAM_0_POURING_PROCESSOR:
+        try:
+            from processors.pouring_processor import PouringProcessor
+            pouring_processor = PouringProcessor(
+                db_manager=db,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                enable_display_meta=stream0_enable_display_meta,
+            )
+            logger.info("Stream 0: Pouring processor initialized")
+        except Exception as e:
+            logger.warning(f"Stream 0: Pouring processor not available: {e}")
+            pouring_processor = None
+    else:
+        logger.warning("Stream 0: Pouring processor disabled for diagnostics")
         pouring_processor = None
 
     # Pouring processor (Stream 2 — Second pouring camera, pouring-only, no brightness)
@@ -497,14 +612,37 @@ def main():
         'config_pouring_2': config.CONFIG_POURING_2,
         'tracker_lib': config.TRACKER_LIB,
         'tracker_config': config.TRACKER_CONFIG,
+        'rtsp_protocol_0': config.RTSP_PROTOCOL_0,
+        'rtsp_protocol_1': config.RTSP_PROTOCOL_1,
+        'rtsp_protocol_2': config.RTSP_PROTOCOL_2,
+        'rtsp_udp_timeout_us': config.RTSP_UDP_TIMEOUT_US,
         'rtsp_tcp_timeout_us': config.RTSP_TCP_TIMEOUT_US,
-        'rtsp_retry': config.RTSP_RETRY,
-        'rtsp_timeout_sec': config.RTSP_TIMEOUT_SEC,
+        'rtsp_port_retry': config.RTSP_PORT_RETRY,
         'rtsp_do_retransmission': config.RTSP_DO_RETRANSMISSION,
+        'rtsp_latency_ms': config.RTSP_LATENCY_MS,
+        'stream_0_bypass_tracker': config.STREAM_0_BYPASS_TRACKER,
+        'stream_0_bypass_pgie': config.STREAM_0_BYPASS_PGIE,
+        'stream_0_decode_only_mode': config.STREAM_0_DECODE_ONLY_MODE,
+        'stream_0_postmux_only_mode': config.STREAM_0_POSTMUX_ONLY_MODE,
+        'stream_0_postconv_only_mode': config.STREAM_0_POSTCONV_ONLY_MODE,
+        'stream_0_preosd_only_mode': config.STREAM_0_PREOSD_ONLY_MODE,
+        'stream_0_decoupled_analysis_mode': config.STREAM_0_DECOUPLED_ANALYSIS_MODE,
         'enable_inference_video': config.ENABLE_INFERENCE_VIDEO,
+        'use_nvurisrcbin_0': config.USE_NVURISRCBIN_0,
+        'use_segment_buffer_0': config.USE_SEGMENT_BUFFER_0,
+        'segment_buffer_dir_0': config.SEGMENT_BUFFER_DIR_0,
+        'segment_buffer_segment_sec_0': config.SEGMENT_BUFFER_SEGMENT_SEC_0,
+        'segment_buffer_delay_sec_0': config.SEGMENT_BUFFER_DELAY_SEC_0,
+        'segment_buffer_retention_sec_0': config.SEGMENT_BUFFER_RETENTION_SEC_0,
+        'use_ffmpeg_src_0': config.USE_FFMPEG_SRC_0,
+        'use_ffmpeg_src_2': config.USE_FFMPEG_SRC_2,
+        'use_udp_loopback_0': config.USE_UDP_LOOPBACK_0,
+        'use_udp_loopback_2': config.USE_UDP_LOOPBACK_2,
+        'udp_loopback_port_0': config.UDP_LOOPBACK_PORT_0,
+        'udp_loopback_port_2': config.UDP_LOOPBACK_PORT_2,
     }
 
-    # Build pipeline
+    # Build pipeline (keep builder reference for ffmpeg cleanup on shutdown)
     builder = DeepStreamPipelineBuilder(pipeline_config)
     pipeline, elements = builder.create_pipeline()
 
@@ -516,7 +654,25 @@ def main():
     loop = GLib.MainLoop()
 
     # Attach bus handler
-    bus_handler = BusHandler(pipeline, loop, healthcheck_url=config.HEALTHCHECK_URL)
+    stream_policies = {
+        0: config.STREAM_0_ZERO_FPS_POLICY,
+        1: config.STREAM_1_ZERO_FPS_POLICY,
+    }
+    stream0_segment_buffer_state_path = ""
+    stream0_startup_grace_sec = 30
+    if config.USE_SEGMENT_BUFFER_0:
+        stream0_segment_buffer_state_path = str(Path(config.SEGMENT_BUFFER_DIR_0) / "state.json")
+        stream0_startup_grace_sec = max(30, int(config.SEGMENT_BUFFER_DELAY_SEC_0) + 10)
+    bus_handler = BusHandler(
+        pipeline,
+        loop,
+        healthcheck_url=config.HEALTHCHECK_URL,
+        stream0_decoupled_analysis_mode=config.STREAM_0_DECOUPLED_ANALYSIS_MODE,
+        stream_policies=stream_policies,
+        stream0_segment_buffer_mode=config.USE_SEGMENT_BUFFER_0,
+        stream0_segment_buffer_state_path=stream0_segment_buffer_state_path,
+        stream0_startup_grace_sec=stream0_startup_grace_sec,
+    )
 
     # Initialize MJPEG live streaming server (if enabled)
     mjpeg_server = None
@@ -547,6 +703,9 @@ def main():
                 target_fps=config.INFERENCE_VIDEO_FPS,
                 target_width=config.INFERENCE_VIDEO_WIDTH,
                 target_height=config.INFERENCE_VIDEO_HEIGHT,
+                schedule=config.INFERENCE_VIDEO_SCHEDULE,
+                max_duration_s=config.INFERENCE_VIDEO_MAX_DURATION_S,
+                retention_days=config.INFERENCE_VIDEO_RETENTION_DAYS,
             )
             if recording_manager.setup_recording_branch(pipeline, tee_0):
                 logger.info("Stream 0: DS-native inference recording branch configured")
@@ -566,6 +725,9 @@ def main():
                 target_fps=config.INFERENCE_VIDEO_FPS,
                 target_width=config.INFERENCE_VIDEO_WIDTH,
                 target_height=config.INFERENCE_VIDEO_HEIGHT,
+                schedule=config.INFERENCE_VIDEO_SCHEDULE,
+                max_duration_s=config.INFERENCE_VIDEO_MAX_DURATION_S,
+                retention_days=config.INFERENCE_VIDEO_RETENTION_DAYS,
             )
             if recording_manager_1.setup_recording_branch(pipeline, tee_1):
                 logger.info("Stream 1: DS-native inference recording branch configured")
@@ -580,11 +742,157 @@ def main():
     if 'nvosd_0' in elements and elements['nvosd_0']:
         osd_sinkpad = elements['nvosd_0'].get_static_pad("sink")
         if osd_sinkpad:
-            osd_sinkpad.add_probe(
+            if config.STREAM_0_DECOUPLED_ANALYSIS_MODE:
+                osd_sinkpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    osd_sink_pad_probe_stream0_heartbeat_main,
+                )
+                logger.info("Stream 0: Main-path heartbeat probe attached (decoupled analysis mode)")
+            elif config.ENABLE_STREAM_0_PROBE:
+                osd_sinkpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    osd_sink_pad_probe_stream0,
+                )
+                logger.info("Stream 0: OSD sink pad probe attached (pouring + brightness + spectro)")
+            else:
+                osd_sinkpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    osd_sink_pad_probe_stream0_heartbeat,
+                )
+                logger.warning(
+                    "Stream 0: OSD sink pad probe disabled for diagnostics "
+                    "(heartbeat-only probe attached)"
+                )
+    if config.STREAM_0_DECOUPLED_ANALYSIS_MODE and 'analysis_caps0' in elements and elements['analysis_caps0']:
+        analysis_srcpad = elements['analysis_caps0'].get_static_pad("src")
+        if analysis_srcpad:
+            if config.ENABLE_STREAM_0_PROBE:
+                analysis_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    analysis_pad_probe_stream0_cpu,
+                )
+                logger.info(
+                    "Stream 0: Analysis branch probe attached "
+                    "(pouring + brightness + spectro on RGBA side branch)"
+                )
+            else:
+                logger.warning(
+                    "Stream 0: Analysis branch probe disabled in decoupled mode "
+                    "(main-path heartbeat remains attached)"
+                )
+    elif 'decode_sink_0' in elements and elements['decode_sink_0']:
+        decode_sinkpad = elements['decode_sink_0'].get_static_pad("sink")
+        if decode_sinkpad:
+            decode_sinkpad.add_probe(
                 Gst.PadProbeType.BUFFER,
-                osd_sink_pad_probe_stream0,
+                osd_sink_pad_probe_stream0_heartbeat,
             )
-            logger.info("Stream 0: OSD sink pad probe attached (pouring + brightness + spectro)")
+            logger.info("Stream 0: decode-only heartbeat probe attached")
+    elif 'postmux_sink_0' in elements and elements['postmux_sink_0']:
+        postmux_sinkpad = elements['postmux_sink_0'].get_static_pad("sink")
+        if postmux_sinkpad:
+            postmux_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                osd_sink_pad_probe_stream0_heartbeat,
+            )
+            logger.info("Stream 0: post-mux heartbeat probe attached")
+    elif 'preosd_sink_0' in elements and elements['preosd_sink_0']:
+        preosd_sinkpad = elements['preosd_sink_0'].get_static_pad("sink")
+        if preosd_sinkpad:
+            preosd_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                osd_sink_pad_probe_stream0_heartbeat,
+            )
+            logger.info("Stream 0: pre-OSD heartbeat probe attached")
+    elif 'postconv_sink_0' in elements and elements['postconv_sink_0']:
+        postconv_sinkpad = elements['postconv_sink_0'].get_static_pad("sink")
+        if postconv_sinkpad:
+            postconv_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                osd_sink_pad_probe_stream0_heartbeat,
+            )
+            logger.info("Stream 0: post-convert heartbeat probe attached")
+
+    # Stream 0: upstream and shared-path boundary probes for failure localization
+    if config.ENABLE_DEBUG_PROBES:
+        if 'decoder0' in elements and elements['decoder0']:
+            decoder0_srcpad = elements['decoder0'].get_static_pad("src")
+            if decoder0_srcpad:
+                decoder0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_decoder_src,
+                )
+                logger.info("Stream 0: stage probe attached at decoder0.src")
+        if 'nvvidconv0' in elements and elements['nvvidconv0']:
+            nvvidconv0_srcpad = elements['nvvidconv0'].get_static_pad("src")
+            if nvvidconv0_srcpad:
+                nvvidconv0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_nvvidconv_src,
+                )
+                logger.info("Stream 0: stage probe attached at nvvidconv0.src")
+        if 'caps0' in elements and elements['caps0']:
+            caps0_srcpad = elements['caps0'].get_static_pad("src")
+            if caps0_srcpad:
+                caps0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_caps_src,
+                )
+                logger.info("Stream 0: stage probe attached at caps0.src")
+        if 'premuxq0' in elements and elements['premuxq0']:
+            premuxq0_srcpad = elements['premuxq0'].get_static_pad("src")
+            if premuxq0_srcpad:
+                premuxq0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_premuxq_src,
+                )
+                logger.info("Stream 0: stage probe attached at premuxq0.src")
+        if 'mux_0' in elements and elements['mux_0']:
+            mux0_srcpad = elements['mux_0'].get_static_pad("src")
+            if mux0_srcpad:
+                mux0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_mux_src,
+                )
+                logger.info("Stream 0: stage probe attached at mux_0.src")
+        if 'postmuxq0' in elements and elements['postmuxq0']:
+            postmuxq0_srcpad = elements['postmuxq0'].get_static_pad("src")
+            if postmuxq0_srcpad:
+                postmuxq0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_postmuxq_src,
+                )
+                logger.info("Stream 0: stage probe attached at postmuxq0.src")
+        if 'pgie_pouring' in elements and elements['pgie_pouring']:
+            pgie0_sinkpad = elements['pgie_pouring'].get_static_pad("sink")
+            if pgie0_sinkpad:
+                pgie0_sinkpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_pgie_sink,
+                )
+                logger.info("Stream 0: stage probe attached at pgie_pouring.sink")
+            pgie0_srcpad = elements['pgie_pouring'].get_static_pad("src")
+            if pgie0_srcpad:
+                pgie0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_pgie_src,
+                )
+                logger.info("Stream 0: stage probe attached at pgie_pouring.src")
+        if 'tracker_0' in elements and elements['tracker_0']:
+            tracker0_sinkpad = elements['tracker_0'].get_static_pad("sink")
+            if tracker0_sinkpad:
+                tracker0_sinkpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_tracker_sink,
+                )
+                logger.info("Stream 0: stage probe attached at tracker_0.sink")
+            tracker0_srcpad = elements['tracker_0'].get_static_pad("src")
+            if tracker0_srcpad:
+                tracker0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_tracker_src,
+                )
+                logger.info("Stream 0: stage probe attached at tracker_0.src")
 
     # Stream 0: Post-OSD probe for live streaming (extracts frames WITH overlays)
     if mjpeg_server and 'queue_display_0' in elements and elements['queue_display_0']:
@@ -713,6 +1021,7 @@ def main():
             except Exception as e:
                 logger.error(f"Error closing pouring processor 2: {e}", exc_info=True)
         pipeline.set_state(Gst.State.NULL)
+        builder.terminate_ffmpeg_procs()
         logger.info("Pipeline stopped")
 
     if bus_handler.fatal_exit:

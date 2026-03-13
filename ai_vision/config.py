@@ -2,9 +2,12 @@
 HiCon Edge AI Configuration
 Centralized configuration with environment variable support
 """
+import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load .env file from ai_vision directory
 env_path = Path(__file__).parent / '.env'
@@ -13,6 +16,19 @@ if env_path.exists():
     print(f"Loaded environment from: {env_path}")
 else:
     print(f"No .env file found at: {env_path} (using system environment variables)")
+
+
+_RTSP_PROTOCOLS = frozenset({"auto", "tcp", "udp"})
+
+
+def _get_rtsp_protocol(env_name: str, default: str) -> str:
+    """Load and validate per-stream RTSP transport preference."""
+    value = os.getenv(env_name, default).strip().lower()
+    if value not in _RTSP_PROTOCOLS:
+        raise ValueError(
+            f"{env_name} must be one of {sorted(_RTSP_PROTOCOLS)} (got {value!r})"
+        )
+    return value
 
 
 # =============================================================================
@@ -127,6 +143,15 @@ INFERENCE_VIDEO_FPS = float(os.getenv('HICON_INFERENCE_VIDEO_FPS', '10'))
 INFERENCE_VIDEO_WIDTH = int(os.getenv('HICON_INFERENCE_VIDEO_WIDTH', '640'))
 INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))
 
+# Recording schedule: 'always' for 24/7, or time windows like '06:00-08:00,18:00-20:00'
+# Format: comma-separated HH:MM-HH:MM pairs (24h clock, local time)
+# Examples: 'always', '06:00-08:00', '06:00-08:00,18:00-20:00'
+INFERENCE_VIDEO_SCHEDULE = os.getenv('HICON_INFERENCE_VIDEO_SCHEDULE', 'always')
+# Max duration per recording file in seconds (0 = no rotation)
+INFERENCE_VIDEO_MAX_DURATION_S = int(os.getenv('HICON_INFERENCE_VIDEO_MAX_DURATION_S', '3600'))
+# Retention: auto-delete recordings older than N days (0 = keep forever)
+INFERENCE_VIDEO_RETENTION_DAYS = int(os.getenv('HICON_INFERENCE_VIDEO_RETENTION_DAYS', '3'))
+
 # =============================================================================
 # RTSP STREAMS (3-stream HiCon pipeline)
 # =============================================================================
@@ -147,18 +172,66 @@ RTSP_CODEC_0 = os.getenv('HICON_RTSP_CODEC_0', 'h265')
 RTSP_CODEC_1 = os.getenv('HICON_RTSP_CODEC_1', 'h265')
 RTSP_CODEC_2 = os.getenv('HICON_RTSP_CODEC_2', 'h265')
 
-# RTSP connection timeout (microseconds, 0 disables)
+# Per-stream transport preference
+RTSP_PROTOCOL_0 = _get_rtsp_protocol('HICON_RTSP_PROTOCOL_0', 'tcp')
+RTSP_PROTOCOL_1 = _get_rtsp_protocol('HICON_RTSP_PROTOCOL_1', 'auto')
+RTSP_PROTOCOL_2 = _get_rtsp_protocol('HICON_RTSP_PROTOCOL_2', 'auto')
+
+# RTSP transport timeouts (microseconds, 0 disables)
 RTSP_TCP_TIMEOUT_US = int(os.getenv('HICON_RTSP_TCP_TIMEOUT_US', '60000000'))
+RTSP_UDP_TIMEOUT_US = int(os.getenv('HICON_RTSP_UDP_TIMEOUT_US', '0'))
+
+_legacy_rtsp_timeout_sec = os.getenv('HICON_RTSP_TIMEOUT_SEC')
+if _legacy_rtsp_timeout_sec is not None:
+    logger.warning(
+        "HICON_RTSP_TIMEOUT_SEC is obsolete and ignored; "
+        "use HICON_RTSP_UDP_TIMEOUT_US instead because rtspsrc.timeout is in microseconds."
+    )
 
 # RTSP reconnection behavior (rtspsrc properties)
-RTSP_RETRY = int(os.getenv('HICON_RTSP_RETRY', '65535'))
-RTSP_TIMEOUT_SEC = int(os.getenv('HICON_RTSP_TIMEOUT_SEC', '20'))
+RTSP_PORT_RETRY = int(os.getenv('HICON_RTSP_PORT_RETRY', '20'))
 RTSP_DO_RETRANSMISSION = os.getenv('HICON_RTSP_DO_RETRANSMISSION', 'true').lower() == 'true'
+RTSP_LATENCY_MS = int(os.getenv('HICON_RTSP_LATENCY_MS', '2000'))
 
 # Stream-level auto-restart thresholds (seconds)
 RTSP_RESTART_STALE_SEC = int(os.getenv('HICON_RTSP_RESTART_STALE_SEC', '90'))
 RTSP_RESTART_COOLDOWN_SEC = int(os.getenv('HICON_RTSP_RESTART_COOLDOWN_SEC', '60'))
 RTSP_RESTART_BACKOFF_SEC = int(os.getenv('HICON_RTSP_RESTART_BACKOFF_SEC', '5'))
+
+# Per-stream 0fps watchdog policy: 'restart' (kill pipeline) or 'warn' (log, wait for recovery)
+STREAM_0_ZERO_FPS_POLICY = os.getenv('HICON_STREAM_0_ZERO_FPS_POLICY', 'warn')
+STREAM_1_ZERO_FPS_POLICY = os.getenv('HICON_STREAM_1_ZERO_FPS_POLICY', 'restart')
+
+# Use nvurisrcbin (with built-in RTSP reconnection) instead of rtspsrc for Stream 0
+USE_NVURISRCBIN_0 = os.getenv('HICON_USE_NVURISRCBIN_0', 'true').lower() == 'true'
+
+# Use ffmpeg subprocess as RTSP-to-pipe bridge (zero-drop, handles keepalives correctly).
+# ffmpeg -c:v copy remuxes only (~1% CPU); GStreamer fdsrc reads from pipe, NVDEC decodes.
+# Takes priority over nvurisrcbin/rtspsrc when enabled.
+USE_FFMPEG_SRC_0 = os.getenv('HICON_USE_FFMPEG_SRC_0', 'false').lower() == 'true'
+USE_FFMPEG_SRC_2 = os.getenv('HICON_USE_FFMPEG_SRC_2', 'false').lower() == 'true'
+
+# Use delayed tmpfs segment buffer for Stream 0.
+# A helper process records the direct RTSP stream into MPEG-TS segments under /dev/shm
+# and feeds DeepStream from a FIFO with a fixed playback delay.
+USE_SEGMENT_BUFFER_0 = os.getenv('HICON_USE_SEGMENT_BUFFER_0', 'false').lower() == 'true'
+SEGMENT_BUFFER_DIR_0 = os.getenv(
+    'HICON_SEGMENT_BUFFER_DIR_0',
+    '/dev/shm/hicon/stream0-buffer',
+)
+SEGMENT_BUFFER_SEGMENT_SEC_0 = int(os.getenv('HICON_SEGMENT_BUFFER_SEGMENT_SEC_0', '2'))
+SEGMENT_BUFFER_DELAY_SEC_0 = int(os.getenv('HICON_SEGMENT_BUFFER_DELAY_SEC_0', '60'))
+SEGMENT_BUFFER_RETENTION_SEC_0 = int(os.getenv('HICON_SEGMENT_BUFFER_RETENTION_SEC_0', '120'))
+
+# Use UDP loopback bridge instead of pipe bridge for CP Plus cameras.
+# ffmpeg reads camera via TCP, sends MPEGTS to udp://127.0.0.1:PORT.
+# GStreamer udpsrc reads from localhost UDP — non-blocking send decouples ffmpeg's
+# TCP read loop from pipeline backpressure, eliminating the ~5-min session timeout.
+# Takes priority over fdsrc pipe when use_ffmpeg_src is also enabled.
+USE_UDP_LOOPBACK_0 = os.getenv('HICON_USE_UDP_LOOPBACK_0', 'false').lower() == 'true'
+USE_UDP_LOOPBACK_2 = os.getenv('HICON_USE_UDP_LOOPBACK_2', 'false').lower() == 'true'
+UDP_LOOPBACK_PORT_0 = int(os.getenv('HICON_UDP_LOOPBACK_PORT_0', '5000'))
+UDP_LOOPBACK_PORT_2 = int(os.getenv('HICON_UDP_LOOPBACK_PORT_2', '5002'))
 
 # Healthchecks.io heartbeat URL (empty = disabled)
 # Ping every 60s from watchdog; /fail on fatal error
@@ -168,7 +241,18 @@ HEALTHCHECK_URL = os.getenv('HICON_HEALTHCHECK_URL', '')
 BYPASS_STREAM_0_INFER = os.getenv('HICON_BYPASS_STREAM_0_INFER', 'false').lower() == 'true'
 BYPASS_STREAM_1_INFER = os.getenv('HICON_BYPASS_STREAM_1_INFER', 'false').lower() == 'true'
 BYPASS_STREAM_2_INFER = os.getenv('HICON_BYPASS_STREAM_2_INFER', 'false').lower() == 'true'
-ENABLE_DEBUG_PROBES = os.getenv('HICON_ENABLE_DEBUG_PROBES', 'true').lower() == 'true'
+STREAM_0_BYPASS_TRACKER = os.getenv('HICON_BYPASS_STREAM_0_TRACKER', 'false').lower() == 'true'
+STREAM_0_BYPASS_PGIE = os.getenv('HICON_BYPASS_STREAM_0_PGIE', 'false').lower() == 'true'
+STREAM_0_DECODE_ONLY_MODE = os.getenv('HICON_STREAM_0_DECODE_ONLY_MODE', 'false').lower() == 'true'
+STREAM_0_POSTMUX_ONLY_MODE = os.getenv('HICON_STREAM_0_POSTMUX_ONLY_MODE', 'false').lower() == 'true'
+STREAM_0_POSTCONV_ONLY_MODE = os.getenv('HICON_STREAM_0_POSTCONV_ONLY_MODE', 'false').lower() == 'true'
+STREAM_0_PREOSD_ONLY_MODE = os.getenv('HICON_STREAM_0_PREOSD_ONLY_MODE', 'false').lower() == 'true'
+STREAM_0_DECOUPLED_ANALYSIS_MODE = os.getenv(
+    'HICON_STREAM_0_DECOUPLED_ANALYSIS_MODE', 'false'
+).lower() == 'true'
+ENABLE_STREAM_0_POURING_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_POURING_PROCESSOR', 'true').lower() == 'true'
+ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR', 'true').lower() == 'true'
+ENABLE_DEBUG_PROBES = os.getenv('HICON_ENABLE_DEBUG_PROBES', 'false').lower() == 'true'
 LOG_SOURCE_IDS = os.getenv('HICON_LOG_SOURCE_IDS', 'true').lower() == 'true'
 ENABLE_STREAM_0_PROBE = os.getenv('HICON_ENABLE_STREAM_0_PROBE', 'true').lower() == 'true'
 ENABLE_STREAM_1_PROBE = os.getenv('HICON_ENABLE_STREAM_1_PROBE', 'true').lower() == 'true'
@@ -232,8 +316,8 @@ LIVE_STREAM_QUALITY = int(os.getenv('HICON_LIVE_STREAM_QUALITY', '85'))  # JPEG 
 LIVE_STREAM_FPS = int(os.getenv('HICON_LIVE_STREAM_FPS', '15'))  # Max FPS for stream
 
 # Per-stream live streaming control (default: follow ENABLE_LIVE_STREAM)
-ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'true'
-ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
+ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'false'
+ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'false'
 
 
 # =============================================================================
@@ -261,6 +345,24 @@ def validate_config():
     if BATCH_SIZE < 1:
         raise ValueError("BATCH_SIZE must be at least 1")
 
+    if RTSP_TCP_TIMEOUT_US < 0:
+        raise ValueError("RTSP_TCP_TIMEOUT_US must be >= 0")
+
+    if RTSP_UDP_TIMEOUT_US < 0:
+        raise ValueError("RTSP_UDP_TIMEOUT_US must be >= 0")
+
+    if RTSP_PORT_RETRY < 0:
+        raise ValueError("RTSP_PORT_RETRY must be >= 0")
+
+    if SEGMENT_BUFFER_SEGMENT_SEC_0 < 1:
+        raise ValueError("SEGMENT_BUFFER_SEGMENT_SEC_0 must be >= 1")
+
+    if SEGMENT_BUFFER_DELAY_SEC_0 < SEGMENT_BUFFER_SEGMENT_SEC_0:
+        raise ValueError("SEGMENT_BUFFER_DELAY_SEC_0 must be >= SEGMENT_BUFFER_SEGMENT_SEC_0")
+
+    if SEGMENT_BUFFER_RETENTION_SEC_0 < SEGMENT_BUFFER_DELAY_SEC_0:
+        raise ValueError("SEGMENT_BUFFER_RETENTION_SEC_0 must be >= SEGMENT_BUFFER_DELAY_SEC_0")
+
 
 # Validate configuration on import
 validate_config()
@@ -284,6 +386,22 @@ def get_config_summary():
         'hmac_configured': bool(HMAC_SECRET),
         'rtsp_stream_0': RTSP_STREAM_0,
         'rtsp_stream_1': RTSP_STREAM_1,
+        'rtsp_protocol_0': RTSP_PROTOCOL_0,
+        'rtsp_protocol_1': RTSP_PROTOCOL_1,
+        'rtsp_protocol_2': RTSP_PROTOCOL_2,
+        'rtsp_udp_timeout_us': RTSP_UDP_TIMEOUT_US,
+        'rtsp_tcp_timeout_us': RTSP_TCP_TIMEOUT_US,
+        'rtsp_port_retry': RTSP_PORT_RETRY,
+        'rtsp_do_retransmission': RTSP_DO_RETRANSMISSION,
+        'stream_0_bypass_tracker': STREAM_0_BYPASS_TRACKER,
+        'stream_0_bypass_pgie': STREAM_0_BYPASS_PGIE,
+        'stream_0_decode_only_mode': STREAM_0_DECODE_ONLY_MODE,
+        'stream_0_postmux_only_mode': STREAM_0_POSTMUX_ONLY_MODE,
+        'stream_0_postconv_only_mode': STREAM_0_POSTCONV_ONLY_MODE,
+        'stream_0_preosd_only_mode': STREAM_0_PREOSD_ONLY_MODE,
+        'stream_0_decoupled_analysis_mode': STREAM_0_DECOUPLED_ANALYSIS_MODE,
+        'enable_stream_0_pouring_processor': ENABLE_STREAM_0_POURING_PROCESSOR,
+        'enable_stream_0_brightness_processor': ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR,
         'base_dir': str(BASE_DIR),
         'config_dir': str(CONFIG_DIR),
         'data_dir': str(DATA_DIR),
@@ -314,4 +432,18 @@ def get_config_summary():
         'inference_video_fps': INFERENCE_VIDEO_FPS,
         'inference_video_width': INFERENCE_VIDEO_WIDTH,
         'inference_video_height': INFERENCE_VIDEO_HEIGHT,
+        'inference_video_schedule': INFERENCE_VIDEO_SCHEDULE,
+        'inference_video_max_duration_s': INFERENCE_VIDEO_MAX_DURATION_S,
+        'inference_video_retention_days': INFERENCE_VIDEO_RETENTION_DAYS,
+        'use_segment_buffer_0': USE_SEGMENT_BUFFER_0,
+        'segment_buffer_dir_0': SEGMENT_BUFFER_DIR_0,
+        'segment_buffer_segment_sec_0': SEGMENT_BUFFER_SEGMENT_SEC_0,
+        'segment_buffer_delay_sec_0': SEGMENT_BUFFER_DELAY_SEC_0,
+        'segment_buffer_retention_sec_0': SEGMENT_BUFFER_RETENTION_SEC_0,
+        'use_ffmpeg_src_0': USE_FFMPEG_SRC_0,
+        'use_ffmpeg_src_2': USE_FFMPEG_SRC_2,
+        'use_udp_loopback_0': USE_UDP_LOOPBACK_0,
+        'use_udp_loopback_2': USE_UDP_LOOPBACK_2,
+        'udp_loopback_port_0': UDP_LOOPBACK_PORT_0,
+        'udp_loopback_port_2': UDP_LOOPBACK_PORT_2,
     }

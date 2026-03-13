@@ -1,0 +1,35 @@
+[Unit]
+Description=HiCon AI Vision Pipeline (DeepStream 7.1)
+After=network-online.target hicon-mediamtx.service
+Wants=network-online.target hicon-mediamtx.service
+
+[Service]
+Type=simple
+User=hicon
+Group=hicon
+WorkingDirectory=/home/hicon/hicon/ai_vision
+
+# DeepStream + CUDA + GStreamer environment
+Environment=PATH=/usr/local/cuda-12.6/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local/cuda-12.6/lib64
+Environment=GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
+Environment=GST_DEBUG=1
+
+ExecStart=/bin/bash -c 'exec python3 hicon_pipeline.py 2>&1 | grep --line-buffered -v "ErrorType="'
+
+# Graceful shutdown — control-group sends SIGTERM to all processes in the pipe
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=15
+
+# Restart on failure with 2s delay (fast recovery for Stream 0 camera drops)
+Restart=on-failure
+RestartSec=2
+
+# Logging to journald (pipeline also logs to logs/pipeline.log)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hicon-vision
+
+[Install]
+WantedBy=multi-user.target
