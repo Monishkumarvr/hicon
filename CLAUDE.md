@@ -329,48 +329,56 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 - Full pipeline watchdog: no frames > 10 min → systemd restart
 - Recording: post-OSD tee branch managed by `RecordingManager` for inference video capture
 
-## Stream 0 Segment Buffer (CP Plus drop isolation)
+## CP Plus Segment Buffer (Streams 0 & 2 — drop isolation)
 
 **Problem:** CP Plus (Dahua OEM) firmware gracefully closes TCP RTSP sessions every ~4-5 min
 (code=0). No transport config or keepalive prevents it. Standalone `ffmpeg ... /dev/null` test
 survived 27+ min zero drops; `-f segment` (disk writes) triggers the firmware timeout.
 
-**Solution (deployed):** 60-second segment buffer spool.
+**Solution (deployed on both CP Plus streams):** Dual-ffmpeg segment buffer spool.
 ```
-camera (TCP) → ffmpeg (-f segment raw H264) → /dev/shm/hicon/stream0-buffer/segments/
-                                                  ↓ (helper paces at natural bitrate)
-                                                FIFO → fdsrc → h264parse → decoder → pipeline
+camera (TCP) → ffmpeg reader (-f {codec} pipe:1) ─[1MB pipe]─ ffmpeg segmenter (-f segment)
+                                                                         ↓
+                                                    /dev/shm/hicon/stream{N}-buffer/segments/
+                                                                         ↓ (helper paces at bitrate)
+                                                              FIFO → fdsrc → {codec}parse → decoder
 ```
-- `HICON_USE_SEGMENT_BUFFER_0=true`, `HICON_SEGMENT_BUFFER_DELAY_SEC_0=60`
-- ffmpeg writes `.h264` segments (2s each) to per-epoch tmpfs dirs
-- `pipeline/segment_buffer_helper.py` feeds completed segments into FIFO at real-time pace
-- GStreamer: static chain `fdsrc → segbufq(leaky) → h264parse(config-interval=-1) → decoder`
-- Result: 4 camera drops in 10 min → **0 watchdog fires, 0 0fps events**. Drops fully transparent.
+- Reader: zero disk I/O (matches `/dev/null` test). `-stimeout 10s` exits promptly on FIN-WAIT-1.
+- Segmenter: isolated from camera TCP session; assigns timestamps via `-r {fps}` (immune to
+  RTSP timestamp discontinuities — MPEGTS was tried but failed after TCP events).
+- 1MB inter-ffmpeg pipe (`F_SETPIPE_SZ`) absorbs brief segmenter stalls.
+- Helper (`pipeline/segment_buffer_helper.py`) feeds FIFO at natural bitrate; `state.json`
+  signals `buffering`/`rebuffering` mode to suppress FPS watchdog during recovery.
+- GStreamer: static chain `fdsrc → segbufq(leaky) → {h264/h265}parse(config-interval=-1) → decoder`
 
-**Known bugs fixed in segment_buffer_helper.py:**
-- **14fps burst**: large FIFO → instant segment write → HW decoder burst → GPU 33%↔1%. Fixed:
-  `_write_segment()` paces writes at `file_size/segment_seconds` bytes/sec in 64KB chunks.
-- **Deadline base**: `_advance_feed_deadline()` uses `write_start` (not write-end) as base, so
-  the 2s rate-limited write duration doesn't add to the 2s feed interval (double-wait bug).
-- **FIFO pipe size**: `F_SETPIPE_SZ` fallback loop 1MB→512KB→256KB (system max=1MB on Jetson).
-  Silent failure on 4MB request fixed.
-- **DTS log flood**: `ffmpeg -loglevel error` (was `warning` — caused Non-monotonous DTS spam).
+| Stream | Camera | Codec | Segment files | Buffer | Safe window |
+|--------|--------|-------|---------------|--------|-------------|
+| 0 | CP Plus 192.168.28.155 `subtype=1` | H.264 | `seg_%06d.h264` | 120s / 60 segs | ~78s |
+| 2 | CP Plus 192.168.28.162 `subtype=1` | **H.265** | `seg_%06d.h265` | 120s / 60 segs | ~78s |
+
+**Key parameters (both streams):**
+- `HICON_USE_SEGMENT_BUFFER_{N}=true`, `HICON_SEGMENT_BUFFER_DELAY_SEC_{N}=120`
+- `HICON_SEGMENT_BUFFER_RETENTION_SEC_{N}=180`, `HICON_SEGMENT_BUFFER_SEGMENT_SEC_{N}=2`
+- Low watermark = `target // 4` = 15 segments; startup grace = `delay_sec + 30` = 150s
+
+**Critical bugs fixed (segment_buffer_helper.py):**
+- **14fps burst**: large FIFO → instant write → HW decoder burst → ~14fps. Fixed: rate-limited
+  writes in `_write_segment()` at `file_size/segment_seconds` bytes/sec in 64KB chunks.
+- **Deadline base**: use `write_start` not write-end so 2s write doesn't add to 2s feed interval.
+- **FIFO pipe size**: `F_SETPIPE_SZ` fallback 1MB→512KB→256KB (Jetson system max = 1MB).
+- **DTS log flood**: `-loglevel error` (was `warning` → non-monotonous DTS spam).
 - **FIFO race**: `gst_builder.py` deletes leftover FIFO before spawning helper.
-- **tsdemux deadlock**: switched from MPEGTS chain to raw H264 segments + static fdsrc chain.
+- **tsdemux deadlock**: raw elementary stream; no MPEGTS demux needed.
+- **Codec hardcoded**: helper used `-f h264` unconditionally; now codec-aware (`hevc`/`h264`).
 
-**Dual-ffmpeg implemented and validated (2026-03-13):** Camera drops every ~4-5 min are now
-fully transparent — Stream 0 FPS stays at 24-25fps through every drop.
-- **Reader**: `ffmpeg -rtsp_transport tcp -stimeout 10000000 -i {url} -f h264 pipe:1` — raw H264 to
-  pipe. Zero disk I/O. `-stimeout 10s` exits promptly if camera stops RTP (avoids FIN-WAIT-1 stall).
-- **Segmenter**: `ffmpeg -f h264 -r 25.0 -i pipe:0 -f segment -segment_time 2 seg_%06d.h264` —
-  assigns its own timestamps via `-r 25.0`, immune to camera RTSP timestamp discontinuities.
-  (MPEGTS format was tried first but got stuck after camera TCP events due to timestamp jumps.)
-- **1MB pipe** (`F_SETPIPE_SZ`) between reader/segmenter absorbs brief segmenter stalls.
-- **Buffer 120s** (`HICON_SEGMENT_BUFFER_DELAY_SEC_0=120`): 60 segments, `low_watermark = target//4 = 15`.
-  Gives ~78s safe playback window vs ~30s camera recovery time → no rebuffer on any drop.
-- **Buffer drift**: writer runs ~0.47/s (camera ~24fps actual vs 25 assigned) → steady-state buffer
-  ~54 segments after 3-4 minutes. `target//4` watermark accounts for this drift.
-- **Retention**: 180s (`HICON_SEGMENT_BUFFER_RETENTION_SEC_0=180`).
+**Critical bugs fixed (bus_handler.py / hicon_pipeline.py):**
+- **Missing pipeline_config keys**: `use_segment_buffer_2` and companion keys were never added
+  to the `pipeline_config` dict — `DeepStreamPipelineBuilder` defaulted to rtspsrc for Stream 2.
+- **Startup grace too short**: was `delay_sec + 10`; camera recovery can add 30-50s → changed
+  to `delay_sec + 30` = 150s; added `stream_startup_grace_overrides` dict to `BusHandler`.
+- **No watchdog suppression for Stream 2**: Stream 0 reads `state.json` to suppress the 0fps
+  watchdog during rebuffering. Added generic `_segment_buffer_watchdog_suppressed(stream_id)`
+  and wired `stream_segment_buffer_state_paths[2]` from `hicon_pipeline.py`.
 
 **Investigation doc:** `ai_vision/docs/rtsp_stream0_investigation.md`
 

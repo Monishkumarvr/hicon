@@ -1380,3 +1380,128 @@ Stream 0 FPS held at 24-25fps through the entire camera recovery period.
 | Low watermark | `target // 4` = 15 segments |
 | Safe window | ~78 seconds |
 
+
+---
+
+## March 13, 2026 (afternoon) — Stream 2 Segment Buffer Rollout
+
+### Context
+
+Stream 2 is the second CP Plus pouring camera (192.168.28.162), same firmware family as
+Stream 0 (192.168.28.155). Having validated the segment buffer approach on Stream 0, the
+same architecture was applied to Stream 2 to eliminate its TCP drop behavior.
+
+### Bugs Found During Stream 2 Rollout
+
+#### Bug 1: Missing pipeline_config keys (root cause of Stream 2 using rtspsrc)
+
+`hicon_pipeline.py` builds a `pipeline_config` dict and passes it to `DeepStreamPipelineBuilder`.
+The Stream 0 segment buffer keys (`use_segment_buffer_0`, `segment_buffer_dir_0`, etc.) were
+present, but the five corresponding Stream 2 keys were never added to the dict.
+
+Result: `config.get('use_segment_buffer_2', False)` returned the default `False` inside
+`DeepStreamPipelineBuilder.__init__`, so the Stream 2 source fell through to `_create_decode_chain`
+(rtspsrc) even when `HICON_USE_SEGMENT_BUFFER_2=true` was set in `.env`.
+
+Symptom: "Stream 2: rtpbin configured" appearing in logs instead of
+"Stream 2: segment buffer source created".
+
+Fix: Added all five `segment_buffer_2` keys to the `pipeline_config` dict in `hicon_pipeline.py`.
+
+#### Bug 2: Wrong codec — Stream 2 camera sends HEVC, not H.264
+
+`.env` had `HICON_RTSP_CODEC_2=h264`. Direct ffprobe test revealed the camera at
+192.168.28.162 actually sends **HEVC (H.265)**:
+
+```
+ffprobe /tmp/stream2_test.h264
+→ Input #0, hevc, from '...': Video: hevc (Main), yuv420p(tv), 640x480, 25 fps
+```
+
+The segment buffer helper's ffmpeg commands used `-f h264` hardcoded (not `self.codec`),
+so the reader output HEVC data labeled as H264. The segmenter received HEVC NAL units but
+tried to parse them as H264:
+
+```
+ffmpeg-segmenter: dimensions not set
+ffmpeg-segmenter: Could not write header for output file #0 (incorrect codec parameters ?): Invalid argument
+```
+
+Fix 1: Changed `HICON_RTSP_CODEC_2=h265` in `.env`.
+
+Fix 2: Made segment_buffer_helper.py codec-aware:
+- `_build_ffmpeg_reader_cmd()`: use `"hevc" if self.codec == "h265" else "h264"` for `-f` format
+- `_build_ffmpeg_segmenter_cmd()`: same, plus codec-aware output extension (`.h265` / `.h264`)
+- `parse_segment_ref()`: added `.h265` to accepted suffixes
+- `list_complete_segments()`: changed glob from `seg_*.h264` to `seg_*.*`
+- GStreamer chain in `_create_segment_buffer_chain()`: already used `self.config.get(f'rtsp_codec_{stream_id}')` to select `h265parse` vs `h264parse` — no change needed there.
+
+#### Bug 3: FPS watchdog startup grace too short
+
+The bus handler's `startup_grace` for Stream 0 was `delay_sec + 10 = 130s`. Under normal
+conditions this is enough — 120s to fill the buffer, ~5s for first frames to reach the
+pipeline. But if the camera is slow to accept the first TCP connection (e.g., needs 30-40s
+recovery from a prior session), total startup can reach `50 + 120 = 170s`, exceeding the
+130s grace.
+
+Stream 2 had the default 30s grace (no override was wired). After the fixes above, the
+segment buffer helper started correctly but the FPS watchdog fired before priming completed:
+
+```
+[FPS-WATCHDOG] Stream 2 at 0fps for 5s — restarting
+```
+
+Fix: Changed grace formula from `delay_sec + 10` to `delay_sec + 30` (→ 150s for 120s buffer).
+Added `stream_startup_grace_overrides` dict to `BusHandler` to support per-stream overrides,
+and wired Stream 2's grace from `hicon_pipeline.py`.
+
+#### Bug 4: Stream 2 warn→restart escalation fired before recovery completed
+
+After the grace fix, a camera TCP drop (both cameras simultaneously at ~16:04:34) caused
+Stream 2 to go to 0fps. The `warn` policy logs warnings but escalates to a hard restart
+after 90s of consecutive 0fps. Stream 2 was already at 0fps for 75s when the grace expired,
+so only 15s remained before the 90s cap triggered a restart.
+
+Root cause: Stream 0 has `_stream0_watchdog_suppressed()` which reads the helper's
+`state.json`. While the helper is in `mode=rebuffering`, the watchdog counter resets
+(suppressing the escalation). Stream 2 had no equivalent suppression.
+
+Fix: Added `_segment_buffer_watchdog_suppressed(stream_id)` to `BusHandler` — a generic
+version that reads any stream's `state.json`. Extended the watchdog check to call this
+for any stream, not just Stream 0. Wired `stream_segment_buffer_state_paths[2]` from
+`hicon_pipeline.py`.
+
+The helper writes `state.json` with `mode` set to `"buffering"` (initial fill) or
+`"rebuffering"` (post-drop recovery). While either mode is active, the watchdog suppresses
+the 0fps counter for that stream, allowing arbitrarily long recovery without pipeline restart.
+
+### Validated Result
+
+After all fixes, both segment buffer streams prime simultaneously:
+```
+16:16:17 Stream 0: buffer primed (60 pending segments, target=60)
+16:16:17 Stream 2: buffer primed (60 pending segments, target=60)
+```
+
+All three streams at ~25fps steady:
+```
+[FPS] Stream 0: 25.2 fps | Stream 1: 25.0 fps | Stream 2: 26.0 fps
+```
+
+Inference active immediately after priming (NEW HEAT CYCLE fired within 1s of first frames).
+
+### Summary of Stream 2 Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Camera | CP Plus 192.168.28.162, `subtype=1` |
+| Codec | **HEVC (H.265)** — different from Stream 0 H.264 |
+| Reader format | `-f hevc pipe:1` |
+| Segmenter format | `-f hevc -r 25.0 -i pipe:0` |
+| Segment files | `seg_%06d.h265` |
+| GStreamer parser | `h265parse(config-interval=-1)` |
+| Buffer delay | 120s (60 segments) |
+| Retention | 180s |
+| Low watermark | `target // 4` = 15 segments |
+| Startup grace | 150s (`delay_sec + 30`) |
+| Watchdog policy | `warn` + state.json suppression during rebuffering |
