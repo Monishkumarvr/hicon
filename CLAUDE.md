@@ -358,13 +358,19 @@ camera (TCP) → ffmpeg (-f segment raw H264) → /dev/shm/hicon/stream0-buffer/
 - **FIFO race**: `gst_builder.py` deletes leftover FIFO before spawning helper.
 - **tsdemux deadlock**: switched from MPEGTS chain to raw H264 segments + static fdsrc chain.
 
-**Ongoing (planned):** Camera still drops every ~4-5 min (just transparent). To eliminate drops,
-a dual-ffmpeg architecture decouples the RTSP reader from disk I/O:
-1. **Reader**: `ffmpeg -rtsp_transport tcp -i {url} -f mpegts pipe:1` — zero disk I/O, no
-   `-stimeout`. Emulates `/dev/null` test conditions for the camera session.
-2. **Segmenter**: `ffmpeg -f mpegts -i pipe:0 -f segment -segment_time 2 seg_%06d.h264` — reads
-   MPEGTS from stdin, writes segments. Disk I/O fully decoupled from RTSP session.
-A 1MB `F_SETPIPE_SZ` pipe between them absorbs momentary segmenter stalls.
+**Dual-ffmpeg implemented and validated (2026-03-13):** Camera drops every ~4-5 min are now
+fully transparent — Stream 0 FPS stays at 24-25fps through every drop.
+- **Reader**: `ffmpeg -rtsp_transport tcp -stimeout 10000000 -i {url} -f h264 pipe:1` — raw H264 to
+  pipe. Zero disk I/O. `-stimeout 10s` exits promptly if camera stops RTP (avoids FIN-WAIT-1 stall).
+- **Segmenter**: `ffmpeg -f h264 -r 25.0 -i pipe:0 -f segment -segment_time 2 seg_%06d.h264` —
+  assigns its own timestamps via `-r 25.0`, immune to camera RTSP timestamp discontinuities.
+  (MPEGTS format was tried first but got stuck after camera TCP events due to timestamp jumps.)
+- **1MB pipe** (`F_SETPIPE_SZ`) between reader/segmenter absorbs brief segmenter stalls.
+- **Buffer 120s** (`HICON_SEGMENT_BUFFER_DELAY_SEC_0=120`): 60 segments, `low_watermark = target//4 = 15`.
+  Gives ~78s safe playback window vs ~30s camera recovery time → no rebuffer on any drop.
+- **Buffer drift**: writer runs ~0.47/s (camera ~24fps actual vs 25 assigned) → steady-state buffer
+  ~54 segments after 3-4 minutes. `target//4` watermark accounts for this drift.
+- **Retention**: 180s (`HICON_SEGMENT_BUFFER_RETENTION_SEC_0=180`).
 
 **Investigation doc:** `ai_vision/docs/rtsp_stream0_investigation.md`
 

@@ -1253,3 +1253,130 @@ conditions for the camera session while still producing segments for the pipelin
 
 A 1MB pipe between reader and segmenter absorbs momentary segmenter stalls. If the segmenter
 stalls, only the pipe fills — the reader's RTSP session is unaffected.
+
+---
+
+## March 13, 2026 (continued): Dual-ffmpeg Implementation and Buffer Tuning
+
+### Dual-ffmpeg Architecture Implemented
+
+The dual-ffmpeg `/dev/null` emulation was implemented in `segment_buffer_helper.py`:
+
+**Reader command** (`_build_ffmpeg_reader_cmd`):
+```
+ffmpeg -hide_banner -loglevel error -nostdin
+       -rtsp_transport tcp -stimeout 10000000
+       -i {rtsp_url}
+       -map 0:v:0 -c:v copy -an -f h264 pipe:1
+```
+
+**Segmenter command** (`_build_ffmpeg_segmenter_cmd`):
+```
+ffmpeg -hide_banner -loglevel error
+       -f h264 -r {fps} -i pipe:0
+       -map 0:v:0 -c:v copy -an
+       -f segment -segment_time 2 -reset_timestamps 1 seg_%06d.h264
+```
+
+Reader and segmenter are connected by a 1MB pipe (`F_SETPIPE_SZ`). Reader writes raw H264
+to the pipe; segmenter reads from it and writes `.h264` segment files.
+
+### Bug: MPEGTS Timestamp Discontinuity (Test 1)
+
+**Symptom**: After a camera drop (code=0) and reconnect, the segmenter stopped writing after
+exactly 262144 bytes (256KB = ~1s video). Segmenter process stayed alive but produced no more
+data. Segment files accumulated at exactly 256KB.
+
+**Root cause**: Initial implementation used MPEGTS (`-f mpegts`) as the pipe format. When the
+camera had a TCP event, MPEGTS timestamps jumped discontinuously. The segment muxer compared
+the new timestamps against its internal state from before the reconnect and got stuck on the
+segment boundary, unable to determine when to cut.
+
+**Fix**: Changed pipe format to raw H264 (`-f h264` on both reader and segmenter, with
+`-r {fps}` added to segmenter to assign its own timestamps). Raw H264 carries no timing
+metadata. The segmenter assigns timestamps based solely on the `-r fps` parameter, which
+is monotonically increasing and unaffected by camera timestamp resets.
+
+### Bug: TCP FIN-WAIT-1 Reader Stall Without -stimeout (Test 2)
+
+**Symptom**: After a camera drop (code=0), the reader process stayed alive in `do_sys_poll`
+kernel state. The pipe to the segmenter was empty. The segmenter was blocked in `pipe_read`.
+`ss -tnp` showed the reader's TCP socket to the camera in state `FIN-WAIT-1` indefinitely.
+
+**Diagnosis**: Without `-stimeout`, when the camera stops sending RTP (RTCP timeout), ffmpeg
+sends a TCP FIN to the camera but the camera firmware does not ACK it promptly. The reader
+gets stuck in FIN-WAIT-1 waiting for the ACK, during which it stops writing to the pipe.
+The segmenter's stdin starves. Buffer drains.
+
+**Fix**: Added `-stimeout 10000000` (10 seconds) back to the reader command. When no data
+arrives for 10 seconds, the reader exits. The writer_loop detects the exit, terminates the
+segmenter, and starts a new epoch.
+
+### Result: First Transparent Drop (Test 3, same session)
+
+With raw H264 pipe format and `-stimeout 10000000`:
+- `14:07:25`: reader exited code=0 (camera drop)
+- `14:07:26–14:07:31`: Stream 0 FPS = 124-125 frames (24.8–25.0 fps)
+
+First confirmed transparent drop absorption in dual-ffmpeg mode.
+
+### Remaining Issue: Buffer Drain During Camera Recovery
+
+After each camera drop (code=0), the reconnect attempt immediately times out with
+`Connection timed out` (code=1, after the 10s `-stimeout`). The CP Plus firmware needs
+~25-40 seconds before it accepts a new TCP connection after closing the previous session.
+
+With the 60s buffer (30 segments, `low_watermark = 15`):
+- Buffer at steady state was empirically ~21 segments (not 30), due to slight drift between
+  feeder rate (0.5/s) and writer rate (~0.47/s, from camera running at ~24fps actual vs 25
+  assigned in `-r 25.0`).
+- Camera recovery: 2-3 failed 10s attempts = 24-36s with no new segments.
+- 21 segments, draining at 0.5/s for 30s = 6 remaining → below `low_watermark = 15`.
+- Result: rebuffer triggered → Stream 0 0fps for ~30-60 seconds until buffer refilled.
+
+### Fix 1: Lower Low Watermark (`target // 2` → `target // 4`)
+
+`low_watermark_segments` changed from `target // 2` to `target // 4`. For 30 segments:
+- Old: watermark = 15, safe window = (30-15)/0.5 = 30 seconds
+- New: watermark = 7, safe window = (21-7)/0.5 = 28 seconds from empirical baseline
+
+With empirical baseline of 21, this extended safe window from ~12s to ~28s before rebuffer
+triggered. Still not enough to survive 30-40s camera recovery.
+
+### Fix 2: Increase Buffer to 120 seconds
+
+`HICON_SEGMENT_BUFFER_DELAY_SEC_0` increased from 60 → 120 (`.env`).
+`HICON_SEGMENT_BUFFER_RETENTION_SEC_0` increased from 120 → 180 (`.env`).
+
+With 120s buffer:
+- `target = 60 segments`, `low_watermark = 15` (60 // 4)
+- Steady-state empirical buffer at first drop: ~54 segments (drift ~6 over 3 minutes)
+- Safe window: (54 - 15) / 0.5 = **78 seconds**
+- Camera recovery ~30s: 54 - 30×0.5 = 39 > 15 → **no rebuffer triggered**
+
+### Confirmed Result (March 13, 15:00–15:10 soak)
+
+With dual-ffmpeg + raw H264 + `-stimeout` + `low_watermark = target // 4` + 120s buffer:
+
+| Drop time | Exit sequence | FPS during recovery | Rebuffer? |
+|-----------|--------------|---------------------|-----------|
+| 14:56:59  | code=0 → code=1 (×1) | 24.4–25.6 fps continuously | None |
+| 15:01:58  | code=0 → code=1 (×2) | 24.4–25.4 fps continuously | None |
+
+Both drops fully transparent. No 0fps events, no rebuffer log entries.
+Stream 0 FPS held at 24-25fps through the entire camera recovery period.
+
+### Summary of Final Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Reader format | `-f h264 pipe:1` |
+| Segmenter format | `-f h264 -r 25.0 -i pipe:0` |
+| Reader `-stimeout` | `10000000` (10s) |
+| Inter-ffmpeg pipe size | 1MB (`F_SETPIPE_SZ`) |
+| Segment duration | 2s |
+| Buffer delay | 120s (60 segments) |
+| Retention | 180s |
+| Low watermark | `target // 4` = 15 segments |
+| Safe window | ~78 seconds |
+
