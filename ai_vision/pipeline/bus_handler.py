@@ -54,7 +54,8 @@ class BusHandler:
     def __init__(self, pipeline, loop, healthcheck_url="",
                  stream0_decoupled_analysis_mode=False, stream_policies=None,
                  stream0_segment_buffer_mode=False, stream0_segment_buffer_state_path="",
-                 stream0_startup_grace_sec=None, stream_startup_grace_overrides=None):
+                 stream0_startup_grace_sec=None, stream_startup_grace_overrides=None,
+                 stream_segment_buffer_state_paths=None):
         """
         Args:
             pipeline: GStreamer pipeline
@@ -66,6 +67,8 @@ class BusHandler:
             stream0_segment_buffer_state_path: JSON state file published by the helper
             stream0_startup_grace_sec: Optional Stream 0 startup grace override
             stream_startup_grace_overrides: {stream_id: int} per-stream grace overrides
+            stream_segment_buffer_state_paths: {stream_id: str} state.json paths for
+                any segment-buffer stream (enables watchdog suppression during rebuffering)
         """
         self.pipeline = pipeline
         self.loop = loop
@@ -92,6 +95,11 @@ class BusHandler:
             int(stream0_startup_grace_sec or _STARTUP_GRACE_SEC),
         )
         self._stream_startup_grace_overrides = dict(stream_startup_grace_overrides or {})
+        self._stream_segment_buffer_state_paths = {
+            sid: Path(p)
+            for sid, p in (stream_segment_buffer_state_paths or {}).items()
+            if p
+        }
         self._healthcheck_url = (healthcheck_url or "").rstrip("/")
 
         # Per-source RTSP error timestamps for rate-limiting
@@ -139,6 +147,17 @@ class BusHandler:
         if not state:
             return False
         return state.get("mode") in {"buffering", "rebuffering"}
+
+    def _segment_buffer_watchdog_suppressed(self, stream_id: int) -> bool:
+        """Return True if stream_id's segment buffer is buffering/rebuffering."""
+        state_path = self._stream_segment_buffer_state_paths.get(stream_id)
+        if state_path is None:
+            return False
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return False
+        return isinstance(data, dict) and data.get("mode") in {"buffering", "rebuffering"}
 
     # ------------------------------------------------------------------
     # healthchecks.io heartbeat
@@ -330,7 +349,10 @@ class BusHandler:
                 if count == 0 and sid in self.last_frame_time and (
                     now - self._startup_time
                 ) >= self._stream_startup_grace_sec(sid):
-                    if sid == 0 and self._stream0_watchdog_suppressed():
+                    if (
+                        (sid == 0 and self._stream0_watchdog_suppressed())
+                        or self._segment_buffer_watchdog_suppressed(sid)
+                    ):
                         self._zero_fps_counts[sid] = 0
                         continue
                     self._zero_fps_counts[sid] = self._zero_fps_counts.get(sid, 0) + 1

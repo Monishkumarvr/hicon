@@ -673,8 +673,12 @@ def main():
         stream0_segment_buffer_state_path = str(Path(config.SEGMENT_BUFFER_DIR_0) / "state.json")
         stream0_startup_grace_sec = max(60, int(config.SEGMENT_BUFFER_DELAY_SEC_0) + 30)
     stream_startup_grace_overrides = {}
+    stream_segment_buffer_state_paths = {}
     if config.USE_SEGMENT_BUFFER_2:
         stream_startup_grace_overrides[2] = max(60, int(config.SEGMENT_BUFFER_DELAY_SEC_2) + 30)
+        stream_segment_buffer_state_paths[2] = str(
+            Path(config.SEGMENT_BUFFER_DIR_2) / "state.json"
+        )
     bus_handler = BusHandler(
         pipeline,
         loop,
@@ -685,6 +689,7 @@ def main():
         stream0_segment_buffer_state_path=stream0_segment_buffer_state_path,
         stream0_startup_grace_sec=stream0_startup_grace_sec,
         stream_startup_grace_overrides=stream_startup_grace_overrides,
+        stream_segment_buffer_state_paths=stream_segment_buffer_state_paths,
     )
 
     # Initialize MJPEG live streaming server (if enabled)
