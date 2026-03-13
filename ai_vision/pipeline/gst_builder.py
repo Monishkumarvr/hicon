@@ -67,6 +67,15 @@ class DeepStreamPipelineBuilder:
         self.segment_buffer_retention_sec_0 = int(
             config.get('segment_buffer_retention_sec_0', 120) or 120
         )
+        self.use_segment_buffer_2 = bool(config.get('use_segment_buffer_2', False))
+        self.segment_buffer_dir_2 = str(
+            config.get('segment_buffer_dir_2', '/dev/shm/hicon/stream2-buffer')
+        )
+        self.segment_buffer_segment_sec_2 = int(config.get('segment_buffer_segment_sec_2', 2) or 2)
+        self.segment_buffer_delay_sec_2 = int(config.get('segment_buffer_delay_sec_2', 120) or 120)
+        self.segment_buffer_retention_sec_2 = int(
+            config.get('segment_buffer_retention_sec_2', 180) or 180
+        )
         self.use_ffmpeg_src_0 = bool(config.get('use_ffmpeg_src_0', False))
         self.use_ffmpeg_src_2 = bool(config.get('use_ffmpeg_src_2', False))
         self.use_udp_loopback_0 = bool(config.get('use_udp_loopback_0', False))
@@ -78,6 +87,9 @@ class DeepStreamPipelineBuilder:
             self.use_udp_loopback_0 = False
             self.use_ffmpeg_src_0 = False
             self.use_nvurisrcbin_0 = False
+        if self.use_segment_buffer_2:
+            self.use_udp_loopback_2 = False
+            self.use_ffmpeg_src_2 = False
         if self.use_udp_loopback_0:
             self.use_ffmpeg_src_0 = False   # UDP loopback takes priority
             self.use_nvurisrcbin_0 = False
@@ -1019,7 +1031,17 @@ class DeepStreamPipelineBuilder:
 
         # === STREAM 2: Second Pouring Camera (pouring only, no brightness) ===
         if 2 in self.enabled_streams:
-            if self.use_udp_loopback_2:
+            if self.use_segment_buffer_2:
+                if not self._create_segment_buffer_chain(
+                    2,
+                    self.config['rtsp_stream_2'],
+                    self.segment_buffer_dir_2,
+                    self.segment_buffer_segment_sec_2,
+                    self.segment_buffer_delay_sec_2,
+                    self.segment_buffer_retention_sec_2,
+                ):
+                    return False
+            elif self.use_udp_loopback_2:
                 port = self.config.get('udp_loopback_port_2', 5002)
                 if not self._create_udp_loopback_chain(2, self.config['rtsp_stream_2'], port):
                     return False
@@ -1088,6 +1110,8 @@ class DeepStreamPipelineBuilder:
         """Check if a stream uses delayed segment-buffer ingest."""
         if stream_id == 0:
             return self.use_segment_buffer_0
+        if stream_id == 2:
+            return self.use_segment_buffer_2
         return False
 
     def _is_udp_loopback_stream(self, stream_id):

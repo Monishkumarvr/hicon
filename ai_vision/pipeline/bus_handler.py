@@ -54,7 +54,7 @@ class BusHandler:
     def __init__(self, pipeline, loop, healthcheck_url="",
                  stream0_decoupled_analysis_mode=False, stream_policies=None,
                  stream0_segment_buffer_mode=False, stream0_segment_buffer_state_path="",
-                 stream0_startup_grace_sec=None):
+                 stream0_startup_grace_sec=None, stream_startup_grace_overrides=None):
         """
         Args:
             pipeline: GStreamer pipeline
@@ -65,6 +65,7 @@ class BusHandler:
             stream0_segment_buffer_mode: Whether Stream 0 uses delayed segment buffering
             stream0_segment_buffer_state_path: JSON state file published by the helper
             stream0_startup_grace_sec: Optional Stream 0 startup grace override
+            stream_startup_grace_overrides: {stream_id: int} per-stream grace overrides
         """
         self.pipeline = pipeline
         self.loop = loop
@@ -90,6 +91,7 @@ class BusHandler:
             _STARTUP_GRACE_SEC,
             int(stream0_startup_grace_sec or _STARTUP_GRACE_SEC),
         )
+        self._stream_startup_grace_overrides = dict(stream_startup_grace_overrides or {})
         self._healthcheck_url = (healthcheck_url or "").rstrip("/")
 
         # Per-source RTSP error timestamps for rate-limiting
@@ -110,10 +112,14 @@ class BusHandler:
                 self.stream0_segment_buffer_state_path,
                 self._stream0_startup_grace_sec,
             )
+        for sid, grace in self._stream_startup_grace_overrides.items():
+            logger.info("Stream %s: startup grace extended to %ss", sid, grace)
         if self._healthcheck_url:
             logger.info(f"Healthcheck enabled: {self._healthcheck_url}")
 
     def _stream_startup_grace_sec(self, stream_id: int) -> int:
+        if stream_id in self._stream_startup_grace_overrides:
+            return self._stream_startup_grace_overrides[stream_id]
         if stream_id == 0 and self.stream0_segment_buffer_mode:
             return self._stream0_startup_grace_sec
         return _STARTUP_GRACE_SEC

@@ -634,6 +634,11 @@ def main():
         'segment_buffer_segment_sec_0': config.SEGMENT_BUFFER_SEGMENT_SEC_0,
         'segment_buffer_delay_sec_0': config.SEGMENT_BUFFER_DELAY_SEC_0,
         'segment_buffer_retention_sec_0': config.SEGMENT_BUFFER_RETENTION_SEC_0,
+        'use_segment_buffer_2': config.USE_SEGMENT_BUFFER_2,
+        'segment_buffer_dir_2': config.SEGMENT_BUFFER_DIR_2,
+        'segment_buffer_segment_sec_2': config.SEGMENT_BUFFER_SEGMENT_SEC_2,
+        'segment_buffer_delay_sec_2': config.SEGMENT_BUFFER_DELAY_SEC_2,
+        'segment_buffer_retention_sec_2': config.SEGMENT_BUFFER_RETENTION_SEC_2,
         'use_ffmpeg_src_0': config.USE_FFMPEG_SRC_0,
         'use_ffmpeg_src_2': config.USE_FFMPEG_SRC_2,
         'use_udp_loopback_0': config.USE_UDP_LOOPBACK_0,
@@ -658,11 +663,18 @@ def main():
         0: config.STREAM_0_ZERO_FPS_POLICY,
         1: config.STREAM_1_ZERO_FPS_POLICY,
     }
+    if config.USE_SEGMENT_BUFFER_2:
+        # Segment buffer priming takes delay_sec to fill; use warn policy like Stream 0
+        # so watchdog logs warnings but doesn't restart during priming.
+        stream_policies[2] = 'warn'
     stream0_segment_buffer_state_path = ""
     stream0_startup_grace_sec = 30
     if config.USE_SEGMENT_BUFFER_0:
         stream0_segment_buffer_state_path = str(Path(config.SEGMENT_BUFFER_DIR_0) / "state.json")
-        stream0_startup_grace_sec = max(30, int(config.SEGMENT_BUFFER_DELAY_SEC_0) + 10)
+        stream0_startup_grace_sec = max(60, int(config.SEGMENT_BUFFER_DELAY_SEC_0) + 30)
+    stream_startup_grace_overrides = {}
+    if config.USE_SEGMENT_BUFFER_2:
+        stream_startup_grace_overrides[2] = max(60, int(config.SEGMENT_BUFFER_DELAY_SEC_2) + 30)
     bus_handler = BusHandler(
         pipeline,
         loop,
@@ -672,6 +684,7 @@ def main():
         stream0_segment_buffer_mode=config.USE_SEGMENT_BUFFER_0,
         stream0_segment_buffer_state_path=stream0_segment_buffer_state_path,
         stream0_startup_grace_sec=stream0_startup_grace_sec,
+        stream_startup_grace_overrides=stream_startup_grace_overrides,
     )
 
     # Initialize MJPEG live streaming server (if enabled)

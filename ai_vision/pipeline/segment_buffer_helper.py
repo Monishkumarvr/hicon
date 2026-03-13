@@ -40,7 +40,7 @@ class SegmentRef:
 
 def parse_segment_ref(path: Path) -> SegmentRef | None:
     """Parse a segment path like epoch_000001/seg_000123.ts."""
-    if path.suffix not in (".ts", ".h264"):
+    if path.suffix not in (".ts", ".h264", ".h265"):
         return None
     try:
         epoch = int(path.parent.name.split("_", 1)[1])
@@ -62,7 +62,7 @@ def list_complete_segments(
     """
     finalized = set(finalized_epochs)
     refs: list[SegmentRef] = []
-    for path in segments_root.glob("epoch_*/seg_*.h264"):
+    for path in segments_root.glob("epoch_*/seg_*.*"):
         ref = parse_segment_ref(path)
         if ref is not None:
             refs.append(ref)
@@ -233,17 +233,19 @@ class SegmentBufferHelper:
         self._last_published_state = state
 
     def _build_ffmpeg_reader_cmd(self) -> list[str]:
-        """RTSP reader: camera → raw H264 bitstream → stdout pipe.
+        """RTSP reader: camera → raw video bitstream → stdout pipe.
 
-        Raw H264 (not MPEGTS) avoids timestamp discontinuity issues: when the camera
-        briefly resets its RTSP session, MPEGTS timestamps jump and confuse the
-        segment muxer. Raw H264 carries no timestamps so the segmenter assigns its
-        own frame-rate-based timestamps and splits cleanly regardless of camera events.
+        Raw elementary stream (not MPEGTS) avoids timestamp discontinuity issues: when
+        the camera briefly resets its RTSP session, MPEGTS timestamps jump and confuse
+        the segment muxer. Raw elementary stream carries no timestamps so the segmenter
+        assigns its own frame-rate-based timestamps and splits cleanly regardless of
+        camera events.
 
         -stimeout 10000000: exit after 10s of no data so the writer_loop can start a
         new epoch promptly. Without this the reader can get stuck in TCP FIN-WAIT-1
         (camera stops RTP but doesn't close TCP) and block the pipe indefinitely.
         """
+        fmt = "hevc" if self.codec == "h265" else "h264"
         return [
             "ffmpeg",
             "-hide_banner",
@@ -262,19 +264,21 @@ class SegmentBufferHelper:
             "copy",
             "-an",
             "-f",
-            "h264",
+            fmt,
             "pipe:1",
         ]
 
     def _build_ffmpeg_segmenter_cmd(self, epoch_dir: Path) -> list[str]:
-        """Segmenter: raw H264 bitstream from stdin pipe → H264 segment files.
+        """Segmenter: raw video bitstream from stdin pipe → segment files.
 
-        -f h264 -r {fps}: demux as raw H264 and assign timestamps at the camera's
-        native framerate. The segment muxer then splits every segment_seconds based
-        on these assigned timestamps rather than on RTSP PTS values, making it immune
-        to camera timestamp discontinuities. NO -nostdin: stdin IS the input pipe.
+        -f {fmt} -r {fps}: demux as raw elementary stream and assign timestamps at the
+        camera's native framerate. The segment muxer then splits every segment_seconds
+        based on these assigned timestamps rather than on RTSP PTS values, making it
+        immune to camera timestamp discontinuities. NO -nostdin: stdin IS the input pipe.
         """
-        output_pattern = str(epoch_dir / "seg_%06d.h264")
+        fmt = "hevc" if self.codec == "h265" else "h264"
+        ext = ".h265" if self.codec == "h265" else ".h264"
+        output_pattern = str(epoch_dir / f"seg_%06d{ext}")
         fps = str(self.fps)
         return [
             "ffmpeg",
@@ -282,7 +286,7 @@ class SegmentBufferHelper:
             "-loglevel",
             "error",
             "-f",
-            "h264",
+            fmt,
             "-r",
             fps,
             "-i",

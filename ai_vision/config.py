@@ -223,6 +223,15 @@ SEGMENT_BUFFER_SEGMENT_SEC_0 = int(os.getenv('HICON_SEGMENT_BUFFER_SEGMENT_SEC_0
 SEGMENT_BUFFER_DELAY_SEC_0 = int(os.getenv('HICON_SEGMENT_BUFFER_DELAY_SEC_0', '60'))
 SEGMENT_BUFFER_RETENTION_SEC_0 = int(os.getenv('HICON_SEGMENT_BUFFER_RETENTION_SEC_0', '120'))
 
+USE_SEGMENT_BUFFER_2 = os.getenv('HICON_USE_SEGMENT_BUFFER_2', 'false').lower() == 'true'
+SEGMENT_BUFFER_DIR_2 = os.getenv(
+    'HICON_SEGMENT_BUFFER_DIR_2',
+    '/dev/shm/hicon/stream2-buffer',
+)
+SEGMENT_BUFFER_SEGMENT_SEC_2 = int(os.getenv('HICON_SEGMENT_BUFFER_SEGMENT_SEC_2', '2'))
+SEGMENT_BUFFER_DELAY_SEC_2 = int(os.getenv('HICON_SEGMENT_BUFFER_DELAY_SEC_2', '120'))
+SEGMENT_BUFFER_RETENTION_SEC_2 = int(os.getenv('HICON_SEGMENT_BUFFER_RETENTION_SEC_2', '180'))
+
 # Use UDP loopback bridge instead of pipe bridge for CP Plus cameras.
 # ffmpeg reads camera via TCP, sends MPEGTS to udp://127.0.0.1:PORT.
 # GStreamer udpsrc reads from localhost UDP — non-blocking send decouples ffmpeg's
@@ -363,6 +372,15 @@ def validate_config():
     if SEGMENT_BUFFER_RETENTION_SEC_0 < SEGMENT_BUFFER_DELAY_SEC_0:
         raise ValueError("SEGMENT_BUFFER_RETENTION_SEC_0 must be >= SEGMENT_BUFFER_DELAY_SEC_0")
 
+    if SEGMENT_BUFFER_SEGMENT_SEC_2 < 1:
+        raise ValueError("SEGMENT_BUFFER_SEGMENT_SEC_2 must be >= 1")
+
+    if SEGMENT_BUFFER_DELAY_SEC_2 < SEGMENT_BUFFER_SEGMENT_SEC_2:
+        raise ValueError("SEGMENT_BUFFER_DELAY_SEC_2 must be >= SEGMENT_BUFFER_SEGMENT_SEC_2")
+
+    if SEGMENT_BUFFER_RETENTION_SEC_2 < SEGMENT_BUFFER_DELAY_SEC_2:
+        raise ValueError("SEGMENT_BUFFER_RETENTION_SEC_2 must be >= SEGMENT_BUFFER_DELAY_SEC_2")
+
 
 # Validate configuration on import
 validate_config()
@@ -440,6 +458,11 @@ def get_config_summary():
         'segment_buffer_segment_sec_0': SEGMENT_BUFFER_SEGMENT_SEC_0,
         'segment_buffer_delay_sec_0': SEGMENT_BUFFER_DELAY_SEC_0,
         'segment_buffer_retention_sec_0': SEGMENT_BUFFER_RETENTION_SEC_0,
+        'use_segment_buffer_2': USE_SEGMENT_BUFFER_2,
+        'segment_buffer_dir_2': SEGMENT_BUFFER_DIR_2,
+        'segment_buffer_segment_sec_2': SEGMENT_BUFFER_SEGMENT_SEC_2,
+        'segment_buffer_delay_sec_2': SEGMENT_BUFFER_DELAY_SEC_2,
+        'segment_buffer_retention_sec_2': SEGMENT_BUFFER_RETENTION_SEC_2,
         'use_ffmpeg_src_0': USE_FFMPEG_SRC_0,
         'use_ffmpeg_src_2': USE_FFMPEG_SRC_2,
         'use_udp_loopback_0': USE_UDP_LOOPBACK_0,
