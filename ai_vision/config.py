@@ -62,7 +62,7 @@ FURNACE_ID = os.getenv('HICON_FURNACE_ID', LOCATION)
 # =============================================================================
 
 # Sync interval (seconds between cloud sync attempts)
-SYNC_INTERVAL = int(os.getenv('HICON_SYNC_INTERVAL', '30'))
+SYNC_INTERVAL = int(os.getenv('HICON_SYNC_INTERVAL', '600'))
 
 # Batch size (number of records to sync per request)
 BATCH_SIZE = int(os.getenv('HICON_BATCH_SIZE', '50'))
