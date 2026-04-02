@@ -37,6 +37,8 @@ from sync.api_client import APIClient
 from sync.sync_manager import SyncManager
 from utils.zone_loader import load_zones_config
 from streaming.mjpeg_server import MJPEGServer
+from processors.pouring_analysis_controller import HybridPouringController
+from processors.pouring_meta_reader import PouringMetaReader
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -60,6 +62,10 @@ logger = logging.getLogger('hicon')
 # ---------------------------------------------------------------------------
 pouring_processor = None
 pouring_processor_2 = None       # Stream 2: second pouring camera (pouring-only, no brightness)
+pouring_controller = None        # Stream 0: C++ state + Python business logic
+pouring_controller_2 = None      # Stream 2: C++ state + Python business logic
+pouring_meta_reader = None       # Stream 0 C++ pouring plugin state decoder
+pouring_meta_reader_2 = None     # Stream 2 C++ pouring plugin state decoder
 heat_cycle_manager_2 = None      # Stream 2: independent heat cycle state
 brightness_processor = None
 pyrometer_processor = None
@@ -67,6 +73,9 @@ bus_handler = None
 sync_manager = None
 recording_manager = None
 mjpeg_server = None
+_live_stream_last_extract = {}
+_live_stream_warmup_deadline = 0.0
+_RECORDING_STARTUP_WARMUP_SEC = 5
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +104,48 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
             if update_analysis_path:
                 bus_handler.update_stream0_analysis_time()
 
+        meta_decode_enabled = bool(config.STREAM_0_CPP_META_DECODE_ENABLED)
+        hybrid_controller_enabled = bool(config.STREAM_0_HYBRID_CONTROLLER_ENABLED)
+
+        native_state = None
+        if (
+            config.USE_CPP_POURING_PLUGIN
+            and pouring_meta_reader is not None
+            and meta_decode_enabled
+        ):
+            try:
+                native_state = pouring_meta_reader.decode_frame_meta(frame_meta)
+            except Exception as e:
+                logger.error(f"Pouring meta reader error: {e}", exc_info=True)
+
+        # Determine which pouring path to use:
+        # 1. C++ state plugin + Python hybrid controller
+        # 2. Python-only YOLO pouring processor
+        run_python_pouring = (
+            pouring_processor is not None
+            and not config.USE_CPP_POURING_PLUGIN
+        )
+        run_hybrid_pouring = (
+            pouring_controller is not None
+            and config.USE_CPP_POURING_PLUGIN
+            and hybrid_controller_enabled
+        )
+
+        # CUDA brightness operates directly on GPU NvBufSurface — no CPU copy needed.
+        # CPU brightness still needs frame extraction like before.
+        cuda_brightness = (
+            brightness_processor is not None
+            and hasattr(brightness_processor, "process_frame_cuda")
+        )
+        cpu_brightness = brightness_processor is not None and not cuda_brightness
+
         stream0_needs_frame = (
             config.ENABLE_FRAME_PROCESSING
-            and ((pouring_processor is not None) or (brightness_processor is not None))
+            and (
+                run_python_pouring
+                or cpu_brightness
+                or (run_hybrid_pouring and pouring_controller.needs_frame(native_state))
+            )
         )
 
         frame = None
@@ -110,7 +158,8 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 logger.error(f"Frame extraction error: {e}", exc_info=True)
 
         try:
-            if pouring_processor:
+            # Pouring path first so brightness suppression sees the newest pouring state.
+            if run_python_pouring:
                 try:
                     pouring_processor.process_frame(
                         frame_meta=frame_meta,
@@ -121,8 +170,30 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                     )
                 except Exception as e:
                     logger.error(f"Pouring processor error: {e}", exc_info=True)
+            elif run_hybrid_pouring:
+                try:
+                    pouring_controller.process_native_state(
+                        frame_meta=frame_meta,
+                        native_state=native_state,
+                        frame=frame,
+                        batch_meta=batch_meta,
+                        timestamp=time.time(),
+                        datetime_obj=datetime.now(),
+                    )
+                except Exception as e:
+                    logger.error(f"Hybrid pouring controller error: {e}", exc_info=True)
 
-            if brightness_processor and frame is not None:
+            # CUDA brightness: runs on GPU NvBufSurface directly (no CPU frame)
+            if cuda_brightness:
+                try:
+                    brightness_processor.process_frame_cuda(
+                        gst_buffer, frame_meta, batch_meta,
+                    )
+                except Exception as e:
+                    logger.error(f"CUDA brightness processor error: {e}", exc_info=True)
+
+            # CPU brightness: legacy path using NumPy frame
+            elif cpu_brightness and frame is not None:
                 try:
                     brightness_processor.process_frame_with_array(frame, frame_meta)
                     if (
@@ -185,7 +256,7 @@ def osd_sink_pad_probe_stream0_heartbeat(pad, info):
 
 
 def analysis_pad_probe_stream0_cpu(pad, info):
-    """Run Stream 0 CPU analysis on the decoupled RGBA side branch."""
+    """Run Stream 0 CPU analysis on the decoupled NV12 side branch."""
     return _process_stream0_cpu_analysis(
         info,
         update_main_path=False,
@@ -251,6 +322,27 @@ def stream0_stage_probe_tracker_src(pad, info):
     return _mark_stream0_stage("tracker_src", info)
 
 
+def _should_extract_live_frame(stream_id: int) -> bool:
+    """Throttle MJPEG extraction before expensive GPU-to-CPU frame copies."""
+    global _live_stream_warmup_deadline
+
+    target_fps = max(int(getattr(config, "LIVE_STREAM_FPS", 0) or 0), 0)
+    if target_fps <= 0:
+        return True
+
+    now = time.monotonic()
+    if now < _live_stream_warmup_deadline:
+        return False
+
+    min_interval = 1.0 / float(target_fps)
+    last_extract = _live_stream_last_extract.get(stream_id, 0.0)
+    if last_extract and (now - last_extract) < min_interval:
+        return False
+
+    _live_stream_last_extract[stream_id] = now
+    return True
+
+
 def post_osd_probe_stream0_for_streaming(pad, info):
     """
     Probe on post-OSD path (after nvosd rendering) for live streaming.
@@ -262,6 +354,9 @@ def post_osd_probe_stream0_for_streaming(pad, info):
 
     gst_buffer = info.get_buffer()
     if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    if not _should_extract_live_frame(0):
         return Gst.PadProbeReturn.OK
 
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
@@ -320,9 +415,18 @@ def nvinfer_src_pad_probe_stream1(pad, info):
         if bus_handler:
             bus_handler.update_frame_time(1)
 
-        # Extract CPU frame for event screenshots (RGBA uint8)
+        # Extract CPU frame lazily for event screenshots only when detections exist or
+        # an active pyrometer event may soon need a start/end snapshot.
         frame = None
-        if config.ENABLE_FRAME_PROCESSING:
+        need_frame = False
+        if config.ENABLE_FRAME_PROCESSING and pyrometer_processor:
+            try:
+                obj_count = int(getattr(frame_meta, "num_obj_meta", 0) or 0)
+                need_frame = obj_count > 0 or pyrometer_processor.is_active
+            except Exception:
+                need_frame = False
+
+        if need_frame:
             try:
                 import numpy as np
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -369,6 +473,9 @@ def post_osd_probe_stream1_for_streaming(pad, info):
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
 
+    if not _should_extract_live_frame(1):
+        return Gst.PadProbeReturn.OK
+
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     if not batch_meta:
         return Gst.PadProbeReturn.OK
@@ -400,12 +507,76 @@ def post_osd_probe_stream1_for_streaming(pad, info):
     return Gst.PadProbeReturn.OK
 
 
+def pgie_src_pad_probe_stream2_diag(pad, info):
+    """Low-rate diagnostic probe on Stream 2 pgie source to separate infer vs tracker issues."""
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if not batch_meta:
+        return Gst.PadProbeReturn.OK
+
+    frame_count = getattr(pgie_src_pad_probe_stream2_diag, "_frames_seen", 0)
+
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        frame_count += 1
+        if frame_count % 250 == 0:
+            raw_obj_count = 0
+            untracked_count = 0
+            class_hist = {}
+
+            l_obj = frame_meta.obj_meta_list
+            while l_obj is not None:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                except StopIteration:
+                    break
+
+                raw_obj_count += 1
+                class_hist[obj_meta.class_id] = class_hist.get(obj_meta.class_id, 0) + 1
+                if int(obj_meta.object_id) == ((1 << 64) - 1):
+                    untracked_count += 1
+
+                try:
+                    l_obj = l_obj.next
+                except StopIteration:
+                    break
+
+            classes = "none"
+            if class_hist:
+                classes = ",".join(f"{cid}:{count}" for cid, count in sorted(class_hist.items()))
+
+            logger.info(
+                "[STREAM2-PGIE] frame=%d src=%s raw_objs=%d untracked=%d classes=%s",
+                frame_count,
+                frame_meta.source_id,
+                raw_obj_count,
+                untracked_count,
+                classes,
+            )
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    pgie_src_pad_probe_stream2_diag._frames_seen = frame_count
+    return Gst.PadProbeReturn.OK
+
+
 def osd_sink_pad_probe_stream2(pad, info):
     """
     Probe on nvosd_2 sink pad (Stream 2 — Second Pouring Camera).
-    Handles pouring detection only — no brightness (tapping/deslagging/spectro).
-    Frame is extracted for pour brightness probe and event screenshots.
-    CRITICAL: unmap_nvds_buf_surface() MUST be called on Jetson.
+    When the C++ plugin is enabled, Python consumes the native session/probe
+    state and reuses the mature business logic on CPU. Otherwise it falls back
+    to the Python-only pouring processor.
     """
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -414,6 +585,15 @@ def osd_sink_pad_probe_stream2(pad, info):
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     if not batch_meta:
         return Gst.PadProbeReturn.OK
+
+    run_python_pouring = (
+        pouring_processor_2 is not None
+        and not config.USE_CPP_POURING_PLUGIN
+    )
+    run_hybrid_pouring = (
+        pouring_controller_2 is not None
+        and config.USE_CPP_POURING_PLUGIN
+    )
 
     l_frame = batch_meta.frame_meta_list
     while l_frame is not None:
@@ -425,8 +605,21 @@ def osd_sink_pad_probe_stream2(pad, info):
         if bus_handler:
             bus_handler.update_frame_time(2)
 
+        native_state = None
+        if config.USE_CPP_POURING_PLUGIN and pouring_meta_reader_2 is not None:
+            try:
+                native_state = pouring_meta_reader_2.decode_frame_meta(frame_meta)
+            except Exception as e:
+                logger.error(f"Stream 2 pouring meta reader error: {e}", exc_info=True)
+
         frame = None
-        if config.ENABLE_FRAME_PROCESSING:
+        if (
+            config.ENABLE_FRAME_PROCESSING
+            and (
+                run_python_pouring
+                or (run_hybrid_pouring and pouring_controller_2.needs_frame(native_state))
+            )
+        ):
             try:
                 import numpy as np
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -435,7 +628,7 @@ def osd_sink_pad_probe_stream2(pad, info):
                 logger.error(f"Stream 2 frame extraction error: {e}", exc_info=True)
 
         try:
-            if pouring_processor_2:
+            if run_python_pouring:
                 try:
                     pouring_processor_2.process_frame(
                         frame_meta=frame_meta,
@@ -446,6 +639,18 @@ def osd_sink_pad_probe_stream2(pad, info):
                     )
                 except Exception as e:
                     logger.error(f"Stream 2 pouring processor error: {e}", exc_info=True)
+            elif run_hybrid_pouring:
+                try:
+                    pouring_controller_2.process_native_state(
+                        frame_meta=frame_meta,
+                        native_state=native_state,
+                        frame=frame,
+                        batch_meta=batch_meta,
+                        timestamp=time.time(),
+                        datetime_obj=datetime.now(),
+                    )
+                except Exception as e:
+                    logger.error(f"Stream 2 hybrid pouring controller error: {e}", exc_info=True)
         finally:
             if frame is not None:
                 try:
@@ -481,7 +686,9 @@ def sync_thread_func(stop_event):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    global pouring_processor, pouring_processor_2, heat_cycle_manager_2
+    global pouring_processor, pouring_processor_2, pouring_controller, pouring_controller_2
+    global pouring_meta_reader, pouring_meta_reader_2
+    global heat_cycle_manager_2
     global brightness_processor, pyrometer_processor
     global bus_handler, sync_manager, recording_manager, mjpeg_server
 
@@ -491,6 +698,20 @@ def main():
 
     # Initialize GStreamer
     Gst.init(None)
+
+    # Load C++ pouring detection plugin
+    cpp_pouring_plugin_path = str(
+        Path(__file__).parent / 'custom_plugins' / 'hicon_pouring' / 'libgsthiconpouring.so'
+    )
+    use_cpp_pouring = config.USE_CPP_POURING_PLUGIN
+    if use_cpp_pouring:
+        try:
+            Gst.Plugin.load_file(cpp_pouring_plugin_path)
+            logger.info("C++ pouring plugin loaded: %s", cpp_pouring_plugin_path)
+            # Meta decoders/controllers are created after db + heat_cycle_manager init.
+        except Exception as e:
+            logger.warning("C++ pouring plugin not available (%s), falling back to Python", e)
+            use_cpp_pouring = False
 
     # Create output directories
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -517,6 +738,22 @@ def main():
         ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
     )
 
+    # Initialize C++ pouring meta readers (after db + heat_cycle_manager)
+    if use_cpp_pouring:
+        pouring_meta_reader = PouringMetaReader(
+            stream_label="stream0",
+        )
+        pouring_meta_reader_2 = PouringMetaReader(
+            stream_label="stream2",
+        )
+        logger.info("C++ pouring meta readers initialized")
+        if not config.STREAM_0_CPP_META_ATTACH_ENABLED:
+            logger.warning("Stream 0: C++ user-meta attachment disabled for staged isolation")
+        if not config.STREAM_0_CPP_META_DECODE_ENABLED:
+            logger.warning("Stream 0: C++ meta decode disabled for staged isolation")
+        if not config.STREAM_0_HYBRID_CONTROLLER_ENABLED:
+            logger.warning("Stream 0: Hybrid pouring controller disabled for staged isolation")
+
     # Initialize processors
     stream0_enable_display_meta = not config.STREAM_0_DECOUPLED_ANALYSIS_MODE
     if config.STREAM_0_DECOUPLED_ANALYSIS_MODE:
@@ -524,15 +761,30 @@ def main():
             "Stream 0 (CP Plus): CPU-generated live display meta disabled in decoupled mode"
         )
 
+    use_cuda_brightness = bool(config.USE_CUDA_BRIGHTNESS)
+
     if config.ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR:
-        brightness_processor = BrightnessProcessor(
-            zones_config=zones_config,
-            db_manager=db,
-            config=config,
-            screenshot_dir=str(config.SCREENSHOT_DIR),
-            heat_cycle_manager=heat_cycle_manager,
-            enable_display_meta=stream0_enable_display_meta,
-        )
+        if use_cuda_brightness:
+            from processors.cuda_brightness_processor import CudaBrightnessProcessor
+            brightness_processor = CudaBrightnessProcessor(
+                zones_config=zones_config,
+                db_manager=db,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                enable_display_meta=stream0_enable_display_meta,
+            )
+            logger.info("Stream 0: CUDA brightness processor initialized (GPU-direct)")
+        else:
+            brightness_processor = BrightnessProcessor(
+                zones_config=zones_config,
+                db_manager=db,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                enable_display_meta=stream0_enable_display_meta,
+            )
+            logger.info("Stream 0: CPU brightness processor initialized (NumPy)")
     else:
         brightness_processor = None
         logger.warning("Stream 0: Brightness processor disabled for diagnostics")
@@ -545,8 +797,26 @@ def main():
         heat_cycle_manager=heat_cycle_manager,
     )
 
-    # Pouring processor (Stream 0 — Process camera)
-    if config.ENABLE_STREAM_0_POURING_PROCESSOR:
+    # Stream 0 pouring path:
+    # - Hybrid controller when the native C++ plugin is enabled
+    # - Python-only processor as fallback otherwise
+    if config.ENABLE_STREAM_0_POURING_PROCESSOR and use_cpp_pouring:
+        try:
+            pouring_controller = HybridPouringController(
+                db_manager=db,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                enable_display_meta=stream0_enable_display_meta,
+            )
+            logger.info("Stream 0: Hybrid pouring controller initialized")
+        except Exception as e:
+            logger.warning(f"Stream 0: Hybrid pouring controller not available: {e}")
+            pouring_controller = None
+    else:
+        pouring_controller = None
+
+    if config.ENABLE_STREAM_0_POURING_PROCESSOR and not use_cpp_pouring:
         try:
             from processors.pouring_processor import PouringProcessor
             pouring_processor = PouringProcessor(
@@ -561,22 +831,45 @@ def main():
             logger.warning(f"Stream 0: Pouring processor not available: {e}")
             pouring_processor = None
     else:
-        logger.warning("Stream 0: Pouring processor disabled for diagnostics")
         pouring_processor = None
+        if not config.ENABLE_STREAM_0_POURING_PROCESSOR:
+            logger.warning("Stream 0: Pouring processor disabled for diagnostics")
+        elif use_cpp_pouring:
+            logger.info("Stream 0: Python-only pouring processor bypassed (hybrid C++ path active)")
 
-    # Pouring processor (Stream 2 — Second pouring camera, pouring-only, no brightness)
-    try:
-        from processors.pouring_processor import PouringProcessor
-        pouring_processor_2 = PouringProcessor(
-            db_manager=db,
-            config=config,
-            screenshot_dir=str(config.SCREENSHOT_DIR),
-            heat_cycle_manager=heat_cycle_manager_2,
-            camera_id_override=config.CAMERA_ID_STREAM_2,
-        )
-        logger.info("Stream 2: Pouring processor initialized")
-    except Exception as e:
-        logger.warning(f"Stream 2: Pouring processor not available: {e}")
+    if use_cpp_pouring:
+        try:
+            pouring_controller_2 = HybridPouringController(
+                db_manager=db,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager_2,
+                camera_id_override=config.CAMERA_ID_STREAM_2,
+                enable_display_meta=False,
+            )
+            logger.info("Stream 2: Hybrid pouring controller initialized")
+        except Exception as e:
+            logger.warning(f"Stream 2: Hybrid pouring controller not available: {e}")
+            pouring_controller_2 = None
+    else:
+        pouring_controller_2 = None
+
+    # YOLO-based pouring fallback (Stream 2 — second pouring camera)
+    if not use_cpp_pouring:
+        try:
+            from processors.pouring_processor import PouringProcessor
+            pouring_processor_2 = PouringProcessor(
+                db_manager=db,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager_2,
+                camera_id_override=config.CAMERA_ID_STREAM_2,
+            )
+            logger.info("Stream 2: Pouring processor initialized")
+        except Exception as e:
+            logger.warning(f"Stream 2: Pouring processor not available: {e}")
+            pouring_processor_2 = None
+    else:
         pouring_processor_2 = None
 
     # Initialize sync manager
@@ -627,8 +920,14 @@ def main():
         'stream_0_postconv_only_mode': config.STREAM_0_POSTCONV_ONLY_MODE,
         'stream_0_preosd_only_mode': config.STREAM_0_PREOSD_ONLY_MODE,
         'stream_0_decoupled_analysis_mode': config.STREAM_0_DECOUPLED_ANALYSIS_MODE,
+        'stream_0_analysis_branch_enabled': config.STREAM_0_ANALYSIS_BRANCH_ENABLED,
+        'stream_0_analysis_rgba_enabled': config.STREAM_0_ANALYSIS_RGBA_ENABLED,
+        'stream_0_analysis_cpp_plugin_enabled': config.STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED,
+        'stream_0_analysis_probe_enabled': config.STREAM_0_ANALYSIS_PROBE_ENABLED,
         'enable_inference_video': config.ENABLE_INFERENCE_VIDEO,
         'use_nvurisrcbin_0': config.USE_NVURISRCBIN_0,
+        'use_nvurisrcbin_1': config.USE_NVURISRCBIN_1,
+        'use_nvurisrcbin_2': config.USE_NVURISRCBIN_2,
         'use_segment_buffer_0': config.USE_SEGMENT_BUFFER_0,
         'segment_buffer_dir_0': config.SEGMENT_BUFFER_DIR_0,
         'segment_buffer_segment_sec_0': config.SEGMENT_BUFFER_SEGMENT_SEC_0,
@@ -645,6 +944,7 @@ def main():
         'use_udp_loopback_2': config.USE_UDP_LOOPBACK_2,
         'udp_loopback_port_0': config.UDP_LOOPBACK_PORT_0,
         'udp_loopback_port_2': config.UDP_LOOPBACK_PORT_2,
+        'use_cpp_pouring_plugin': use_cpp_pouring,
     }
 
     # Build pipeline (keep builder reference for ffmpeg cleanup on shutdown)
@@ -662,23 +962,25 @@ def main():
     stream_policies = {
         0: config.STREAM_0_ZERO_FPS_POLICY,
         1: config.STREAM_1_ZERO_FPS_POLICY,
+        2: config.STREAM_2_ZERO_FPS_POLICY if not config.USE_SEGMENT_BUFFER_2 else 'warn',
     }
-    if config.USE_SEGMENT_BUFFER_2:
-        # Segment buffer priming takes delay_sec to fill; use warn policy like Stream 0
-        # so watchdog logs warnings but doesn't restart during priming.
-        stream_policies[2] = 'warn'
     stream0_segment_buffer_state_path = ""
     stream0_startup_grace_sec = 30
     if config.USE_SEGMENT_BUFFER_0:
         stream0_segment_buffer_state_path = str(Path(config.SEGMENT_BUFFER_DIR_0) / "state.json")
         stream0_startup_grace_sec = max(60, int(config.SEGMENT_BUFFER_DELAY_SEC_0) + 30)
-    stream_startup_grace_overrides = {}
+    stream_startup_grace_overrides = {1: 150}  # Hikvision: tolerate full network outages
     stream_segment_buffer_state_paths = {}
     if config.USE_SEGMENT_BUFFER_2:
         stream_startup_grace_overrides[2] = max(60, int(config.SEGMENT_BUFFER_DELAY_SEC_2) + 30)
         stream_segment_buffer_state_paths[2] = str(
             Path(config.SEGMENT_BUFFER_DIR_2) / "state.json"
         )
+    # nvurisrcbin handles reconnection internally — raise the warn safety cap
+    # from 90s to 300s so the watchdog doesn't kill the pipeline during NVR session resets
+    any_nvurisrcbin = config.USE_NVURISRCBIN_0 or config.USE_NVURISRCBIN_1 or config.USE_NVURISRCBIN_2
+    warn_cap = 300 if any_nvurisrcbin else 90
+
     bus_handler = BusHandler(
         pipeline,
         loop,
@@ -690,6 +992,7 @@ def main():
         stream0_startup_grace_sec=stream0_startup_grace_sec,
         stream_startup_grace_overrides=stream_startup_grace_overrides,
         stream_segment_buffer_state_paths=stream_segment_buffer_state_paths,
+        warn_safety_cap_sec=warn_cap,
     )
 
     # Initialize MJPEG live streaming server (if enabled)
@@ -755,17 +1058,49 @@ def main():
         else:
             logger.warning("Inference video enabled but tee_1 missing; stream 1 recording disabled")
 
+    recording_manager_2 = None
+    if config.ENABLE_INFERENCE_VIDEO:
+        tee_2 = elements.get('tee_2')
+        if tee_2:
+            recording_manager_2 = RecordingManager(
+                output_dir=str(config.VIDEO_DIR / 'inference'),
+                stream_id=2,
+                target_fps=config.INFERENCE_VIDEO_FPS,
+                target_width=config.INFERENCE_VIDEO_WIDTH,
+                target_height=config.INFERENCE_VIDEO_HEIGHT,
+                schedule=config.INFERENCE_VIDEO_SCHEDULE,
+                max_duration_s=config.INFERENCE_VIDEO_MAX_DURATION_S,
+                retention_days=config.INFERENCE_VIDEO_RETENTION_DAYS,
+            )
+            if recording_manager_2.setup_recording_branch(pipeline, tee_2):
+                logger.info("Stream 2: DS-native inference recording branch configured")
+            else:
+                logger.error("Stream 2: failed to configure inference recording branch")
+                recording_manager_2 = None
+        else:
+            logger.warning("Inference video enabled but tee_2 missing; stream 2 recording disabled")
+
     # Attach pad probes
     # Stream 0: OSD sink pad probe (pouring + brightness)
     if 'nvosd_0' in elements and elements['nvosd_0']:
         osd_sinkpad = elements['nvosd_0'].get_static_pad("sink")
         if osd_sinkpad:
             if config.STREAM_0_DECOUPLED_ANALYSIS_MODE:
-                osd_sinkpad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    osd_sink_pad_probe_stream0_heartbeat_main,
-                )
-                logger.info("Stream 0: Main-path heartbeat probe attached (decoupled analysis mode)")
+                if config.ENABLE_STREAM_0_PROBE and not config.STREAM_0_ANALYSIS_PROBE_ENABLED:
+                    osd_sinkpad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        osd_sink_pad_probe_stream0,
+                    )
+                    logger.info(
+                        "Stream 0: Main-path CPU analysis fallback attached "
+                        "(decoupled mode, analysis side probe disabled)"
+                    )
+                else:
+                    osd_sinkpad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        osd_sink_pad_probe_stream0_heartbeat_main,
+                    )
+                    logger.info("Stream 0: Main-path heartbeat probe attached (decoupled analysis mode)")
             elif config.ENABLE_STREAM_0_PROBE:
                 osd_sinkpad.add_probe(
                     Gst.PadProbeType.BUFFER,
@@ -781,23 +1116,50 @@ def main():
                     "Stream 0: OSD sink pad probe disabled for diagnostics "
                     "(heartbeat-only probe attached)"
                 )
-    if config.STREAM_0_DECOUPLED_ANALYSIS_MODE and 'analysis_caps0' in elements and elements['analysis_caps0']:
-        analysis_srcpad = elements['analysis_caps0'].get_static_pad("src")
-        if analysis_srcpad:
+    if (
+        config.STREAM_0_DECOUPLED_ANALYSIS_MODE
+        and config.STREAM_0_ANALYSIS_BRANCH_ENABLED
+        and config.STREAM_0_ANALYSIS_PROBE_ENABLED
+    ):
+        # Frames on the analysis branch are NV12 (no nvvideoconvert in decoupled mode).
+        # Probe attaches to the analysis branch terminal: after C++ plugin if present, else analysisq0.
+        if 'hicon_pouring_0' in elements and elements['hicon_pouring_0']:
+            analysis_probe_pad = elements['hicon_pouring_0'].get_static_pad("src")
+        elif 'analysisq0' in elements and elements['analysisq0']:
+            analysis_probe_pad = elements['analysisq0'].get_static_pad("src")
+        else:
+            analysis_probe_pad = None
+        if analysis_probe_pad:
             if config.ENABLE_STREAM_0_PROBE:
-                analysis_srcpad.add_probe(
+                analysis_probe_pad.add_probe(
                     Gst.PadProbeType.BUFFER,
                     analysis_pad_probe_stream0_cpu,
                 )
                 logger.info(
                     "Stream 0: Analysis branch probe attached "
-                    "(pouring + brightness + spectro on RGBA side branch)"
+                    "(pouring + brightness + spectro on NV12 analysis branch)"
                 )
             else:
                 logger.warning(
                     "Stream 0: Analysis branch probe disabled in decoupled mode "
                     "(main-path heartbeat remains attached)"
                 )
+    elif config.STREAM_0_DECOUPLED_ANALYSIS_MODE and not config.STREAM_0_ANALYSIS_BRANCH_ENABLED:
+        logger.info(
+            "Stream 0: Analysis branch disabled for isolation; skipping analysis probe "
+            "and C++ pouring meta reader on Stream 0"
+        )
+    elif config.STREAM_0_DECOUPLED_ANALYSIS_MODE and config.STREAM_0_ANALYSIS_BRANCH_ENABLED:
+        if config.ENABLE_STREAM_0_PROBE and not config.STREAM_0_ANALYSIS_PROBE_ENABLED:
+            logger.info(
+                "Stream 0: Analysis side probe disabled; CPU analysis is running on the "
+                "main path while the side branch remains shell-only"
+            )
+        else:
+            logger.info(
+                "Stream 0: Analysis branch probe disabled for staged isolation "
+                "(main-path heartbeat remains attached)"
+            )
     elif 'decode_sink_0' in elements and elements['decode_sink_0']:
         decode_sinkpad = elements['decode_sink_0'].get_static_pad("sink")
         if decode_sinkpad:
@@ -944,6 +1306,16 @@ def main():
     elif mjpeg_server and not config.ENABLE_LIVE_STREAM_1:
         logger.info("Stream 1: Live streaming disabled (ENABLE_LIVE_STREAM_1=false)")
 
+    # Stream 2: PGIE src diagnostic probe (counts raw inference objects before tracker)
+    if 'pgie_pouring_2' in elements and elements['pgie_pouring_2']:
+        pgie2_srcpad = elements['pgie_pouring_2'].get_static_pad("src")
+        if pgie2_srcpad:
+            pgie2_srcpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                pgie_src_pad_probe_stream2_diag,
+            )
+            logger.info("Stream 2: PGIE src diagnostic probe attached")
+
     # Stream 2: OSD sink pad probe (second pouring camera — pouring only, no brightness)
     if 'nvosd_2' in elements and elements['nvosd_2']:
         osd2_sinkpad = elements['nvosd_2'].get_static_pad("sink")
@@ -973,12 +1345,6 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Configure recording file before PLAYING so filesink location is set in NULL/READY state
-    if recording_manager:
-        recording_manager.start_recording(event_prefix="inference_stream0")
-    if recording_manager_1:
-        recording_manager_1.start_recording(event_prefix="inference_stream1")
-
     # Start pipeline
     logger.info("Starting pipeline...")
     ret = pipeline.set_state(Gst.State.PLAYING)
@@ -988,6 +1354,27 @@ def main():
         sys.exit(1)
 
     logger.info("Pipeline PLAYING — waiting for streams...")
+    global _live_stream_warmup_deadline
+    _live_stream_warmup_deadline = time.monotonic() + _RECORDING_STARTUP_WARMUP_SEC
+
+    def _start_recording_branches_after_warmup():
+        if recording_manager:
+            recording_manager.start_recording(event_prefix="inference_stream0")
+        if recording_manager_1:
+            recording_manager_1.start_recording(event_prefix="inference_stream1")
+        if recording_manager_2:
+            recording_manager_2.start_recording(event_prefix="inference_stream2")
+        return False
+
+    if config.ENABLE_INFERENCE_VIDEO:
+        logger.info(
+            "Deferring inference recording start for %ss warm-up",
+            _RECORDING_STARTUP_WARMUP_SEC,
+        )
+        GLib.timeout_add_seconds(
+            _RECORDING_STARTUP_WARMUP_SEC,
+            _start_recording_branches_after_warmup,
+        )
 
     # Seed frame times for enabled streams only (disabled streams must not be tracked,
     # otherwise the watchdog fires false stale alerts for streams with no probe)
@@ -1033,11 +1420,21 @@ def main():
                 pouring_processor.close()
             except Exception as e:
                 logger.error(f"Error closing pouring processor: {e}", exc_info=True)
+        if pouring_controller:
+            try:
+                pouring_controller.close()
+            except Exception as e:
+                logger.error(f"Error closing hybrid pouring controller: {e}", exc_info=True)
         if pouring_processor_2:
             try:
                 pouring_processor_2.close()
             except Exception as e:
                 logger.error(f"Error closing pouring processor 2: {e}", exc_info=True)
+        if pouring_controller_2:
+            try:
+                pouring_controller_2.close()
+            except Exception as e:
+                logger.error(f"Error closing hybrid pouring controller 2: {e}", exc_info=True)
         pipeline.set_state(Gst.State.NULL)
         builder.terminate_ffmpeg_procs()
         logger.info("Pipeline stopped")

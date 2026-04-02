@@ -15,7 +15,7 @@ Environment=LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local
 Environment=GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
 Environment=GST_DEBUG=1
 
-ExecStart=/bin/bash -c 'exec python3 hicon_pipeline.py 2>&1 | grep --line-buffered -v "ErrorType="'
+ExecStart=/bin/bash -lc 'set -o pipefail; python3 hicon_pipeline.py 2>&1 | grep --line-buffered -v "ErrorType="; exit ${PIPESTATUS[0]}'
 
 # Graceful shutdown — control-group sends SIGTERM to all processes in the pipe
 KillSignal=SIGTERM

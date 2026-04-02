@@ -55,7 +55,8 @@ class BusHandler:
                  stream0_decoupled_analysis_mode=False, stream_policies=None,
                  stream0_segment_buffer_mode=False, stream0_segment_buffer_state_path="",
                  stream0_startup_grace_sec=None, stream_startup_grace_overrides=None,
-                 stream_segment_buffer_state_paths=None):
+                 stream_segment_buffer_state_paths=None,
+                 warn_safety_cap_sec=90):
         """
         Args:
             pipeline: GStreamer pipeline
@@ -89,6 +90,7 @@ class BusHandler:
         self._zero_fps_counts = {}    # {stream_id: int} — consecutive 0fps intervals
         self._zero_fps_limit = 1      # 1 × 10s = 10s of 0fps → restart
         self._stream_zero_fps_policy = stream_policies or {}  # {0: 'warn', 1: 'restart'}
+        self._warn_safety_cap_sec = warn_safety_cap_sec  # max 0fps in warn mode before restart
         self._startup_time = time.time()  # Grace period: skip 0fps watchdog at boot
         self._stream0_startup_grace_sec = max(
             _STARTUP_GRACE_SEC,
@@ -364,9 +366,9 @@ class BusHandler:
                                 f"[FPS-WATCHDOG] Stream {sid} at 0fps for "
                                 f"{stall_sec}s — policy=warn, waiting for recovery"
                             )
-                            # Safety cap: 90s stale even in warn mode → restart
-                            # (MediaMTX reconnects in ~5-40s, nvurisrcbin retries every 5s)
-                            if stall_sec >= 90:
+                            # Safety cap: stale even in warn mode → restart
+                            # Default 90s for segment buffer; raised to 300s for nvurisrcbin
+                            if stall_sec >= self._warn_safety_cap_sec:
                                 logger.critical(
                                     f"[FPS-WATCHDOG] Stream {sid} stale {stall_sec}s — escalating to restart"
                                 )

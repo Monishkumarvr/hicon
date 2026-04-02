@@ -74,8 +74,8 @@ class BrightnessProcessor:
         # Scale factors are computed on first frame so overlays and masks match the actual
         # mux output resolution (e.g., if main stream differs from calibration resolution).
         meta = zones_config.get('metadata', {})
-        self._ref_w = int(meta.get('ref_width', 1920))
-        self._ref_h = int(meta.get('ref_height', 1080))
+        self._ref_w = int(meta.get('ref_width', 1280))
+        self._ref_h = int(meta.get('ref_height', 720))
         self._sx = 1.0
         self._sy = 1.0
         self._last_white_ratios = {
@@ -181,26 +181,40 @@ class BrightnessProcessor:
         """
         Process a pre-extracted frame for tapping, deslagging, and spectro detection.
 
-        Called from osd_sink_pad probe on Stream 0.
+        Called from osd_sink_pad probe on Stream 0 (non-decoupled) or analysis branch probe
+        (decoupled mode).  Accepts either RGBA (shape H×W×4) or NV12 (shape H*3/2×W).
         Frame is already extracted and will be unmapped by the caller.
 
         Args:
-            frame: RGBA numpy array (already extracted via get_nvds_buf_surface)
+            frame: numpy array from get_nvds_buf_surface — RGBA (H,W,4) or NV12 (H*3/2,W)
             frame_meta: NvDsFrameMeta
         """
         try:
+            # Detect pixel format and derive actual frame height/width.
+            # NV12 semi-planar: shape is (H*3//2, W) — Y plane in rows [0:H].
+            # RGBA: shape is (H, W, 4).
+            if frame.ndim == 2:
+                # NV12: Y plane (luma) is the first 2/3 of rows; use it directly as grayscale.
+                frame_h = frame.shape[0] * 2 // 3
+                frame_w = frame.shape[1]
+                gray = frame[:frame_h, :]
+                # For screenshots: wrap Y-plane as 4-channel grayscale (prepare_frame expects RGBA).
+                frame_for_ss = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGRA)
+            else:
+                frame_h = frame.shape[0]
+                frame_w = frame.shape[1]
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGBA2GRAY)
+                frame_for_ss = frame
+
             # Build masks on first frame
             if not self._masks_built:
-                self._build_masks(frame.shape[0], frame.shape[1])
-
-            # Convert RGBA to grayscale
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGBA2GRAY)
+                self._build_masks(frame_h, frame_w)
 
             # Process tapping zone
             if self._tapping_mask is not None and self._tapping_pixel_count > 0:
                 self._process_zone(
                     gray, self._tapping_mask, self._tapping_pixel_count,
-                    self.tapping_tracker, frame
+                    self.tapping_tracker, frame_for_ss
                 )
 
             # Process deslagging zone (suppressed during tapping or active pouring cycle)
@@ -212,7 +226,7 @@ class BrightnessProcessor:
                 else:
                     self._process_zone(
                         gray, self._deslagging_mask, self._deslagging_pixel_count,
-                        self.deslagging_tracker, frame
+                        self.deslagging_tracker, frame_for_ss
                     )
 
             # Process spectro zone (suppressed during tapping or active pouring cycle)
@@ -223,7 +237,7 @@ class BrightnessProcessor:
                 else:
                     self._process_zone(
                         gray, self._spectro_mask, self._spectro_pixel_count,
-                        self.spectro_tracker, frame
+                        self.spectro_tracker, frame_for_ss
                     )
 
         except Exception as e:

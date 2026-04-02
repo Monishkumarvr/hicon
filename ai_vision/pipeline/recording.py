@@ -1,5 +1,5 @@
 """
-Recording Module - DS-native MJPEG MKV recording via tee → nvjpegenc → matroskamux.
+Recording Module - DS-native MJPEG MKV recording via tee → valve → nvjpegenc → matroskamux.
 Uses NVMM path to avoid costly/fragile NVMM->CPU conversion on Jetson.
 
 Supports scheduled recording windows (morning/evening shifts or 24/7)
@@ -100,7 +100,10 @@ class RecordingManager:
         self.is_recording = False
         self.current_file = None
         self.filesink = None
+        self.muxer = None
+        self.record_valve = None
         self._branch_buffer_count = 0
+        self._schedule_probe_count = 0
         self._recording_start_time = 0.0
         self._schedule_windows = parse_schedule(schedule)
         self._max_duration_s = int(max_duration_s or 0)
@@ -120,7 +123,7 @@ class RecordingManager:
     def setup_recording_branch(self, pipeline, tee_element):
         """
         Add recording branch to pipeline:
-        tee → queue → nvvideoconvert → capsfilter(NV12+fps) → nvjpegenc → matroskamux → filesink
+        tee → valve → queue → nvvideoconvert → capsfilter(NV12+fps) → nvjpegenc → matroskamux → filesink
 
         Args:
             pipeline: GStreamer pipeline
@@ -130,8 +133,16 @@ class RecordingManager:
             True if setup successful
         """
         sid = str(self.stream_id)
+        in_window = is_in_schedule(self._schedule_windows)
 
         # Create recording elements
+        self.record_valve = Gst.ElementFactory.make("valve", f"rec-valve-{sid}")
+        if not self.record_valve:
+            logger.error("valve not available - recording disabled")
+            return False
+        # Keep the branch closed until start_recording() explicitly opens it.
+        self.record_valve.set_property("drop", True)
+
         queue = Gst.ElementFactory.make("queue", f"rec-queue-{sid}")
         if queue:
             queue.set_property("max-size-buffers", 16)
@@ -161,13 +172,14 @@ class RecordingManager:
         if not muxer:
             logger.error("matroskamux not available - recording disabled")
             return False
+        self.muxer = muxer
 
         self.filesink = Gst.ElementFactory.make("filesink", f"rec-sink-{sid}")
         self.filesink.set_property("location", "/dev/null")
         self.filesink.set_property("sync", False)
         self.filesink.set_property("async", False)
 
-        elements = [queue, conv, capsfilter, encoder, muxer, self.filesink]
+        elements = [self.record_valve, queue, conv, capsfilter, encoder, muxer, self.filesink]
 
         for el in elements:
             if not el:
@@ -175,7 +187,8 @@ class RecordingManager:
                 return False
             pipeline.add(el)
 
-        if not (queue.link(conv) and
+        if not (self.record_valve.link(queue) and
+                queue.link(conv) and
                 conv.link(capsfilter) and
                 capsfilter.link(encoder) and
                 encoder.link(muxer) and
@@ -184,20 +197,73 @@ class RecordingManager:
             return False
 
         tee_pad = tee_element.request_pad_simple("src_%u")
-        queue_pad = queue.get_static_pad("sink")
-        if tee_pad.link(queue_pad) != Gst.PadLinkReturn.OK:
-            logger.error("Failed to link tee to recording queue")
+        valve_pad = self.record_valve.get_static_pad("sink")
+        if tee_pad.link(valve_pad) != Gst.PadLinkReturn.OK:
+            logger.error("Failed to link tee to recording valve")
             return False
+
+        schedule_pad = self.record_valve.get_static_pad("sink")
+        if schedule_pad:
+            schedule_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_schedule_probe)
 
         probe_pad = capsfilter.get_static_pad("src")
         if probe_pad:
             probe_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_branch_buffer)
 
+        if in_window:
+            logger.info(
+                f"Stream {sid} recording branch primed at startup "
+                f"(inside schedule, awaiting deferred start)"
+            )
+        else:
+            logger.info(f"Stream {sid} recording branch dormant at startup (outside schedule)")
         logger.info(f"Recording branch set up for stream {sid}")
         return True
 
+    def _set_branch_flow_enabled(self, enabled: bool):
+        """Open or close the recording branch without relinking the pipeline."""
+        if self.record_valve:
+            self.record_valve.set_property("drop", not enabled)
+
+    def _reconfigure_output_location(self, location: str) -> bool:
+        """Safely switch filesink output while the branch is closed."""
+        if not self.filesink:
+            return False
+        target = str(location)
+        current = self.filesink.get_property("location")
+        if current == target:
+            return True
+
+        try:
+            self._set_branch_flow_enabled(False)
+            if self.muxer:
+                self.muxer.set_state(Gst.State.READY)
+                self.muxer.get_state(2 * Gst.SECOND)
+            self.filesink.set_state(Gst.State.READY)
+            self.filesink.get_state(2 * Gst.SECOND)
+            self.filesink.set_property("location", target)
+            if self.muxer:
+                self.muxer.set_state(Gst.State.PLAYING)
+                self.muxer.get_state(2 * Gst.SECOND)
+            self.filesink.set_state(Gst.State.PLAYING)
+            self.filesink.get_state(2 * Gst.SECOND)
+            return True
+        except Exception as e:
+            logger.error(
+                f"Stream {self.stream_id}: failed to switch recording output to {target}: {e}",
+                exc_info=True,
+            )
+            return False
+
+    def _on_schedule_probe(self, pad, info):
+        """Lightweight pre-valve probe to drive schedule transitions while dormant."""
+        self._schedule_probe_count += 1
+        if self._schedule_probe_count % 100 == 0:
+            self._check_schedule_and_rotation()
+        return Gst.PadProbeReturn.OK
+
     def _on_branch_buffer(self, pad, info):
-        """Pad probe for recording branch diagnostics + schedule/rotation checks."""
+        """Pad probe for diagnostics on the active recording branch."""
         self._branch_buffer_count += 1
         if self._branch_buffer_count == 1:
             logger.info(f"Stream {self.stream_id} recording: first buffer received")
@@ -205,10 +271,6 @@ class RecordingManager:
             logger.info(
                 f"Stream {self.stream_id} recording: received {self._branch_buffer_count} buffers"
             )
-
-        # Check schedule and rotation every ~10 seconds (every 100 buffers at 10fps)
-        if self._branch_buffer_count % 100 == 0:
-            self._check_schedule_and_rotation()
 
         return Gst.PadProbeReturn.OK
 
@@ -275,6 +337,7 @@ class RecordingManager:
 
         # Check schedule before starting
         if not is_in_schedule(self._schedule_windows):
+            self._set_branch_flow_enabled(False)
             logger.info(f"Stream {self.stream_id}: not in recording window, skipping start")
             return
 
@@ -283,8 +346,11 @@ class RecordingManager:
         filename = f"{event_prefix}_s{self.stream_id}_{timestamp}.mkv"
         filepath = self.output_dir / filename
 
-        self.filesink.set_property("location", str(filepath))
-
+        if not self._reconfigure_output_location(str(filepath)):
+            logger.error(f"Stream {self.stream_id}: could not prepare recording output")
+            return
+        self._set_branch_flow_enabled(True)
+        self._branch_buffer_count = 0
         self.is_recording = True
         self.current_file = filepath
         self._recording_start_time = time.monotonic()
@@ -296,6 +362,7 @@ class RecordingManager:
             return None
 
         self.is_recording = False
+        self._set_branch_flow_enabled(False)
 
         filepath = self.current_file
         self.current_file = None

@@ -19,6 +19,7 @@ gi.require_version('GstRtsp', '1.0')
 from gi.repository import Gst, GstRtsp
 
 logger = logging.getLogger(__name__)
+_NVDSOSD_MODE_CPU = 0
 _NVDSOSD_MODE_GPU = 1
 
 
@@ -58,6 +59,18 @@ class DeepStreamPipelineBuilder:
         self.stream0_decoupled_analysis_mode = bool(
             config.get('stream_0_decoupled_analysis_mode', False)
         )
+        self.stream0_analysis_branch_enabled = bool(
+            config.get('stream_0_analysis_branch_enabled', True)
+        )
+        self.stream0_analysis_rgba_enabled = bool(
+            config.get('stream_0_analysis_rgba_enabled', True)
+        )
+        self.stream0_analysis_cpp_plugin_enabled = bool(
+            config.get('stream_0_analysis_cpp_plugin_enabled', True)
+        )
+        self.stream0_analysis_probe_enabled = bool(
+            config.get('stream_0_analysis_probe_enabled', True)
+        )
         self.use_segment_buffer_0 = bool(config.get('use_segment_buffer_0', False))
         self.segment_buffer_dir_0 = str(
             config.get('segment_buffer_dir_0', '/dev/shm/hicon/stream0-buffer')
@@ -83,6 +96,8 @@ class DeepStreamPipelineBuilder:
         self._ffmpeg_procs = {}  # {stream_id: subprocess.Popen}
         self._source_fds = []
         self.use_nvurisrcbin_0 = bool(config.get('use_nvurisrcbin_0', False))
+        self.use_nvurisrcbin_1 = bool(config.get('use_nvurisrcbin_1', False))
+        self.use_nvurisrcbin_2 = bool(config.get('use_nvurisrcbin_2', False))
         if self.use_segment_buffer_0:
             self.use_udp_loopback_0 = False
             self.use_ffmpeg_src_0 = False
@@ -130,19 +145,20 @@ class DeepStreamPipelineBuilder:
         self._source_fds.clear()
 
     @staticmethod
-    def _configure_queue(queue, max_buffers=16, leaky=0):
+    def _configure_queue(queue, max_buffers=16, leaky=0, max_size_time_ns=0):
         """Configure a small queue with bounded buffers and optional leak behavior."""
         if not queue:
             return
         queue.set_property('max-size-buffers', max_buffers)
         queue.set_property('max-size-bytes', 0)
-        queue.set_property('max-size-time', 0)
+        queue.set_property('max-size-time', max_size_time_ns)
         queue.set_property('leaky', leaky)
 
     @classmethod
-    def _configure_leaky_queue(cls, queue, max_buffers=16):
-        """Configure a small downstream-leaky queue to isolate transient backpressure."""
-        cls._configure_queue(queue, max_buffers=max_buffers, leaky=2)
+    def _configure_leaky_queue(cls, queue, max_buffers=16, max_size_time_ns=0):
+        """Configure a downstream-leaky queue to isolate transient backpressure."""
+        cls._configure_queue(queue, max_buffers=max_buffers, leaky=2,
+                             max_size_time_ns=max_size_time_ns)
 
     def create_pipeline(self):
         """
@@ -165,7 +181,7 @@ class DeepStreamPipelineBuilder:
         logger.info("3-stream HiCon pipeline created successfully")
         return self.pipeline, self.elements
 
-    def _create_streammux(self, name, batch_size=1, width=1920, height=1080):
+    def _create_streammux(self, name, batch_size=1, width=1280, height=720):
         """Create nvstreammux with standard properties."""
         mux = Gst.ElementFactory.make("nvstreammux", name)
         if not mux:
@@ -238,32 +254,47 @@ class DeepStreamPipelineBuilder:
 
         uribin.set_property('uri', rtsp_url)
         uribin.set_property('type', 2)  # rtsp source type
-        uribin.set_property('rtsp-reconnect-interval', 2)
+        # Stream 0 (1280x720) needs longer reconnect interval: decoder DPB reallocation
+        # + TCP socket cleanup takes >2s at higher resolution.  640x480 streams recover
+        # fast enough with 2s.  10s matches the nvurisrcbin default and avoids the
+        # "reconnect loop" where each attempt interrupts the previous one.
+        reconnect_s = 10 if stream_id == 0 else 2
+        uribin.set_property('rtsp-reconnect-interval', reconnect_s)
         uribin.set_property('rtsp-reconnect-attempts', -1)  # unlimited
         uribin.set_property('gpu-id', 0)
         uribin.set_property('cudadec-memtype', 0)  # device memory (NVMM)
         uribin.set_property('num-extra-surfaces', 8)
 
-        latency_ms = int(self.config.get('rtsp_latency_ms', 2000) or 2000)
+        latency_ms = int(self.config.get('rtsp_latency_ms', 4000) or 4000)
         uribin.set_property('latency', latency_ms)
-        uribin.set_property('drop-on-latency', False)
+        uribin.set_property('drop-on-latency', True)
 
+        # For nvurisrcbin, prefer auto (UDP fallback) — TCP-only reconnection is slower
+        # because of TCP socket TIME-WAIT cleanup.  Override any per-stream tcp setting.
         protocol = str(self.config.get(f'rtsp_protocol_{stream_id}', 'auto') or 'auto').lower()
+        if protocol == 'tcp' and stream_id == 0:
+            logger.info(f"Stream {stream_id}: overriding protocol tcp→auto for nvurisrcbin (faster reconnect)")
+            protocol = 'auto'
         if protocol == 'tcp':
             uribin.set_property('select-rtp-protocol', 4)  # rtp-tcp
         # default 0 = rtp-multi (UDP + UDP Multicast + TCP)
 
         self.elements[f'source{sid}'] = uribin
 
-        # premuxq0 for Stream 0 isolation (same as rtspsrc path)
-        if stream_id == 0:
-            self.elements['premuxq0'] = Gst.ElementFactory.make("queue", "premuxq0")
-            self._configure_leaky_queue(self.elements['premuxq0'])
+        # Leaky queue for ALL streams to absorb backpressure from downstream
+        # inference spikes — prevents RTSP TCP socket stall → server disconnect.
+        # Stream 0 had this since March 6 investigation; Streams 1 & 2 were missing it.
+        queue_name = f'premuxq{stream_id}'
+        self.elements[queue_name] = Gst.ElementFactory.make("queue", queue_name)
+        self._configure_leaky_queue(self.elements[queue_name], max_buffers=128,
+                                    max_size_time_ns=5_000_000_000)
 
         logger.info(
             f"Stream {sid}: nvurisrcbin created "
-            f"(reconnect-interval=5s, reconnect-attempts=unlimited, "
-            f"protocol={'tcp' if protocol == 'tcp' else 'multi'}, latency={latency_ms}ms)"
+            f"(reconnect-interval={reconnect_s}s, reconnect-attempts=unlimited, "
+            f"protocol={'tcp' if protocol == 'tcp' else 'multi'}, latency={latency_ms}ms, "
+            f"drop-on-latency=True, num-extra-surfaces=16, "
+            f"premuxq={queue_name} leaky=2 max-buffers=128 max-time=5s)"
         )
         return True
 
@@ -852,9 +883,12 @@ class DeepStreamPipelineBuilder:
                 )
             elif self.stream0_postconv_only_mode:
                 self.elements['mux_0'] = self._create_streammux("mux-0")
-                self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                else:
+                    logger.info("Stream 0: skipping CP Plus mux tuning (async-process=False incompatible with nvurisrcbin reconnection)")
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
-                self._configure_leaky_queue(self.elements['postmuxq0'])
+                self._configure_leaky_queue(self.elements['postmuxq0'], max_buffers=64)
                 self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-0")
                 self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
                 self.elements['postconv_sink_0'] = Gst.ElementFactory.make("fakesink", "postconv-sink-0")
@@ -870,9 +904,10 @@ class DeepStreamPipelineBuilder:
                 )
             elif self.stream0_preosd_only_mode:
                 self.elements['mux_0'] = self._create_streammux("mux-0")
-                self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
-                self._configure_leaky_queue(self.elements['postmuxq0'])
+                self._configure_leaky_queue(self.elements['postmuxq0'], max_buffers=64)
                 self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-0")
                 self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
                 self.elements['caps_osd_0'] = Gst.ElementFactory.make("capsfilter", "caps-osd-0")
@@ -894,9 +929,10 @@ class DeepStreamPipelineBuilder:
                 )
             elif self.stream0_postmux_only_mode:
                 self.elements['mux_0'] = self._create_streammux("mux-0")
-                self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
-                self._configure_leaky_queue(self.elements['postmuxq0'])
+                self._configure_leaky_queue(self.elements['postmuxq0'], max_buffers=64)
                 self.elements['postmux_sink_0'] = Gst.ElementFactory.make("fakesink", "postmux-sink-0")
                 self.elements['postmux_sink_0'].set_property('sync', 0)
                 self.elements['postmux_sink_0'].set_property('async', False)
@@ -906,9 +942,12 @@ class DeepStreamPipelineBuilder:
                 )
             else:
                 self.elements['mux_0'] = self._create_streammux("mux-0")
-                self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                else:
+                    logger.info("Stream 0: skipping CP Plus mux tuning for nvurisrcbin (async-process=False blocks reconnection)")
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
-                self._configure_leaky_queue(self.elements['postmuxq0'])
+                self._configure_leaky_queue(self.elements['postmuxq0'], max_buffers=64)
 
                 # Pouring inference (GIE-1)
                 if not self.stream0_bypass_pgie:
@@ -924,36 +963,75 @@ class DeepStreamPipelineBuilder:
                     self.elements['tracker_0'].set_property('tracker-width', 640)
                     self.elements['tracker_0'].set_property('tracker-height', 384)
 
+                # C++ pouring detection plugin (state machine, mould counting, OSD overlays)
+                stream0_cpp_plugin_enabled = self.config.get('use_cpp_pouring_plugin', False) and (
+                    not self.stream0_decoupled_analysis_mode or (
+                        self.stream0_analysis_cpp_plugin_enabled and (
+                            self.stream0_analysis_branch_enabled
+                            or not self.stream0_analysis_probe_enabled
+                        )
+                    )
+                )
+                if stream0_cpp_plugin_enabled:
+                    self.elements['hicon_pouring_0'] = Gst.ElementFactory.make(
+                        "hicon_pouring_detect", "hicon-pouring-0"
+                    )
+                    if self.elements['hicon_pouring_0']:
+                        enable_cpp_osd = not self.stream0_decoupled_analysis_mode
+                        self.elements['hicon_pouring_0'].set_property('enable-osd', enable_cpp_osd)
+                        logger.info("Stream 0: C++ pouring plugin created (hicon_pouring_detect)")
+                        if enable_cpp_osd:
+                            logger.info("Stream 0: C++ pouring OSD enabled on main path before nvosd_0")
+                        else:
+                            logger.info("Stream 0: C++ pouring OSD disabled on metadata-only Stream 0 path")
+                    else:
+                        logger.error("Stream 0: Failed to create hicon_pouring_detect element. "
+                                     "Check GST_PLUGIN_PATH includes the plugin .so directory.")
+                elif self.config.get('use_cpp_pouring_plugin', False) and self.stream0_decoupled_analysis_mode:
+                    if not self.stream0_analysis_branch_enabled:
+                        logger.info(
+                            "Stream 0: C++ pouring plugin skipped because analysis branch is disabled "
+                            "for isolation"
+                        )
+                    else:
+                        logger.info(
+                            "Stream 0: C++ pouring plugin skipped on analysis branch for staged isolation"
+                        )
+
                 self.elements['nvosd_0'] = Gst.ElementFactory.make("nvdsosd", "nvosd-0")
+                if self.elements['nvosd_0']:
+                    # CPU mode is more stable on the headless inference/recording path when
+                    # Python processors attach display_meta with lines/rects/text.
+                    self.elements['nvosd_0'].set_property('process-mode', _NVDSOSD_MODE_CPU)
                 if self.stream0_decoupled_analysis_mode:
-                    self.elements['nvosd_0'].set_property('process-mode', _NVDSOSD_MODE_GPU)
+                    # In decoupled mode, no nvvideoconvert is placed on Stream 0.
+                    # Any nvvideoconvert on Stream 0 combined with a pre-OSD tee causes
+                    # pgie-pyrometer CUDA OOM during TRT startup — keep Stream 0 NV12-only.
+                    # nvosd_0 CPU mode handles NV12 directly; brightness probe uses NV12 Y-plane.
                     self.elements['tee_stream0_analysis'] = Gst.ElementFactory.make(
                         "tee", "tee-stream0-analysis"
                     )
                     self.elements['displayq0'] = Gst.ElementFactory.make("queue", "displayq0")
                     self._configure_queue(self.elements['displayq0'], max_buffers=16, leaky=0)
-                    self.elements['analysisq0'] = Gst.ElementFactory.make("queue", "analysisq0")
-                    self._configure_queue(self.elements['analysisq0'], max_buffers=2, leaky=2)
-                    self.elements['analysis_conv0'] = Gst.ElementFactory.make(
-                        "nvvideoconvert", "analysis-conv0"
-                    )
-                    self.elements['analysis_caps0'] = Gst.ElementFactory.make(
-                        "capsfilter", "analysis-caps0"
-                    )
-                    self.elements['analysis_caps0'].set_property(
-                        'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
-                    )
-                    self.elements['analysis_sink0'] = Gst.ElementFactory.make(
-                        "fakesink", "analysis-sink0"
-                    )
-                    self.elements['analysis_sink0'].set_property('sync', False)
-                    self.elements['analysis_sink0'].set_property('async', False)
-                    logger.info(
-                        "Stream 0 (CP Plus): decoupled analysis mode enabled "
-                        "(main path NV12 -> nvdsosd GPU, CPU analysis on leaky RGBA side branch)"
-                    )
+                    if self.stream0_analysis_branch_enabled:
+                        self.elements['analysisq0'] = Gst.ElementFactory.make("queue", "analysisq0")
+                        self._configure_queue(self.elements['analysisq0'], max_buffers=2, leaky=2)
+                        self.elements['analysis_sink0'] = Gst.ElementFactory.make(
+                            "fakesink", "analysis-sink0"
+                        )
+                        self.elements['analysis_sink0'].set_property('sync', False)
+                        self.elements['analysis_sink0'].set_property('async', False)
+                        logger.info(
+                            "Stream 0: decoupled analysis mode — NV12 tee "
+                            "(display NV12 → nvosd_0, leaky NV12 analysis branch)"
+                        )
+                    else:
+                        logger.info(
+                            "Stream 0: decoupled analysis mode — NV12 tee "
+                            "(analysis branch disabled for isolation)"
+                        )
                 else:
-                    # OSD + convert for RGBA (needed for brightness probe)
+                    # Non-decoupled: single NV12→RGBA conversion, no pre-OSD tee.
                     self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make(
                         "nvvideoconvert", "nvvidconv-osd-0"
                     )
@@ -994,7 +1072,11 @@ class DeepStreamPipelineBuilder:
 
         # === STREAM 1: Pyrometer Camera ===
         if 1 in self.enabled_streams:
-            self._create_decode_chain(1, self.config['rtsp_stream_1'])
+            if self.use_nvurisrcbin_1:
+                if not self._create_nvurisrcbin_chain(1, self.config['rtsp_stream_1']):
+                    return False
+            else:
+                self._create_decode_chain(1, self.config['rtsp_stream_1'])
 
             self.elements['mux_1'] = self._create_streammux("mux-1")
 
@@ -1010,6 +1092,8 @@ class DeepStreamPipelineBuilder:
                 'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
             )
             self.elements['nvosd_1'] = Gst.ElementFactory.make("nvdsosd", "nvosd-1")
+            if self.elements['nvosd_1']:
+                self.elements['nvosd_1'].set_property('process-mode', _NVDSOSD_MODE_CPU)
 
             # Optional DS-native recording split point for stream 1
             if self.enable_inference_video:
@@ -1048,12 +1132,15 @@ class DeepStreamPipelineBuilder:
             elif self.use_ffmpeg_src_2:
                 if not self._create_ffmpeg_chain(2, self.config['rtsp_stream_2']):
                     return False
+            elif self.use_nvurisrcbin_2:
+                if not self._create_nvurisrcbin_chain(2, self.config['rtsp_stream_2']):
+                    return False
             else:
                 self._create_decode_chain(2, self.config['rtsp_stream_2'])
 
-            self.elements['mux_2'] = self._create_streammux("mux-2", width=704, height=576)
+            self.elements['mux_2'] = self._create_streammux("mux-2", width=1280, height=720)
 
-            # Pouring inference (GIE-3) — same model as GIE-1, different gie-unique-id
+            # Pouring inference (GIE-3)
             self.elements['pgie_pouring_2'] = Gst.ElementFactory.make("nvinfer", "pgie-pouring-2")
             self.elements['pgie_pouring_2'].set_property(
                 'config-file-path', self.config['config_pouring_2']
@@ -1067,6 +1154,18 @@ class DeepStreamPipelineBuilder:
             self.elements['tracker_2'].set_property('tracker-width', 640)
             self.elements['tracker_2'].set_property('tracker-height', 384)
 
+            # C++ pouring detection plugin for stream 2 (same detector logic, second camera)
+            if self.config.get('use_cpp_pouring_plugin', False):
+                self.elements['hicon_pouring_2'] = Gst.ElementFactory.make(
+                    "hicon_pouring_detect", "hicon-pouring-2"
+                )
+                if self.elements['hicon_pouring_2']:
+                    self.elements['hicon_pouring_2'].set_property('enable-osd', True)
+                    logger.info("Stream 2: C++ pouring plugin created (hicon_pouring_detect)")
+                    logger.info("Stream 2: C++ pouring OSD enabled on main path before nvosd_2")
+                else:
+                    logger.error("Stream 2: Failed to create hicon_pouring_detect element. Check GST plugin load path.")
+
             # OSD for stream 2
             self.elements['nvvidconv_osd_2'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-2")
             self.elements['caps_osd_2'] = Gst.ElementFactory.make("capsfilter", "caps-osd-2")
@@ -1075,6 +1174,22 @@ class DeepStreamPipelineBuilder:
                     'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
                 )
             self.elements['nvosd_2'] = Gst.ElementFactory.make("nvdsosd", "nvosd-2")
+            if self.elements['nvosd_2']:
+                self.elements['nvosd_2'].set_property('process-mode', _NVDSOSD_MODE_CPU)
+
+            # Optional DS-native recording split point for stream 2
+            if self.enable_inference_video:
+                self.elements['post_osd_conv_2'] = Gst.ElementFactory.make("nvvideoconvert", "post-osd-conv-2")
+                self.elements['post_osd_caps_2'] = Gst.ElementFactory.make("capsfilter", "post-osd-caps-2")
+                if self.elements['post_osd_caps_2']:
+                    self.elements['post_osd_caps_2'].set_property(
+                        'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+                    )
+                self.elements['tee_2'] = Gst.ElementFactory.make("tee", "tee-2")
+                self.elements['queue_display_2'] = Gst.ElementFactory.make("queue", "queue-display-2")
+                if self.elements['queue_display_2']:
+                    self.elements['queue_display_2'].set_property('leaky', 2)
+                    self.elements['queue_display_2'].set_property('max-size-buffers', 8)
 
             self.elements['sink_2'] = Gst.ElementFactory.make("fakesink", "sink-2")
             if self.elements['sink_2']:
@@ -1129,9 +1244,11 @@ class DeepStreamPipelineBuilder:
     def _link_decode_chain(self, stream_id):
         """Link decode chain, with Stream 0 queue isolation before depay and before mux."""
         sid = str(stream_id)
-        if stream_id == 0 and self.use_nvurisrcbin_0:
+        if (stream_id == 0 and self.use_nvurisrcbin_0) or \
+           (stream_id == 1 and self.use_nvurisrcbin_1) or \
+           (stream_id == 2 and self.use_nvurisrcbin_2):
             # nvurisrcbin handles decode internally — nothing to link here.
-            # The vsrc_0 pad is linked to premuxq0 via pad-added callback.
+            # The vsrc pad is linked to premuxq/mux via pad-added callback.
             return True
         if self._is_segment_buffer_stream(stream_id):
             # Segment buffer uses raw H264 files — static chain, same as ffmpeg pipe path.
@@ -1285,12 +1402,26 @@ class DeepStreamPipelineBuilder:
                 if self.stream0_decoupled_analysis_mode:
                     chain_0.append((stream0_head, 'tee_stream0_analysis'))
                 else:
-                    chain_0.extend([
-                        (stream0_head, 'nvvidconv_osd_0'),
-                        ('nvvidconv_osd_0', 'caps_osd_0'),
-                        ('caps_osd_0', 'preosdq0'),
-                        ('preosdq0', 'nvosd_0'),
-                    ])
+                    # hicon_pouring_0 must be placed AFTER nvvidconv_osd_0 (post-RGBA copy).
+                    # Placing it before nvvidconv (on the raw NV12 NVMM buffer) causes
+                    # NvBufSurfaceMap to invalidate nvtracker's live cuDCF CUDA texture
+                    # cache, producing cudaErrorIllegalAddress at cuDCFFrameTransformTexture.
+                    cpp_plugin = self.elements.get('hicon_pouring_0')
+                    if cpp_plugin:
+                        chain_0.extend([
+                            (stream0_head, 'nvvidconv_osd_0'),
+                            ('nvvidconv_osd_0', 'caps_osd_0'),
+                            ('caps_osd_0', 'hicon_pouring_0'),
+                            ('hicon_pouring_0', 'preosdq0'),
+                            ('preosdq0', 'nvosd_0'),
+                        ])
+                    else:
+                        chain_0.extend([
+                            (stream0_head, 'nvvidconv_osd_0'),
+                            ('nvvidconv_osd_0', 'caps_osd_0'),
+                            ('caps_osd_0', 'preosdq0'),
+                            ('preosdq0', 'nvosd_0'),
+                        ])
                 for src_name, dst_name in chain_0:
                     if not self.elements[src_name].link(self.elements[dst_name]):
                         logger.error(f"Failed to link {src_name} -> {dst_name}")
@@ -1298,20 +1429,49 @@ class DeepStreamPipelineBuilder:
                 if self.stream0_decoupled_analysis_mode:
                     if not self._link_tee_src_to_element('tee_stream0_analysis', 'displayq0'):
                         return False
-                    if not self.elements['displayq0'].link(self.elements['nvosd_0']):
-                        logger.error("Failed to link displayq0 -> nvosd_0")
-                        return False
-                    if not self._link_tee_src_to_element('tee_stream0_analysis', 'analysisq0'):
-                        return False
-                    analysis_chain = [
-                        ('analysisq0', 'analysis_conv0'),
-                        ('analysis_conv0', 'analysis_caps0'),
-                        ('analysis_caps0', 'analysis_sink0'),
-                    ]
-                    for src_name, dst_name in analysis_chain:
+                    display_chain = []
+                    if 'hicon_pouring_0' in self.elements and self.elements.get('hicon_pouring_0') \
+                            and not self.stream0_analysis_probe_enabled:
+                        display_chain.extend([
+                            ('displayq0', 'hicon_pouring_0'),
+                            ('hicon_pouring_0', 'nvosd_0'),
+                        ])
+                        logger.info(
+                            "Stream 0: C++ pouring plugin placed on display path "
+                            "(main-path analysis fallback)"
+                        )
+                    else:
+                        display_chain.append(('displayq0', 'nvosd_0'))
+                    for src_name, dst_name in display_chain:
                         if not self.elements[src_name].link(self.elements[dst_name]):
                             logger.error(f"Failed to link {src_name} -> {dst_name}")
                             return False
+                    if self.stream0_analysis_branch_enabled:
+                        if not self._link_tee_src_to_element('tee_stream0_analysis', 'analysisq0'):
+                            return False
+                        analysis_chain = []
+                        analysis_head = 'analysisq0'
+                        if (
+                            'hicon_pouring_0' in self.elements
+                            and self.elements.get('hicon_pouring_0')
+                            and self.stream0_analysis_probe_enabled
+                        ):
+                            analysis_chain.append(('analysisq0', 'hicon_pouring_0'))
+                            analysis_head = 'hicon_pouring_0'
+                            logger.info(
+                                "Stream 0: C++ pouring plugin placed on analysis branch "
+                                "(off main path)"
+                            )
+                        analysis_chain.append((analysis_head, 'analysis_sink0'))
+                        for src_name, dst_name in analysis_chain:
+                            if not self.elements[src_name].link(self.elements[dst_name]):
+                                logger.error(f"Failed to link {src_name} -> {dst_name}")
+                                return False
+                    else:
+                        logger.info(
+                            "Stream 0: analysis branch omitted for isolation; only display path "
+                            "linked from tee_stream0_analysis"
+                        )
 
                 if self.enable_inference_video:
                     # Split annotated stream: display path + recording path (added later by RecordingManager)
@@ -1339,8 +1499,13 @@ class DeepStreamPipelineBuilder:
         if 1 in self.enabled_streams:
             if not self._link_decode_chain(1):
                 return False
-            if not self._link_to_mux('caps1', 'mux_1'):
-                return False
+            if not self.use_nvurisrcbin_1:
+                if not self._link_to_mux('caps1', 'mux_1'):
+                    return False
+            else:
+                # nvurisrcbin: pad-added links vsrc → premuxq1; link premuxq1 → mux_1 here
+                if not self._link_to_mux('premuxq1', 'mux_1'):
+                    return False
 
             # mux_1 → pyrometer → nvvidconv → caps_rgba → osd → [tee_1 →] sink_1
             chain_1 = [
@@ -1379,21 +1544,46 @@ class DeepStreamPipelineBuilder:
         if 2 in self.enabled_streams:
             if not self._link_decode_chain(2):
                 return False
-            if not self._link_to_mux('caps2', 'mux_2'):
-                return False
+            if not self.use_nvurisrcbin_2:
+                if not self._link_to_mux('caps2', 'mux_2'):
+                    return False
+            else:
+                # nvurisrcbin: pad-added links vsrc → premuxq2; link premuxq2 → mux_2 here
+                if not self._link_to_mux('premuxq2', 'mux_2'):
+                    return False
 
-            # mux_2 → pouring(GIE-3) → tracker → nvvidconv → caps_rgba → osd → sink
-            chain_2 = [
-                ('mux_2', 'pgie_pouring_2'),
-                ('pgie_pouring_2', 'tracker_2'),
-                ('tracker_2', 'nvvidconv_osd_2'),
+            # mux_2 → [pouring(GIE-3) → tracker →] [cpp pouring →] nvvidconv → caps_rgba → osd → sink
+            chain_2 = []
+            stream2_head = 'mux_2'
+            chain_2.append(('mux_2', 'pgie_pouring_2'))
+            chain_2.append(('pgie_pouring_2', 'tracker_2'))
+            stream2_head = 'tracker_2'
+            if 'hicon_pouring_2' in self.elements and self.elements.get('hicon_pouring_2'):
+                chain_2.append(('tracker_2', 'hicon_pouring_2'))
+                stream2_head = 'hicon_pouring_2'
+            chain_2.append((stream2_head, 'nvvidconv_osd_2'))
+            chain_2.extend([
                 ('nvvidconv_osd_2', 'caps_osd_2'),
                 ('caps_osd_2', 'nvosd_2'),
-                ('nvosd_2', 'sink_2'),
-            ]
+            ])
+            if self.enable_inference_video and 'tee_2' in self.elements and self.elements.get('tee_2'):
+                chain_2.extend([
+                    ('nvosd_2', 'post_osd_conv_2'),
+                    ('post_osd_conv_2', 'post_osd_caps_2'),
+                    ('post_osd_caps_2', 'tee_2'),
+                ])
+            else:
+                chain_2.append(('nvosd_2', 'sink_2'))
             for src_name, dst_name in chain_2:
                 if not self.elements[src_name].link(self.elements[dst_name]):
                     logger.error(f"Failed to link {src_name} -> {dst_name}")
+                    return False
+            # Link tee_2 display branch if recording is active
+            if self.enable_inference_video and 'tee_2' in self.elements and self.elements.get('tee_2'):
+                if not self._link_tee_src_to_element('tee_2', 'queue_display_2'):
+                    return False
+                if not self.elements['queue_display_2'].link(self.elements['sink_2']):
+                    logger.error("Failed to link queue_display_2 -> sink_2")
                     return False
             logger.info("Stream 2: Second pouring camera chain linked")
 
@@ -1405,9 +1595,11 @@ class DeepStreamPipelineBuilder:
                 self.elements[f'tsdemux{i}'].connect("pad-added", self._cb_tsdemux_pad_added, i)
             elif self._is_ffmpeg_stream(i) or self._is_segment_buffer_stream(i):
                 pass  # static src pad, already fully linked in _link_decode_chain
-            elif i == 0 and self.use_nvurisrcbin_0:
-                self.elements['source0'].connect(
-                    "pad-added", self._cb_nvurisrcbin_pad_added, 0
+            elif (i == 0 and self.use_nvurisrcbin_0) or \
+                 (i == 1 and self.use_nvurisrcbin_1) or \
+                 (i == 2 and self.use_nvurisrcbin_2):
+                self.elements[f'source{i}'].connect(
+                    "pad-added", self._cb_nvurisrcbin_pad_added, i
                 )
             else:
                 self.elements[f'source{i}'].connect("pad-added", self._cb_newpad, i)
@@ -1507,7 +1699,8 @@ class DeepStreamPipelineBuilder:
             logger.debug(f"Stream {stream_id}: nvurisrcbin ignoring non-video pad {name}")
             return
 
-        target_name = 'premuxq0' if stream_id == 0 else f'caps{stream_id}'
+        # Link to premuxq (leaky queue) for ALL streams — absorbs backpressure
+        target_name = f'premuxq{stream_id}'
         target_pad = self.elements[target_name].get_static_pad("sink")
         if target_pad.is_linked():
             logger.debug(f"Stream {stream_id}: nvurisrcbin {target_name} already linked")
@@ -1593,9 +1786,9 @@ class DeepStreamPipelineBuilder:
             protocol = 'auto'
 
         source.set_property('location', location)
-        latency_ms = int(self.config.get('rtsp_latency_ms', 2000) or 2000)
+        latency_ms = int(self.config.get('rtsp_latency_ms', 4000) or 4000)
         source.set_property('latency', latency_ms)
-        source.set_property('drop-on-latency', False)
+        source.set_property('drop-on-latency', True)
         source.set_property('buffer-mode', 0)  # none: raw RTP timestamps (longest proven runtime)
         source.set_property('do-rtsp-keep-alive', True)
 
@@ -1641,7 +1834,7 @@ class DeepStreamPipelineBuilder:
 
         logger.info(
             f"Stream {stream_id}: RTSP config "
-            f"protocol={protocol}, latency={latency_ms}ms, drop-on-latency=False, buffer-mode=0(none), "
+            f"protocol={protocol}, latency={latency_ms}ms, drop-on-latency=True, buffer-mode=0(none), "
             f"timeout={effective_udp_timeout_us}us, tcp-timeout={effective_tcp_timeout_us}us, "
             f"retry={rtsp_port_retry}, do-retransmission={rtsp_do_retransmission}"
         )

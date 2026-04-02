@@ -91,19 +91,22 @@ SESSION_START_DURATION = float(os.getenv('HICON_SESSION_START_DURATION', '1.0'))
 SESSION_END_DURATION = float(os.getenv('HICON_SESSION_END_DURATION', '1.5'))
 
 # Legacy single-probe offset (kept for backward compatibility; multi-probe is used)
-POUR_PROBE_OFFSET_PX = int(os.getenv('HICON_POUR_PROBE_OFFSET', '50'))
-POUR_PROBE_RADIUS_PX = int(os.getenv('HICON_POUR_PROBE_RADIUS', '6'))
-POUR_BRIGHTNESS_START = int(os.getenv('HICON_POUR_BRIGHTNESS_START', '230'))
-POUR_BRIGHTNESS_END = int(os.getenv('HICON_POUR_BRIGHTNESS_END', '180'))
-POUR_START_DURATION = float(os.getenv('HICON_POUR_START_DURATION', '0.25'))
-POUR_END_DURATION = float(os.getenv('HICON_POUR_END_DURATION', '1.0'))
+POUR_REF_WIDTH = int(os.getenv('HICON_POUR_REF_WIDTH', '1920'))
+POUR_REF_HEIGHT = int(os.getenv('HICON_POUR_REF_HEIGHT', '1080'))
+POUR_PROBE_OFFSET_PX = int(os.getenv('HICON_POUR_PROBE_OFFSET', '30'))
+POUR_PROBE_RADIUS_PX = int(os.getenv('HICON_POUR_PROBE_RADIUS', '8'))
+POUR_BRIGHTNESS_START = int(os.getenv('HICON_POUR_BRIGHTNESS_START', '205'))
+POUR_BRIGHTNESS_END = int(os.getenv('HICON_POUR_BRIGHTNESS_END', '160'))
+POUR_START_DURATION = float(os.getenv('HICON_POUR_START_DURATION', '0.20'))
+POUR_END_DURATION = float(os.getenv('HICON_POUR_END_DURATION', '0.80'))
 POUR_MIN_DURATION = float(os.getenv('HICON_POUR_MIN_DURATION', '2.0'))
 
 # Mould counting: anchor-based trolley motion + spatial clustering
-MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15'))
-MOULD_SUSTAINED_DURATION = float(os.getenv('HICON_MOULD_SUSTAINED', '1.5'))
+MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.25'))
+MOULD_SUSTAINED_DURATION = float(os.getenv('HICON_MOULD_SUSTAINED', '0.30'))
 CLUSTER_R_CLUSTER = float(os.getenv('HICON_CLUSTER_R_CLUSTER', '0.08'))
-CLUSTER_R_MERGE = float(os.getenv('HICON_CLUSTER_R_MERGE', '0.05'))  # Euclidean distance threshold
+CLUSTER_R_MERGE = float(os.getenv('HICON_CLUSTER_R_MERGE', '0.07'))  # Euclidean distance threshold
+CLUSTER_BACKTRACK_CID_GUARD = int(os.getenv('HICON_CLUSTER_BACKTRACK_CID_GUARD', '5'))
 MOULD_SPLIT_MIN_DX_PX = float(os.getenv('HICON_MOULD_SPLIT_MIN_DX_PX', '12.0'))
 MOULD_SPLIT_MIN_DY_PX = float(os.getenv('HICON_MOULD_SPLIT_MIN_DY_PX', '12.0'))
 MOULD_SPLIT_COOLDOWN_S = float(os.getenv('HICON_MOULD_SPLIT_COOLDOWN_S', '1.5'))
@@ -115,15 +118,16 @@ MOULD_SPLIT_REARM_DY_PX = float(os.getenv('HICON_MOULD_SPLIT_REARM_DY_PX', '14.0
 LOG_MOULD_DISPLACEMENT = os.getenv('HICON_LOG_MOULD_DISPLACEMENT', 'false').lower() == 'true'
 MOULD_DISP_LOG_INTERVAL_S = float(os.getenv('HICON_MOULD_DISP_LOG_INTERVAL_S', '0.25'))
 
-# Trolley bbox expansion for mouth-inside check (top edge only, ladle above trolley)
-EDGE_EXPAND_PX = int(os.getenv('HICON_EDGE_EXPAND_PX', '200'))
+# Trolley bbox expansion for mouth-inside check (reference parity: all sides)
+EDGE_EXPAND_PX = int(os.getenv('HICON_EDGE_EXPAND_PX', '180'))
 
 # Mouth absence tolerance during active session (before session-end timer starts)
-MOUTH_MISSING_TOL_S = float(os.getenv('HICON_MOUTH_MISSING_TOL_S', '0.8'))
+MOUTH_MISSING_TOL_S = float(os.getenv('HICON_MOUTH_MISSING_TOL_S', '0.6'))
+MOUTH_HOLD_S = float(os.getenv('HICON_MOUTH_HOLD_S', '0.4'))
 
 # Multiple brightness probe offsets: (dx, dy) from mouth bottom-center
-POUR_PROBE_OFFSETS = [(20, 0), (30, 0), (40, 0)]
-POUR_PROBE_BELOW_PX = int(os.getenv('HICON_POUR_PROBE_BELOW_PX', '50'))
+POUR_PROBE_OFFSETS = [(0, 0), (12, 0), (-12, 0), (24, 0), (-24, 0)]
+POUR_PROBE_BELOW_PX = int(os.getenv('HICON_POUR_PROBE_BELOW_PX', '30'))
 
 # Pouring cycle timeout: mouth absent from locked trolley region (5 min)
 POURING_CYCLE_TIMEOUT_S = float(os.getenv('HICON_POURING_CYCLE_TIMEOUT', '300.0'))
@@ -136,6 +140,16 @@ MIN_CLUSTER_POUR_S = float(os.getenv('HICON_MIN_CLUSTER_POUR_S', '1.5'))
 
 # Enable per-frame CPU extraction for processors
 ENABLE_FRAME_PROCESSING = os.getenv('HICON_ENABLE_FRAME_PROCESSING', 'true').lower() == 'true'
+
+# C++ pouring detection plugin (replaces Python pouring_processor with compiled GstBaseTransform)
+USE_CPP_POURING_PLUGIN = os.getenv('HICON_USE_CPP_POURING_PLUGIN', 'false').lower() == 'true'
+
+# CUDA-accelerated brightness detection (replaces CPU NumPy brightness_processor).
+# Supported Stream 0 hybrid runtime keeps this disabled because the production
+# analysis branch is NV12-only and shares one CPU-extracted frame across
+# tapping/deslagging/spectro plus the hybrid pouring controller.
+# Set to 'true' only for explicit diagnostics or a future NV12-safe redesign.
+USE_CUDA_BRIGHTNESS = os.getenv('HICON_USE_CUDA_BRIGHTNESS', 'true').lower() != 'false'
 
 # Annotated inference video (DS-native: tee + nvosd + RecordingManager)
 ENABLE_INFERENCE_VIDEO = os.getenv('HICON_ENABLE_INFERENCE_VIDEO', 'false').lower() == 'true'
@@ -201,9 +215,13 @@ RTSP_RESTART_BACKOFF_SEC = int(os.getenv('HICON_RTSP_RESTART_BACKOFF_SEC', '5'))
 # Per-stream 0fps watchdog policy: 'restart' (kill pipeline) or 'warn' (log, wait for recovery)
 STREAM_0_ZERO_FPS_POLICY = os.getenv('HICON_STREAM_0_ZERO_FPS_POLICY', 'warn')
 STREAM_1_ZERO_FPS_POLICY = os.getenv('HICON_STREAM_1_ZERO_FPS_POLICY', 'restart')
+STREAM_2_ZERO_FPS_POLICY = os.getenv('HICON_STREAM_2_ZERO_FPS_POLICY', 'restart')
 
-# Use nvurisrcbin (with built-in RTSP reconnection) instead of rtspsrc for Stream 0
-USE_NVURISRCBIN_0 = os.getenv('HICON_USE_NVURISRCBIN_0', 'true').lower() == 'true'
+# Use nvurisrcbin (with built-in RTSP reconnection) instead of rtspsrc.
+# nvurisrcbin reconnects every 2s on drop — brief 2-5s stutter instead of 90s+ dead stream.
+USE_NVURISRCBIN_0 = os.getenv('HICON_USE_NVURISRCBIN_0', 'false').lower() == 'true'
+USE_NVURISRCBIN_1 = os.getenv('HICON_USE_NVURISRCBIN_1', 'false').lower() == 'true'
+USE_NVURISRCBIN_2 = os.getenv('HICON_USE_NVURISRCBIN_2', 'false').lower() == 'true'
 
 # Use ffmpeg subprocess as RTSP-to-pipe bridge (zero-drop, handles keepalives correctly).
 # ffmpeg -c:v copy remuxes only (~1% CPU); GStreamer fdsrc reads from pipe, NVDEC decodes.
@@ -258,6 +276,31 @@ STREAM_0_POSTCONV_ONLY_MODE = os.getenv('HICON_STREAM_0_POSTCONV_ONLY_MODE', 'fa
 STREAM_0_PREOSD_ONLY_MODE = os.getenv('HICON_STREAM_0_PREOSD_ONLY_MODE', 'false').lower() == 'true'
 STREAM_0_DECOUPLED_ANALYSIS_MODE = os.getenv(
     'HICON_STREAM_0_DECOUPLED_ANALYSIS_MODE', 'false'
+).lower() == 'true'
+# Diagnostic-only flags for the Stream 0 analysis branch. The supported
+# production topology is NV12 tee -> analysisq0 -> hicon_pouring_0 -> fakesink
+# with CPU Python analysis in the branch probe; RGBA side-branch conversion is
+# intentionally not part of the supported path.
+STREAM_0_ANALYSIS_BRANCH_ENABLED = os.getenv(
+    'HICON_STREAM_0_ANALYSIS_BRANCH_ENABLED', 'true'
+).lower() == 'true'
+STREAM_0_ANALYSIS_RGBA_ENABLED = os.getenv(
+    'HICON_STREAM_0_ANALYSIS_RGBA_ENABLED', 'false'
+).lower() == 'true'
+STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED = os.getenv(
+    'HICON_STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED', 'true'
+).lower() == 'true'
+STREAM_0_ANALYSIS_PROBE_ENABLED = os.getenv(
+    'HICON_STREAM_0_ANALYSIS_PROBE_ENABLED', 'true'
+).lower() == 'true'
+STREAM_0_CPP_META_ATTACH_ENABLED = os.getenv(
+    'HICON_STREAM_0_CPP_META_ATTACH_ENABLED', 'true'
+).lower() == 'true'
+STREAM_0_CPP_META_DECODE_ENABLED = os.getenv(
+    'HICON_STREAM_0_CPP_META_DECODE_ENABLED', 'true'
+).lower() == 'true'
+STREAM_0_HYBRID_CONTROLLER_ENABLED = os.getenv(
+    'HICON_STREAM_0_HYBRID_CONTROLLER_ENABLED', 'true'
 ).lower() == 'true'
 ENABLE_STREAM_0_POURING_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_POURING_PROCESSOR', 'true').lower() == 'true'
 ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR', 'true').lower() == 'true'
@@ -325,8 +368,8 @@ LIVE_STREAM_QUALITY = int(os.getenv('HICON_LIVE_STREAM_QUALITY', '85'))  # JPEG 
 LIVE_STREAM_FPS = int(os.getenv('HICON_LIVE_STREAM_FPS', '15'))  # Max FPS for stream
 
 # Per-stream live streaming control (default: follow ENABLE_LIVE_STREAM)
-ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'false'
-ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'false'
+ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'true'
+ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 
 
 # =============================================================================
@@ -418,6 +461,13 @@ def get_config_summary():
         'stream_0_postconv_only_mode': STREAM_0_POSTCONV_ONLY_MODE,
         'stream_0_preosd_only_mode': STREAM_0_PREOSD_ONLY_MODE,
         'stream_0_decoupled_analysis_mode': STREAM_0_DECOUPLED_ANALYSIS_MODE,
+        'stream_0_analysis_branch_enabled': STREAM_0_ANALYSIS_BRANCH_ENABLED,
+        'stream_0_analysis_rgba_enabled': STREAM_0_ANALYSIS_RGBA_ENABLED,
+        'stream_0_analysis_cpp_plugin_enabled': STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED,
+        'stream_0_analysis_probe_enabled': STREAM_0_ANALYSIS_PROBE_ENABLED,
+        'stream_0_cpp_meta_attach_enabled': STREAM_0_CPP_META_ATTACH_ENABLED,
+        'stream_0_cpp_meta_decode_enabled': STREAM_0_CPP_META_DECODE_ENABLED,
+        'stream_0_hybrid_controller_enabled': STREAM_0_HYBRID_CONTROLLER_ENABLED,
         'enable_stream_0_pouring_processor': ENABLE_STREAM_0_POURING_PROCESSOR,
         'enable_stream_0_brightness_processor': ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR,
         'base_dir': str(BASE_DIR),
@@ -428,14 +478,18 @@ def get_config_summary():
         'trolley_confidence': TROLLEY_CONFIDENCE,
         'session_start_duration': SESSION_START_DURATION,
         'session_end_duration': SESSION_END_DURATION,
+        'pour_ref_width': POUR_REF_WIDTH,
+        'pour_ref_height': POUR_REF_HEIGHT,
         'pour_brightness_start': POUR_BRIGHTNESS_START,
         'pour_brightness_end': POUR_BRIGHTNESS_END,
         'pour_min_duration': POUR_MIN_DURATION,
         'edge_expand_px': EDGE_EXPAND_PX,
         'mouth_missing_tol_s': MOUTH_MISSING_TOL_S,
+        'mouth_hold_s': MOUTH_HOLD_S,
         'pouring_cycle_timeout_s': POURING_CYCLE_TIMEOUT_S,
         'mould_switch_min_pour_s': MOULD_SWITCH_MIN_POUR_S,
         'min_cluster_pour_s': MIN_CLUSTER_POUR_S,
+        'cluster_backtrack_cid_guard': CLUSTER_BACKTRACK_CID_GUARD,
         'mould_split_min_dx_px': MOULD_SPLIT_MIN_DX_PX,
         'mould_split_min_dy_px': MOULD_SPLIT_MIN_DY_PX,
         'mould_split_cooldown_s': MOULD_SPLIT_COOLDOWN_S,

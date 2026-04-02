@@ -2,14 +2,16 @@
 Pyrometer Processor - Rod insertion detection on Stream 1 (Pyrometer Camera).
 
 Reads NvDsObjectMeta from nvinfer (YOLO26 custom parser).
-Applies zone check + temporal frame counting for event start/end.
+Multi-zone support: each zone tracks rod presence independently with
+temporal frame counting for event start/end.
 """
 import logging
 import time
 import numpy as np
 import cv2
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from pathlib import Path
 
 import pyds
@@ -21,11 +23,26 @@ from utils.screenshot import (prepare_frame, add_header, add_footer,
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class PyroZoneState:
+    """Per-zone state for pyrometer rod detection."""
+    name: str
+    zone: List[Tuple[float, float]]  # polygon vertices as (x, y) tuples
+    state: str = "IDLE"              # IDLE or ACTIVE
+    in_zone_counter: int = 0
+    out_zone_counter: int = 0
+    event_start_time: float = 0.0
+    event_start_datetime: Optional[datetime] = None
+    event_sync_id: str = ""
+
+
 class PyrometerProcessor:
     """
     Detect pyrometer rod insertion events using nvinfer detections + zone filtering.
 
-    Algorithm:
+    Multi-zone: each zone tracks rod presence independently.
+
+    Algorithm per zone:
     1. Filter detections: confidence >= threshold
     2. Zone check: bbox top-left AND bottom-center must be inside polygon
     3. Temporal: N consecutive in-zone frames → EVENT START
@@ -33,13 +50,6 @@ class PyrometerProcessor:
     """
 
     def __init__(self, zone_config, db_manager, config, screenshot_dir, heat_cycle_manager=None):
-        """
-        Args:
-            zone_config: Pyrometer zone config from zones.json
-            db_manager: HiConDatabase instance
-            config: Configuration module
-            screenshot_dir: Path for event screenshots
-        """
         self.db_manager = db_manager
         self.config = config
         self.heat_cycle_manager = heat_cycle_manager
@@ -49,45 +59,53 @@ class PyrometerProcessor:
         self.camera_id = config.CAMERA_ID_STREAM_1
         self.location = config.LOCATION
 
-        # Zone polygon: list of (x, y) tuples
-        self.zone_polygon = zone_config.get('zone_polygon', [])
+        # Shared thresholds
         self.confidence_threshold = zone_config.get('confidence_threshold', 0.25)
         self.temporal_in_frames = zone_config.get('temporal_in_frames', 10)
         self.temporal_out_frames = zone_config.get('temporal_out_frames', 10)
 
-        # State
-        self.state = "IDLE"  # IDLE or ACTIVE
-        self.in_zone_counter = 0
-        self.out_zone_counter = 0
-        self.event_start_time = None
-        self.event_start_datetime = None
-        self.event_sync_id = None
+        # Build zone states — multi-zone or legacy single-zone fallback
+        self.zone_states: Dict[str, PyroZoneState] = {}
+        zones_data = zone_config.get('zones', {})
+        if zones_data:
+            for name, zcfg in zones_data.items():
+                pts = zcfg.get('roi_points', [])
+                if pts:
+                    polygon = [(float(p[0]), float(p[1])) for p in pts]
+                    self.zone_states[name] = PyroZoneState(name=name, zone=polygon)
+        else:
+            # Legacy single-zone fallback
+            legacy_pts = zone_config.get('zone_polygon', [])
+            if legacy_pts:
+                polygon = [(float(p[0]), float(p[1])) for p in legacy_pts]
+                self.zone_states["zone-1"] = PyroZoneState(name="zone-1", zone=polygon)
 
         # Keep latest frame + detections for screenshot on event transitions
         self._last_frame = None
         self._last_detections = []
 
+        zone_names = ", ".join(self.zone_states.keys())
         logger.info(
-            f"PyrometerProcessor initialized: conf>={self.confidence_threshold}, "
-            f"zone={len(self.zone_polygon)} pts, "
+            f"PyrometerProcessor initialized: {len(self.zone_states)} zones ({zone_names}), "
+            f"conf>={self.confidence_threshold}, "
             f"temporal_in={self.temporal_in_frames}, temporal_out={self.temporal_out_frames}"
         )
+
+    @property
+    def is_active(self) -> bool:
+        """True if any zone is currently active."""
+        return any(zs.state == "ACTIVE" for zs in self.zone_states.values())
 
     def process_frame(self, frame_meta, frame=None):
         """
         Process a single frame's detections from nvinfer.
 
         Called from post-nvinfer probe on Stream 1.
-
-        Args:
-            frame_meta: NvDsFrameMeta from batch meta
-            frame: RGBA numpy array (optional, for screenshots)
         """
         try:
-            rod_in_zone = False
             detections = []
 
-            # Iterate detections
+            # Iterate nvinfer detections (once for all zones)
             l_obj = frame_meta.obj_meta_list
             while l_obj is not None:
                 try:
@@ -95,30 +113,19 @@ class PyrometerProcessor:
                 except StopIteration:
                     break
 
-                # Filter by confidence
                 if obj_meta.confidence >= self.confidence_threshold:
-                    # Get bbox
                     rect = obj_meta.rect_params
                     x1 = rect.left
                     y1 = rect.top
                     x2 = x1 + rect.width
                     y2 = y1 + rect.height
-                    conf = obj_meta.confidence
 
                     detections.append({
                         'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                        'confidence': conf,
-                        'in_zone': False,
+                        'confidence': obj_meta.confidence,
+                        'top_left': (x1, y1),
+                        'bottom_center': ((x1 + x2) / 2, y2),
                     })
-
-                    # Zone check: top-left AND bottom-center in polygon
-                    top_left = (x1, y1)
-                    bottom_center = ((x1 + x2) / 2, y2)
-
-                    if (self._point_in_polygon(top_left, self.zone_polygon) and
-                            self._point_in_polygon(bottom_center, self.zone_polygon)):
-                        rod_in_zone = True
-                        detections[-1]['in_zone'] = True
 
                 try:
                     l_obj = l_obj.next
@@ -130,69 +137,106 @@ class PyrometerProcessor:
                 self._last_frame = frame.copy()
             self._last_detections = detections
 
-            # Update temporal state machine
-            self._update_state(rod_in_zone)
+            # Check each zone independently
+            for zs in self.zone_states.values():
+                rod_in_zone = self._any_detection_in_zone(detections, zs.zone)
+                event = self._update_zone_state(zs, rod_in_zone)
+                if event:
+                    if event["phase"] == "start":
+                        self._save_event_screenshot(
+                            f"PYROMETER ROD START ({zs.name})",
+                            zone_state=zs,
+                        )
+                    elif event["phase"] == "end":
+                        self._emit_event(event, zs)
 
         except Exception as e:
             logger.error(f"PyrometerProcessor error: {e}", exc_info=True)
 
-    def _update_state(self, rod_in_zone: bool):
-        """Update temporal state machine."""
-        if self.state == "IDLE":
+    def _any_detection_in_zone(self, detections, zone):
+        """Check if any detection has top-left AND bottom-center inside zone polygon."""
+        for det in detections:
+            if (self._point_in_polygon(det['top_left'], zone) and
+                    self._point_in_polygon(det['bottom_center'], zone)):
+                return True
+        return False
+
+    def _update_zone_state(self, zs: PyroZoneState, rod_in_zone: bool):
+        """Update temporal state machine for a single zone. Returns event dict or None."""
+        if zs.state == "IDLE":
             if rod_in_zone:
-                self.in_zone_counter += 1
-                if self.in_zone_counter >= self.temporal_in_frames:
-                    # Transition to ACTIVE
-                    self.state = "ACTIVE"
-                    self.event_start_time = time.time()
-                    self.event_start_datetime = datetime.now()
-                    self.event_sync_id = generate_sync_id("pyro")
-                    self.in_zone_counter = 0
-                    self.out_zone_counter = 0
+                zs.in_zone_counter += 1
+                if zs.in_zone_counter >= self.temporal_in_frames:
+                    zs.state = "ACTIVE"
+                    zs.event_start_time = time.time()
+                    zs.event_start_datetime = datetime.now()
+                    zs.event_sync_id = generate_sync_id("pyro")
+                    zs.in_zone_counter = 0
+                    zs.out_zone_counter = 0
                     logger.info(
-                        f"[pyrometer] ROD DETECTED - sustained {self.temporal_in_frames} frames"
+                        f"[pyrometer] Zone '{zs.name}': ROD DETECTED — "
+                        f"sustained {self.temporal_in_frames} frames"
                     )
-                    # Save start screenshot
-                    self._save_event_screenshot("PYROMETER ROD START")
+                    return {
+                        "type": "pyrometer",
+                        "phase": "start",
+                        "zone_name": zs.name,
+                        "start_wall": zs.event_start_time,
+                        "start_datetime": zs.event_start_datetime,
+                    }
             else:
-                self.in_zone_counter = 0
+                zs.in_zone_counter = 0
 
-        elif self.state == "ACTIVE":
+        elif zs.state == "ACTIVE":
             if not rod_in_zone:
-                self.out_zone_counter += 1
-                if self.out_zone_counter >= self.temporal_out_frames:
-                    # Transition to IDLE - emit event
-                    self._emit_event()
-                    self.state = "IDLE"
-                    self.out_zone_counter = 0
-                    self.in_zone_counter = 0
+                zs.out_zone_counter += 1
+                if zs.out_zone_counter >= self.temporal_out_frames:
+                    end_time = time.time()
+                    end_datetime = datetime.now()
+                    duration = end_time - zs.event_start_time
+                    zs.state = "IDLE"
+                    zs.out_zone_counter = 0
+                    zs.in_zone_counter = 0
+                    logger.info(
+                        f"[pyrometer] Zone '{zs.name}': ROD REMOVED — "
+                        f"duration={duration:.1f}s"
+                    )
+                    return {
+                        "type": "pyrometer",
+                        "phase": "end",
+                        "zone_name": zs.name,
+                        "sync_id": zs.event_sync_id,
+                        "start_wall": zs.event_start_time,
+                        "start_datetime": zs.event_start_datetime,
+                        "end_wall": end_time,
+                        "end_datetime": end_datetime,
+                        "duration_sec": round(duration, 1),
+                    }
             else:
-                self.out_zone_counter = 0
+                zs.out_zone_counter = 0
 
-    def _emit_event(self):
-        """Emit completed pyrometer event."""
-        end_time = time.time()
-        end_datetime = datetime.now()
-        duration = end_time - self.event_start_time
+        return None
 
-        logger.info(
-            f"[pyrometer] ROD REMOVED - event duration={duration:.1f}s"
-        )
+    def _emit_event(self, event, zs: PyroZoneState):
+        """Emit completed pyrometer event — DB insert + heat cycle + screenshot."""
+        zone_name = event["zone_name"]
+        duration = event["duration_sec"]
 
         # Save end screenshot
         screenshot_path = self._save_event_screenshot(
-            "PYROMETER ROD END",
+            f"PYROMETER ROD END ({zone_name})",
             duration=duration,
+            zone_state=zs,
         )
 
         try:
             self.db_manager.insert_melting_event(
-                sync_id=self.event_sync_id,
+                sync_id=event["sync_id"],
                 customer_id=self.customer_id,
                 event_type="pyrometer",
-                start_time=self.event_start_datetime.isoformat(),
-                end_time=end_datetime.isoformat(),
-                duration_sec=round(duration, 1),
+                start_time=event["start_datetime"].isoformat(),
+                end_time=event["end_datetime"].isoformat(),
+                duration_sec=duration,
                 camera_id=self.camera_id,
                 location=self.location,
                 screenshot_path=screenshot_path or "",
@@ -200,24 +244,25 @@ class PyrometerProcessor:
         except Exception as e:
             logger.error(f"Failed to insert pyrometer event: {e}")
 
-        # Push to heat cycle manager for aggregation
         if self.heat_cycle_manager:
             try:
                 self.heat_cycle_manager.add_pyrometer_event(
-                    start_wall=self.event_start_time,
-                    start_dt=self.event_start_datetime,
-                    end_wall=end_time,
-                    end_dt=end_datetime,
-                    duration=round(duration, 1),
+                    start_wall=event["start_wall"],
+                    start_dt=event["start_datetime"],
+                    end_wall=event["end_wall"],
+                    end_dt=event["end_datetime"],
+                    duration=duration,
+                    zone_name=zone_name,
                 )
             except Exception as e:
                 logger.error(f"Failed to push pyrometer to heat cycle manager: {e}")
 
-        self.event_start_time = None
-        self.event_start_datetime = None
-        self.event_sync_id = None
+        # Reset zone event fields
+        zs.event_start_time = 0.0
+        zs.event_start_datetime = None
+        zs.event_sync_id = ""
 
-    def _save_event_screenshot(self, title, duration=None):
+    def _save_event_screenshot(self, title, duration=None, zone_state=None):
         """Save annotated screenshot with zone polygon, detections, and event details."""
         if self._last_frame is None:
             return None
@@ -225,21 +270,23 @@ class PyrometerProcessor:
         try:
             annotated = prepare_frame(self._last_frame)
 
-            # Draw zone polygon with semi-transparent fill + outline
-            if self.zone_polygon:
-                draw_roi_overlay(annotated, self.zone_polygon, (255, 200, 0),
-                                 label="DETECTION ZONE")
+            # Draw zone polygon(s)
+            if zone_state and zone_state.zone:
+                draw_roi_overlay(annotated, zone_state.zone, (255, 200, 0),
+                                 label=f"ZONE: {zone_state.name}")
+            else:
+                # Draw all zones
+                for zs in self.zone_states.values():
+                    draw_roi_overlay(annotated, zs.zone, (255, 200, 0),
+                                     label=f"ZONE: {zs.name}")
 
             # Draw detection bboxes
             for det in self._last_detections:
                 x1, y1, x2, y2 = det['bbox']
                 conf = det['confidence']
-                in_zone = det['in_zone']
-                color = (0, 255, 0) if in_zone else (0, 0, 255)
+                color = (0, 255, 0)
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
                 label = f"Rod {conf:.2f}"
-                if in_zone:
-                    label += " [IN ZONE]"
                 cv2.putText(annotated, label, (x1, max(y1 - 8, 20)),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -247,12 +294,13 @@ class PyrometerProcessor:
             extra_lines = [f"Duration: {duration:.1f}s"] if duration is not None else None
             add_header(annotated, title, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                        extra_lines)
-            status = (f"Conf threshold: {self.confidence_threshold}  "
-                      f"Temporal: {self.temporal_in_frames}in/{self.temporal_out_frames}out frames")
+            status = (f"Conf>={self.confidence_threshold}  "
+                      f"Temporal: {self.temporal_in_frames}in/{self.temporal_out_frames}out")
             add_footer(annotated, self.camera_id, status)
 
             tag = "start" if "START" in title else "end"
-            return save_screenshot(annotated, "pyrometer", tag, datetime.now(),
+            zone_tag = f"_{zone_state.name}" if zone_state else ""
+            return save_screenshot(annotated, f"pyrometer{zone_tag}", tag, datetime.now(),
                                    self.screenshot_dir)
 
         except Exception as e:
@@ -260,35 +308,37 @@ class PyrometerProcessor:
             return None
 
     def add_inference_display_meta(self, batch_meta, frame_meta):
-        """Attach DS-native overlay for pyrometer zone + detection status."""
+        """Attach DS-native overlay for pyrometer zones + detection status."""
         try:
-            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-            if not display_meta:
-                return
-
             # Scale overlay for downscaled recording
             scale_up = 1.0
             try:
                 target_w = int(getattr(self.config, "INFERENCE_VIDEO_WIDTH", 0) or 0)
-                # Pyrometer is 1920x1080, use frame_meta dimensions
-                frame_w = frame_meta.source_frame_width or 1920
+                frame_w = frame_meta.source_frame_width or 1280
                 if target_w and target_w < frame_w:
                     scale_up = min(3.0, frame_w / float(target_w))
             except Exception:
                 scale_up = 1.0
 
-            # Status text
+            # Status text (first display_meta)
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if not display_meta:
+                return
+
             labels = []
-            header = "PYROMETER ROD"
-            labels.append((header, (1.0, 1.0, 1.0, 1.0)))
+            labels.append(("PYROMETER ROD", (1.0, 1.0, 1.0, 1.0)))
 
-            state_txt = f"STATE: {'INSERTED' if self.state == 'ACTIVE' else 'NOT DETECTED'}"
-            state_color = (0.0, 1.0, 0.0, 1.0) if self.state == 'ACTIVE' else (0.8, 0.8, 0.8, 1.0)
-            labels.append((state_txt, state_color))
-
-            if self.state == 'ACTIVE' and self.event_start_time:
-                duration = time.time() - self.event_start_time
-                labels.append((f"Duration: {duration:.1f}s", (0.0, 1.0, 1.0, 1.0)))
+            # Per-zone status
+            for zs in self.zone_states.values():
+                if zs.state == "ACTIVE":
+                    dur = time.time() - zs.event_start_time if zs.event_start_time else 0
+                    labels.append(
+                        (f"{zs.name}: INSERTED ({dur:.1f}s)", (0.0, 1.0, 0.0, 1.0))
+                    )
+                else:
+                    labels.append(
+                        (f"{zs.name}: idle", (0.8, 0.8, 0.8, 1.0))
+                    )
 
             # Render text
             base_x = 10
@@ -307,31 +357,56 @@ class PyrometerProcessor:
                 txt.set_bg_clr = 1
                 txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.55)
 
-            # Draw zone polygon
-            line_idx = 0
-            max_lines = len(getattr(display_meta, "line_params", []))
-            if max_lines > 0 and self.zone_polygon:
-                n = len(self.zone_polygon)
-                for i in range(n):
-                    if line_idx >= max_lines:
-                        break
-                    x1, y1 = self.zone_polygon[i]
-                    x2, y2 = self.zone_polygon[(i + 1) % n]
-                    line = display_meta.line_params[line_idx]
-                    line.x1 = int(max(0, x1))
-                    line.y1 = int(max(0, y1))
-                    line.x2 = int(max(0, x2))
-                    line.y2 = int(max(0, y2))
-                    line.line_width = max(2, int(round(2 * scale_up)))
-                    # Magenta color for pyrometer zone
-                    line.line_color.set(1.0, 0.0, 1.0, 1.0)
-                    line_idx += 1
-
-            display_meta.num_lines = line_idx
+            display_meta.num_lines = 0
             display_meta.num_rects = 0
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+            # Draw zone polygons (separate display_meta per zone for 16-line limit)
+            for zs in self.zone_states.values():
+                color = (1.0, 0.5, 0.0, 1.0) if zs.state == "ACTIVE" else (0.0, 1.0, 1.0, 1.0)
+                self._draw_zone_polygon(batch_meta, frame_meta, zs.zone, color, scale_up)
+
         except Exception as exc:
             logger.error(f"[pyrometer] Failed to attach display meta: {exc}", exc_info=True)
+
+    def _draw_zone_polygon(self, batch_meta, frame_meta, polygon, color, scale_up=1.0):
+        """Draw a polygon outline using NvOSD line segments."""
+        n = len(polygon)
+        if n < 3:
+            return
+
+        dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+        if not dm:
+            return
+
+        line_idx = 0
+        max_lines = 16  # NvOSD limit per display_meta
+        for i in range(n):
+            if line_idx >= max_lines:
+                dm.num_lines = line_idx
+                dm.num_labels = 0
+                dm.num_rects = 0
+                pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
+                dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                if not dm:
+                    return
+                line_idx = 0
+
+            x1, y1 = polygon[i]
+            x2, y2 = polygon[(i + 1) % n]
+            line = dm.line_params[line_idx]
+            line.x1 = int(max(0, x1))
+            line.y1 = int(max(0, y1))
+            line.x2 = int(max(0, x2))
+            line.y2 = int(max(0, y2))
+            line.line_width = max(2, int(round(2 * scale_up)))
+            line.line_color.set(*color)
+            line_idx += 1
+
+        dm.num_lines = line_idx
+        dm.num_labels = 0
+        dm.num_rects = 0
+        pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
 
     @staticmethod
     def _point_in_polygon(point, polygon):

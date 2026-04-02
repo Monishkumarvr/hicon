@@ -8,6 +8,7 @@ gi.require_version("GstRtsp", "1.0")
 from gi.repository import GstRtsp
 
 import pipeline.gst_builder as gst_builder_mod
+import pipeline.recording as recording_mod
 from pipeline.gst_builder import DeepStreamPipelineBuilder
 from pipeline.recording import RecordingManager
 
@@ -21,6 +22,14 @@ class DummySource:
 
 
 class DummyFileSink:
+    def __init__(self):
+        self.props = {}
+
+    def set_property(self, name, value):
+        self.props[name] = value
+
+
+class DummyValve:
     def __init__(self):
         self.props = {}
 
@@ -237,6 +246,44 @@ def test_recording_logs_include_stream_id(tmp_path, caplog):
     assert "Stream 7 recording stopped:" in messages
 
 
+def test_recording_start_keeps_branch_dormant_outside_schedule(tmp_path, monkeypatch):
+    manager = RecordingManager(output_dir=str(tmp_path), stream_id=7, target_fps=10)
+    manager.filesink = DummyFileSink()
+    manager.record_valve = DummyValve()
+
+    monkeypatch.setattr(recording_mod, "is_in_schedule", lambda _windows: False)
+
+    manager.start_recording(event_prefix="stage1_test")
+
+    assert manager.is_recording is False
+    assert manager.current_file is None
+    assert manager.filesink.props["location"] == "/dev/null"
+    assert manager.record_valve.props["drop"] is True
+
+
+def test_recording_start_and_stop_toggle_valve_inside_schedule(tmp_path, monkeypatch):
+    manager = RecordingManager(output_dir=str(tmp_path), stream_id=7, target_fps=10)
+    manager.filesink = DummyFileSink()
+    manager.record_valve = DummyValve()
+
+    monkeypatch.setattr(recording_mod, "is_in_schedule", lambda _windows: True)
+
+    manager.start_recording(event_prefix="stage1_test")
+
+    assert manager.is_recording is True
+    assert manager.current_file is not None
+    assert manager.filesink.props["location"] != "/dev/null"
+    assert manager.record_valve.props["drop"] is False
+
+    recorded_path = manager.stop_recording()
+
+    assert recorded_path is not None
+    assert manager.is_recording is False
+    assert manager.current_file is None
+    assert manager.filesink.props["location"] == "/dev/null"
+    assert manager.record_valve.props["drop"] is True
+
+
 def test_stream0_decode_chain_creates_isolation_queues(monkeypatch, caplog):
     created = {}
 
@@ -275,12 +322,15 @@ def test_create_all_elements_adds_stream0_post_mux_isolation_queues(monkeypatch,
         config_pouring="/tmp/config_pouring.txt",
         tracker_lib="/tmp/libtracker.so",
         tracker_config="/tmp/tracker.yml",
+        use_cpp_pouring_plugin=True,
     )
     monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
     monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
     caplog.set_level(logging.INFO)
 
     assert builder._create_all_elements() is True
+    assert builder.elements["hicon_pouring_0"].props["enable-osd"] is True
+    assert "Stream 0: C++ pouring OSD enabled on main path before nvosd_0" in caplog.text
     assert "postmuxq0" in builder.elements
     assert "preosdq0" in builder.elements
     assert builder.elements["postmuxq0"].props["leaky"] == 2
@@ -288,6 +338,7 @@ def test_create_all_elements_adds_stream0_post_mux_isolation_queues(monkeypatch,
     assert builder.elements["postmuxq0"].props["max-size-bytes"] == 0
     assert builder.elements["postmuxq0"].props["max-size-time"] == 0
     assert builder.elements["preosdq0"].props["leaky"] == 2
+    assert builder.elements["nvosd_0"].props["process-mode"] == 0
     assert "Stream 0 (CP Plus): post-mux isolation queues enabled" in caplog.text
 
 
@@ -461,17 +512,20 @@ def test_create_all_elements_sets_stream0_decoupled_analysis_mode(monkeypatch, c
         tracker_lib="/tmp/libtracker.so",
         tracker_config="/tmp/tracker.yml",
         stream_0_decoupled_analysis_mode=True,
+        use_cpp_pouring_plugin=True,
     )
     monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
     monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
     caplog.set_level(logging.INFO)
 
     assert builder._create_all_elements() is True
+    assert builder.elements["hicon_pouring_0"].props["enable-osd"] is False
+    assert "Stream 0: C++ pouring OSD disabled on analysis branch (no downstream nvdsosd)" in caplog.text
     assert "tee_stream0_analysis" in builder.elements
     assert "displayq0" in builder.elements
     assert "analysisq0" in builder.elements
-    assert "analysis_conv0" in builder.elements
-    assert "analysis_caps0" in builder.elements
+    assert "analysis_conv0" not in builder.elements
+    assert "analysis_caps0" not in builder.elements
     assert "analysis_sink0" in builder.elements
     assert "nvvidconv_osd_0" not in builder.elements
     assert "caps_osd_0" not in builder.elements
@@ -480,8 +534,146 @@ def test_create_all_elements_sets_stream0_decoupled_analysis_mode(monkeypatch, c
     assert builder.elements["displayq0"].props["max-size-buffers"] == 16
     assert builder.elements["analysisq0"].props["leaky"] == 2
     assert builder.elements["analysisq0"].props["max-size-buffers"] == 2
-    assert builder.elements["nvosd_0"].props["process-mode"] == 1
-    assert "Stream 0 (CP Plus): decoupled analysis mode enabled" in caplog.text
+    assert builder.elements["nvosd_0"].props["process-mode"] == 0
+    assert "Stream 0: decoupled analysis mode — NV12 tee" in caplog.text
+
+
+def test_create_all_elements_omits_stream0_analysis_branch_when_disabled(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_0="rtsp://example/stream0",
+        config_pouring="/tmp/config_pouring.txt",
+        tracker_lib="/tmp/libtracker.so",
+        tracker_config="/tmp/tracker.yml",
+        stream_0_decoupled_analysis_mode=True,
+        stream_0_analysis_branch_enabled=False,
+        use_cpp_pouring_plugin=True,
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_all_elements() is True
+    assert "tee_stream0_analysis" in builder.elements
+    assert "displayq0" in builder.elements
+    assert "analysisq0" not in builder.elements
+    assert "analysis_conv0" not in builder.elements
+    assert "analysis_caps0" not in builder.elements
+    assert "analysis_sink0" not in builder.elements
+    assert "hicon_pouring_0" not in builder.elements
+    assert "nvvidconv_osd_0" not in builder.elements
+    assert "caps_osd_0" not in builder.elements
+    assert "preosdq0" not in builder.elements
+    assert builder.elements["nvosd_0"].props["process-mode"] == 0
+    assert (
+        "Stream 0: C++ pouring plugin skipped because analysis branch is disabled "
+        "for isolation"
+    ) in caplog.text
+    assert (
+        "Stream 0: decoupled analysis mode — NV12 tee "
+        "(analysis branch disabled for isolation)"
+    ) in caplog.text
+
+
+def test_create_all_elements_builds_shell_only_stream0_analysis_branch(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_0="rtsp://example/stream0",
+        config_pouring="/tmp/config_pouring.txt",
+        tracker_lib="/tmp/libtracker.so",
+        tracker_config="/tmp/tracker.yml",
+        stream_0_decoupled_analysis_mode=True,
+        stream_0_analysis_branch_enabled=True,
+        stream_0_analysis_rgba_enabled=False,
+        stream_0_analysis_cpp_plugin_enabled=False,
+        use_cpp_pouring_plugin=True,
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_all_elements() is True
+    assert "analysisq0" in builder.elements
+    assert "analysis_sink0" in builder.elements
+    assert "analysis_conv0" not in builder.elements
+    assert "analysis_caps0" not in builder.elements
+    assert "hicon_pouring_0" not in builder.elements
+    assert "nvvidconv_osd_0" not in builder.elements
+    assert "caps_osd_0" not in builder.elements
+    assert "preosdq0" not in builder.elements
+    assert (
+        "Stream 0: decoupled analysis mode — NV12 tee "
+        "(display NV12 → nvosd_0, leaky NV12 analysis branch)"
+    ) in caplog.text
+    assert "Stream 0: C++ pouring plugin skipped on analysis branch for staged isolation" in caplog.text
+
+
+def test_create_all_elements_keeps_stream0_cpp_plugin_for_main_path_fallback(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_0="rtsp://example/stream0",
+        config_pouring="/tmp/config_pouring.txt",
+        tracker_lib="/tmp/libtracker.so",
+        tracker_config="/tmp/tracker.yml",
+        stream_0_decoupled_analysis_mode=True,
+        stream_0_analysis_branch_enabled=True,
+        stream_0_analysis_probe_enabled=False,
+        stream_0_analysis_cpp_plugin_enabled=True,
+        use_cpp_pouring_plugin=True,
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_all_elements() is True
+    assert "hicon_pouring_0" in builder.elements
+    assert builder.elements["hicon_pouring_0"].props["enable-osd"] is False
+    assert "analysisq0" in builder.elements
+    assert "analysis_sink0" in builder.elements
+    assert "Stream 0: C++ pouring plugin created (hicon_pouring_detect)" in caplog.text
+
+
+def test_create_all_elements_sets_stream1_nvosd_cpu_mode(monkeypatch):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_1="rtsp://example/stream1",
+        config_pyrometer="/tmp/config_pyrometer.txt",
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+
+    assert builder._create_all_elements() is True
+    assert builder.elements["nvosd_1"].props["process-mode"] == 0
+
+
+def test_create_all_elements_sets_stream2_cpp_plugin_osd_on_main_path(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_2="rtsp://example/stream2",
+        config_pouring_2="/tmp/config_pouring_2.txt",
+        tracker_lib="/tmp/libtracker.so",
+        tracker_config="/tmp/tracker.yml",
+        use_cpp_pouring_plugin=True,
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_all_elements() is True
+    assert builder.elements["hicon_pouring_2"].props["enable-osd"] is True
+    assert builder.elements["nvosd_2"].props["process-mode"] == 0
+    assert "Stream 2: C++ pouring OSD enabled on main path before nvosd_2" in caplog.text
+
 
 
 def test_link_decode_chain_for_stream0_uses_isolation_queues():
@@ -554,6 +746,7 @@ def test_link_all_branches_uses_premuxq0_for_stream0(monkeypatch):
         "postmuxq0": FakeElement("queue", "postmuxq0"),
         "pgie_pouring": FakeElement("nvinfer", "pgie_pouring"),
         "tracker_0": FakeElement("nvtracker", "tracker_0"),
+        "hicon_pouring_0": FakeElement("hicon_pouring_detect", "hicon_pouring_0"),
         "nvvidconv_osd_0": FakeElement("nvvideoconvert", "nvvidconv_osd_0"),
         "caps_osd_0": FakeElement("capsfilter", "caps_osd_0"),
         "preosdq0": FakeElement("queue", "preosdq0"),
@@ -573,6 +766,10 @@ def test_link_all_branches_uses_premuxq0_for_stream0(monkeypatch):
     assert mux_links == [("premuxq0", "mux_0")]
     assert builder.elements["mux_0"].links == ["postmuxq0"]
     assert builder.elements["postmuxq0"].links == ["pgie_pouring"]
+    assert builder.elements["pgie_pouring"].links == ["tracker_0"]
+    assert builder.elements["tracker_0"].links == ["hicon_pouring_0"]
+    assert builder.elements["hicon_pouring_0"].links == ["nvvidconv_osd_0"]
+    assert builder.elements["nvvidconv_osd_0"].links == ["caps_osd_0"]
     assert builder.elements["caps_osd_0"].links == ["preosdq0"]
     assert builder.elements["preosdq0"].links == ["nvosd_0"]
 
@@ -611,11 +808,10 @@ def test_link_all_branches_uses_decoupled_stream0_analysis_split(monkeypatch):
         "postmuxq0": FakeElement("queue", "postmuxq0"),
         "pgie_pouring": FakeElement("nvinfer", "pgie_pouring"),
         "tracker_0": FakeElement("nvtracker", "tracker_0"),
+        "hicon_pouring_0": FakeElement("hicon_pouring_detect", "hicon_pouring_0"),
         "tee_stream0_analysis": FakeElement("tee", "tee_stream0_analysis"),
         "displayq0": FakeElement("queue", "displayq0"),
         "analysisq0": FakeElement("queue", "analysisq0"),
-        "analysis_conv0": FakeElement("nvvideoconvert", "analysis_conv0"),
-        "analysis_caps0": FakeElement("capsfilter", "analysis_caps0"),
         "analysis_sink0": FakeElement("fakesink", "analysis_sink0"),
         "nvosd_0": FakeElement("nvdsosd", "nvosd_0"),
         "sink_0": FakeElement("fakesink", "sink_0"),
@@ -636,12 +832,153 @@ def test_link_all_branches_uses_decoupled_stream0_analysis_split(monkeypatch):
     assert builder.elements["pgie_pouring"].links == ["tracker_0"]
     assert builder.elements["tracker_0"].links == ["tee_stream0_analysis"]
     assert builder.elements["displayq0"].links == ["nvosd_0"]
-    assert builder.elements["analysisq0"].links == ["analysis_conv0"]
-    assert builder.elements["analysis_conv0"].links == ["analysis_caps0"]
-    assert builder.elements["analysis_caps0"].links == ["analysis_sink0"]
+    assert builder.elements["analysisq0"].links == ["hicon_pouring_0"]
+    assert builder.elements["hicon_pouring_0"].links == ["analysis_sink0"]
     assert builder.elements["nvosd_0"].links == ["sink_0"]
-    assert builder.elements["postmuxq0"].links == ["pgie_pouring"]
-    assert builder.elements["pgie_pouring"].links == ["nvvidconv_osd_0"]
+
+
+def test_link_all_branches_omits_stream0_analysis_split_when_disabled(monkeypatch):
+    builder = _make_builder(
+        stream_0_decoupled_analysis_mode=True,
+        stream_0_analysis_branch_enabled=False,
+    )
+    builder.enabled_streams = [0]
+    builder.enable_inference_video = False
+    builder.elements = {
+        "source0": FakeElement("rtspsrc", "source0"),
+        "premuxq0": FakeElement("queue", "premuxq0"),
+        "mux_0": FakeElement("nvstreammux", "mux_0"),
+        "postmuxq0": FakeElement("queue", "postmuxq0"),
+        "pgie_pouring": FakeElement("nvinfer", "pgie_pouring"),
+        "tracker_0": FakeElement("nvtracker", "tracker_0"),
+        "tee_stream0_analysis": FakeElement("tee", "tee_stream0_analysis"),
+        "displayq0": FakeElement("queue", "displayq0"),
+        "nvosd_0": FakeElement("nvdsosd", "nvosd_0"),
+        "sink_0": FakeElement("fakesink", "sink_0"),
+    }
+
+    mux_links = []
+    tee_links = []
+    monkeypatch.setattr(builder, "_link_decode_chain", lambda stream_id: True)
+    monkeypatch.setattr(
+        builder,
+        "_link_to_mux",
+        lambda src_name, mux_name: mux_links.append((src_name, mux_name)) or True,
+    )
+    monkeypatch.setattr(
+        builder,
+        "_link_tee_src_to_element",
+        lambda tee_name, dst_name: tee_links.append((tee_name, dst_name)) or True,
+    )
+
+    assert builder._link_all_branches() is True
+    assert mux_links == [("premuxq0", "mux_0")]
+    assert tee_links == [("tee_stream0_analysis", "displayq0")]
+    assert builder.elements["tracker_0"].links == ["tee_stream0_analysis"]
+    assert builder.elements["displayq0"].links == ["nvosd_0"]
+    assert builder.elements["nvosd_0"].links == ["sink_0"]
+
+
+def test_link_all_branches_builds_shell_only_stream0_analysis_split(monkeypatch):
+    builder = _make_builder(
+        stream_0_decoupled_analysis_mode=True,
+        stream_0_analysis_branch_enabled=True,
+        stream_0_analysis_rgba_enabled=False,
+        stream_0_analysis_cpp_plugin_enabled=False,
+    )
+    builder.enabled_streams = [0]
+    builder.enable_inference_video = False
+    builder.elements = {
+        "source0": FakeElement("rtspsrc", "source0"),
+        "premuxq0": FakeElement("queue", "premuxq0"),
+        "mux_0": FakeElement("nvstreammux", "mux_0"),
+        "postmuxq0": FakeElement("queue", "postmuxq0"),
+        "pgie_pouring": FakeElement("nvinfer", "pgie_pouring"),
+        "tracker_0": FakeElement("nvtracker", "tracker_0"),
+        "tee_stream0_analysis": FakeElement("tee", "tee_stream0_analysis"),
+        "displayq0": FakeElement("queue", "displayq0"),
+        "analysisq0": FakeElement("queue", "analysisq0"),
+        "analysis_sink0": FakeElement("fakesink", "analysis_sink0"),
+        "nvosd_0": FakeElement("nvdsosd", "nvosd_0"),
+        "sink_0": FakeElement("fakesink", "sink_0"),
+    }
+
+    mux_links = []
+    tee_links = []
+    monkeypatch.setattr(builder, "_link_decode_chain", lambda stream_id: True)
+    monkeypatch.setattr(
+        builder,
+        "_link_to_mux",
+        lambda src_name, mux_name: mux_links.append((src_name, mux_name)) or True,
+    )
+    monkeypatch.setattr(
+        builder,
+        "_link_tee_src_to_element",
+        lambda tee_name, dst_name: tee_links.append((tee_name, dst_name)) or True,
+    )
+
+    assert builder._link_all_branches() is True
+    assert mux_links == [("premuxq0", "mux_0")]
+    assert tee_links == [
+        ("tee_stream0_analysis", "displayq0"),
+        ("tee_stream0_analysis", "analysisq0"),
+    ]
+    assert builder.elements["tracker_0"].links == ["tee_stream0_analysis"]
+    assert builder.elements["displayq0"].links == ["nvosd_0"]
+    assert builder.elements["analysisq0"].links == ["analysis_sink0"]
+    assert builder.elements["nvosd_0"].links == ["sink_0"]
+
+
+
+def test_link_all_branches_places_stream0_cpp_plugin_on_display_path_fallback(monkeypatch):
+    builder = _make_builder(
+        stream_0_decoupled_analysis_mode=True,
+        stream_0_analysis_branch_enabled=True,
+        stream_0_analysis_probe_enabled=False,
+        stream_0_analysis_cpp_plugin_enabled=True,
+    )
+    builder.enabled_streams = [0]
+    builder.enable_inference_video = False
+    builder.elements = {
+        "source0": FakeElement("rtspsrc", "source0"),
+        "premuxq0": FakeElement("queue", "premuxq0"),
+        "mux_0": FakeElement("nvstreammux", "mux_0"),
+        "postmuxq0": FakeElement("queue", "postmuxq0"),
+        "pgie_pouring": FakeElement("nvinfer", "pgie_pouring"),
+        "tracker_0": FakeElement("nvtracker", "tracker_0"),
+        "tee_stream0_analysis": FakeElement("tee", "tee_stream0_analysis"),
+        "displayq0": FakeElement("queue", "displayq0"),
+        "hicon_pouring_0": FakeElement("hicon_pouring_detect", "hicon_pouring_0"),
+        "analysisq0": FakeElement("queue", "analysisq0"),
+        "analysis_sink0": FakeElement("fakesink", "analysis_sink0"),
+        "nvosd_0": FakeElement("nvdsosd", "nvosd_0"),
+        "sink_0": FakeElement("fakesink", "sink_0"),
+    }
+
+    mux_links = []
+    tee_links = []
+    monkeypatch.setattr(builder, "_link_decode_chain", lambda stream_id: True)
+    monkeypatch.setattr(
+        builder,
+        "_link_to_mux",
+        lambda src_name, mux_name: mux_links.append((src_name, mux_name)) or True,
+    )
+    monkeypatch.setattr(
+        builder,
+        "_link_tee_src_to_element",
+        lambda tee_name, dst_name: tee_links.append((tee_name, dst_name)) or True,
+    )
+
+    assert builder._link_all_branches() is True
+    assert mux_links == [("premuxq0", "mux_0")]
+    assert tee_links == [
+        ("tee_stream0_analysis", "displayq0"),
+        ("tee_stream0_analysis", "analysisq0"),
+    ]
+    assert builder.elements["displayq0"].links == ["hicon_pouring_0"]
+    assert builder.elements["hicon_pouring_0"].links == ["nvosd_0"]
+    assert builder.elements["analysisq0"].links == ["analysis_sink0"]
+    assert builder.elements["nvosd_0"].links == ["sink_0"]
 
 
 def test_link_all_branches_skips_stream0_pgie_and_tracker_when_bypassed(monkeypatch):

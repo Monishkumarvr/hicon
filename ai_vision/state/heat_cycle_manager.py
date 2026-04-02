@@ -1,11 +1,11 @@
 """
-Heat Cycle Manager - Track ladle-based pouring cycles
+Heat Cycle Manager - Track pouring-session-driven heat cycles.
 
 Manages heat cycles where:
-- One continuous ladle presence window = One heat cycle
-- Multiple mould pourings belong to same cycle
-- Cycle ends after 5 minutes of NO ladle
-- Aggregates pouring times for API POST
+- A cycle is created by pouring-session presence or tapping
+- Pouring-backed cycles stay alive only while mouth-in-trolley presence refreshes
+- Tapping-only cycles are allowed and finalized after a confirmation window
+- Aggregates pouring + melting-side timings for API POST
 """
 import logging
 from dataclasses import dataclass, field
@@ -31,25 +31,29 @@ class MouldPouringRecord:
 
 @dataclass
 class HeatCycle:
-    """Represents one complete heat cycle (ladle-based)."""
+    """Represents one complete heat cycle."""
     heat_no: str  # Sequential: HEAT_0001, HEAT_0002, etc.
-    ladle_number: str  # Sequential: LAD_001, LAD_002, etc.
-    ladle_track_ids: List[int]  # All tracker IDs seen during this cycle
-    cycle_start_time: float  # Wall clock when ladle first appeared
+    ladle_number: str  # Legacy DB field; kept empty in the new logic
+    ladle_track_ids: List[int]  # Track IDs seen during this cycle (legacy/debug)
+    cycle_start_time: float
     cycle_start_datetime: datetime
 
     # Pouring aggregation
     mould_pourings: List[MouldPouringRecord] = field(default_factory=list)
 
     # Cycle state
-    ladle_last_seen: float = 0.0  # Last time ladle was in frame
     cycle_active: bool = True  # False when finalized
+    has_pouring_session: bool = False
+    last_pouring_presence_time: Optional[float] = None
+    last_pouring_presence_datetime: Optional[datetime] = None
 
     # Tapping aggregation (first start = cycle tapping start, last end = cycle tapping end)
     tapping_start_time: Optional[float] = None
     tapping_start_datetime: Optional[datetime] = None
     tapping_end_time: Optional[float] = None
     tapping_end_datetime: Optional[datetime] = None
+    last_tapping_end_time: Optional[float] = None
+    last_tapping_end_datetime: Optional[datetime] = None
     tapping_events: List[Dict] = field(default_factory=list)
 
     # Deslagging aggregation
@@ -78,10 +82,10 @@ class HeatCycleManager:
     Manage heat cycles and aggregate pouring data.
     
     Business logic:
-    - First ladle appearance creates new cycle
-    - ANY ladle extends the current cycle (tracker ID changes do not split cycles)
-    - Cycle ends after 5 minutes of NO ladle
-    - Finalized cycles POSTed to API
+    - New cycle starts from pouring-session presence or tapping
+    - Pouring-backed cycles stay alive from mouth-in-trolley presence only
+    - Tapping-only cycles are valid and finalized after a confirmation window
+    - Finalized cycles are posted to API
     """
     
     def __init__(self, db_manager, ladle_absence_timeout: float = 300.0):
@@ -90,7 +94,7 @@ class HeatCycleManager:
         
         Args:
             db_manager: Database manager instance for querying existing counters
-            ladle_absence_timeout: Seconds of ladle absence before finalizing cycle (default 300 = 5min)
+            ladle_absence_timeout: Seconds of pouring-session/tapping inactivity before finalizing cycle
         """
         self.db_manager = db_manager
         self.ladle_absence_timeout = ladle_absence_timeout
@@ -100,17 +104,13 @@ class HeatCycleManager:
         
         # Sequential counters - initialize from database
         self.heat_counter = self._get_last_heat_counter()
-        self.ladle_counter = self._get_last_ladle_counter()
-        
-        # Map ladle_track_id to assigned sequential ladle_number
-        self.ladle_track_to_number: Dict[int, str] = {}
-        
+
         # Finalized cycles ready for sync (keyed by heat_no)
         self.finalized_cycles: Dict[str, HeatCycle] = {}
+        self.previous_cycle_end_time, self.previous_cycle_end_datetime = self._get_last_cycle_end()
         
         logger.info(f"✓ HeatCycleManager initialized (ladle timeout: {ladle_absence_timeout}s)")
         logger.info(f"  Heat counter starting at: {self.heat_counter}")
-        logger.info(f"  Ladle counter starting at: {self.ladle_counter}")
     
     def _get_last_heat_counter(self) -> int:
         """Query database for the last used heat counter."""
@@ -134,61 +134,101 @@ class HeatCycleManager:
             logger.warning(f"Error querying last heat counter: {e}")
             return 0
     
-    def _get_last_ladle_counter(self) -> int:
-        """Query database for the last used ladle counter."""
+    def _get_last_cycle_end(self) -> tuple[Optional[float], Optional[datetime]]:
+        """Query database for the last finalized heat cycle end time."""
         try:
             conn = self.db_manager._get_connection()
             c = conn.cursor()
-            c.execute("SELECT DISTINCT ladle_number FROM heat_cycles ORDER BY ladle_number DESC")
-            rows = c.fetchall()
+            c.execute(
+                "SELECT cycle_end_time FROM heat_cycles "
+                "WHERE cycle_end_time IS NOT NULL AND cycle_end_time != '' "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            row = c.fetchone()
             conn.close()
-            
-            max_counter = 0
-            for row in rows:
-                if row[0] and row[0].startswith('LAD_'):
-                    try:
-                        counter = int(row[0].split('_')[1])
-                        max_counter = max(max_counter, counter)
-                    except (IndexError, ValueError):
-                        continue
-            return max_counter
+
+            if not row or not row[0]:
+                return None, None
+
+            dt = datetime.fromisoformat(row[0])
+            return dt.timestamp(), dt
         except Exception as e:
-            logger.warning(f"Error querying last ladle counter: {e}")
-            return 0
+            logger.warning(f"Error querying last heat cycle end: {e}")
+            return None, None
     
     def _get_next_heat_no(self) -> str:
         """Generate next sequential heat number."""
         self.heat_counter += 1
         return f"HEAT_{self.heat_counter:04d}"
-    
-    def _get_ladle_number(self, ladle_track_id: int) -> str:
-        """Get or assign sequential ladle number for a track_id."""
-        if ladle_track_id not in self.ladle_track_to_number:
-            self.ladle_counter += 1
-            self.ladle_track_to_number[ladle_track_id] = f"LAD_{self.ladle_counter:03d}"
-        return self.ladle_track_to_number[ladle_track_id]
-    
-    def update_ladle_presence(self, ladle_track_id: int, current_time: float, current_datetime: datetime) -> None:
+
+    def _get_cycle_start_seed(
+        self,
+        event_time: float,
+        event_datetime: datetime,
+    ) -> tuple[float, datetime]:
+        """Backfill next cycle start from previous cycle end when available."""
+        if self.previous_cycle_end_time is not None and self.previous_cycle_end_datetime is not None:
+            return self.previous_cycle_end_time, self.previous_cycle_end_datetime
+        return event_time, event_datetime
+
+    def _create_new_cycle(
+        self,
+        creator_track_id: Optional[int],
+        event_time: float,
+        event_datetime: datetime,
+        reason: str,
+    ) -> HeatCycle:
+        """Create a new cycle seeded from the previous cycle end when available."""
+        heat_no = self._get_next_heat_no()
+        cycle_start_time, cycle_start_datetime = self._get_cycle_start_seed(event_time, event_datetime)
+
+        track_ids: List[int] = []
+        if creator_track_id is not None:
+            track_ids.append(int(creator_track_id))
+
+        cycle = HeatCycle(
+            heat_no=heat_no,
+            ladle_number="",
+            ladle_track_ids=track_ids,
+            cycle_start_time=cycle_start_time,
+            cycle_start_datetime=cycle_start_datetime,
+            cycle_active=True,
+        )
+
+        self.active_cycle = cycle
+        logger.info(
+            "🔥 NEW HEAT CYCLE: %s (reason=%s, start=%s)",
+            heat_no,
+            reason,
+            cycle_start_datetime.isoformat(),
+        )
+        return cycle
+
+    def update_pouring_session_presence(
+        self,
+        track_id: int,
+        current_time: float,
+        current_datetime: datetime,
+    ) -> None:
         """
-        Update ladle last-seen timestamp (call every frame where ladle is detected).
-        
-        Args:
-            ladle_track_id: Ladle tracker ID
-            current_time: Current wall clock time
-            current_datetime: Current datetime object
+        Refresh cycle presence from a valid mouth-in-trolley observation.
+
+        This is the only signal that should keep a pouring-backed cycle alive.
         """
         if self.active_cycle is None:
-            # Create new heat cycle
-            self._create_new_cycle(ladle_track_id, current_time, current_datetime)
-            return
+            self._create_new_cycle(track_id, current_time, current_datetime, reason="pouring_session")
 
-        # Extend existing cycle with ANY ladle
-        self.active_cycle.ladle_last_seen = current_time
-        if ladle_track_id not in self.active_cycle.ladle_track_ids:
-            self.active_cycle.ladle_track_ids.append(ladle_track_id)
-            logger.info(
-                f"🔄 {self.active_cycle.heat_no}: Detected ladle tracker_id={ladle_track_id} - extending cycle"
-            )
+        cycle = self.active_cycle
+        cycle.has_pouring_session = True
+        cycle.last_pouring_presence_time = current_time
+        cycle.last_pouring_presence_datetime = current_datetime
+
+        if track_id not in cycle.ladle_track_ids:
+            cycle.ladle_track_ids.append(track_id)
+
+    def update_ladle_presence(self, ladle_track_id: int, current_time: float, current_datetime: datetime) -> None:
+        """Backward-compatible alias for older callers."""
+        self.update_pouring_session_presence(ladle_track_id, current_time, current_datetime)
     
     def add_tapping_event(self, start_wall: float, start_dt: datetime,
                           end_wall: float, end_dt: datetime, duration: float) -> None:
@@ -197,8 +237,7 @@ class HeatCycleManager:
         Updates tapping_start_time (min of starts) and tapping_end_time (max of ends).
         """
         if self.active_cycle is None:
-            logger.warning("Cannot add tapping event: no active cycle")
-            return
+            self._create_new_cycle(None, start_wall, start_dt, reason="tapping")
 
         cycle = self.active_cycle
         event = {
@@ -215,6 +254,8 @@ class HeatCycleManager:
         if cycle.tapping_end_time is None or end_wall > cycle.tapping_end_time:
             cycle.tapping_end_time = end_wall
             cycle.tapping_end_datetime = end_dt
+        cycle.last_tapping_end_time = end_wall
+        cycle.last_tapping_end_datetime = end_dt
 
         logger.info(
             f"  {cycle.heat_no}: Added tapping event ({len(cycle.tapping_events)} total), "
@@ -260,7 +301,8 @@ class HeatCycleManager:
         )
 
     def add_pyrometer_event(self, start_wall: float, start_dt: datetime,
-                            end_wall: float, end_dt: datetime, duration: float) -> None:
+                            end_wall: float, end_dt: datetime, duration: float,
+                            zone_name: str = None) -> None:
         """Add a pyrometer event to the active heat cycle."""
         if self.active_cycle is None:
             logger.warning("Cannot add pyrometer event: no active cycle")
@@ -272,10 +314,13 @@ class HeatCycleManager:
             "end": end_dt.isoformat(),
             "duration_sec": duration,
         }
+        if zone_name:
+            event["zone_name"] = zone_name
         cycle.pyrometer_events.append(event)
+        zone_label = f" [{zone_name}]" if zone_name else ""
         logger.info(
-            f"  {cycle.heat_no}: Added pyrometer event ({len(cycle.pyrometer_events)} total), "
-            f"duration={duration:.1f}s"
+            f"  {cycle.heat_no}: Added pyrometer event{zone_label} "
+            f"({len(cycle.pyrometer_events)} total), duration={duration:.1f}s"
         )
 
     def lock_trolley(self, trolley_track_id: int) -> None:
@@ -287,26 +332,6 @@ class HeatCycleManager:
         self.active_cycle.locked_trolley_id = trolley_track_id
         logger.info(f"  {self.active_cycle.heat_no}: Locked to trolley T{trolley_track_id}")
 
-    def _create_new_cycle(self, ladle_track_id: int, current_time: float, current_datetime: datetime) -> HeatCycle:
-        """Create new heat cycle for ladle."""
-        heat_no = self._get_next_heat_no()
-        ladle_number = self._get_ladle_number(ladle_track_id)
-        
-        cycle = HeatCycle(
-            heat_no=heat_no,
-            ladle_number=ladle_number,
-            ladle_track_ids=[ladle_track_id],
-            cycle_start_time=current_time,
-            cycle_start_datetime=current_datetime,
-            ladle_last_seen=current_time,
-            cycle_active=True
-        )
-        
-        self.active_cycle = cycle
-        logger.info(f"🔥 NEW HEAT CYCLE: {heat_no} (Ladle: {ladle_number}, tracker_id={ladle_track_id})")
-        
-        return cycle
-    
     def add_pouring_to_cycle(
         self,
         ladle_track_id: int,
@@ -332,10 +357,7 @@ class HeatCycleManager:
         Returns:
             heat_no if cycle exists, None otherwise
         """
-        if self.active_cycle is None:
-            logger.warning(f"Cannot add pouring: no active cycle for ladle {ladle_track_id}")
-            return None
-        
+        self.update_pouring_session_presence(ladle_track_id, start_time, start_datetime)
         cycle = self.active_cycle
         if ladle_track_id not in cycle.ladle_track_ids:
             cycle.ladle_track_ids.append(ladle_track_id)
@@ -396,7 +418,7 @@ class HeatCycleManager:
     
     def check_and_finalize_cycles(self, current_time: float, current_datetime: datetime) -> List[HeatCycle]:
         """
-        Check for cycles that should be finalized (ladle absent for timeout period).
+        Check for cycles that should be finalized after the configured inactivity window.
         
         Args:
             current_time: Current wall clock time
@@ -409,15 +431,30 @@ class HeatCycleManager:
             return []
 
         cycle = self.active_cycle
-        time_since_last_seen = current_time - cycle.ladle_last_seen
+        finalize_time = None
+        finalize_datetime = None
+        finalize_reason = None
 
-        if time_since_last_seen < self.ladle_absence_timeout:
+        if cycle.has_pouring_session and cycle.last_pouring_presence_time is not None:
+            time_since_last_presence = current_time - cycle.last_pouring_presence_time
+            if time_since_last_presence >= self.ladle_absence_timeout:
+                finalize_time = cycle.last_pouring_presence_time
+                finalize_datetime = cycle.last_pouring_presence_datetime or current_datetime
+                finalize_reason = f"pouring session absent for {time_since_last_presence:.1f}s"
+        elif cycle.tapping_events and cycle.last_tapping_end_time is not None:
+            time_since_tapping_end = current_time - cycle.last_tapping_end_time
+            if time_since_tapping_end >= self.ladle_absence_timeout:
+                finalize_time = cycle.last_tapping_end_time
+                finalize_datetime = cycle.last_tapping_end_datetime or current_datetime
+                finalize_reason = f"no pouring after tapping for {time_since_tapping_end:.1f}s"
+
+        if finalize_time is None or finalize_datetime is None:
             return []
 
-        logger.info(
-            f"⏱️  Finalizing {cycle.heat_no}: ladle absent for {time_since_last_seen:.1f}s"
-        )
-        self._finalize_cycle(cycle, current_time, current_datetime)
+        logger.info("⏱️  Finalizing %s: %s", cycle.heat_no, finalize_reason)
+        self._finalize_cycle(cycle, finalize_time, finalize_datetime)
+        self.previous_cycle_end_time = cycle.cycle_end_time
+        self.previous_cycle_end_datetime = cycle.cycle_end_datetime
         self.finalized_cycles[cycle.heat_no] = cycle
         self.active_cycle = None
         return [cycle]
@@ -436,8 +473,10 @@ class HeatCycleManager:
         cycle.cycle_end_time = end_time
         cycle.cycle_end_datetime = end_datetime
         
-        if not cycle.mould_pourings:
-            logger.warning(f"Cycle {cycle.heat_no} has no pourings!")
+        if not cycle.mould_pourings and not cycle.tapping_events:
+            logger.warning(f"Cycle {cycle.heat_no} has no pourings or tapping events")
+            cycle.total_pouring_time = 0
+            cycle.mould_wise_pouring_time = []
             return
         
         # Find first and last pouring times
@@ -449,7 +488,7 @@ class HeatCycleManager:
         
         # Calculate total pouring time (sum of individual durations)
         total_seconds = sum(
-            p.duration_seconds for p in cycle.mould_pourings 
+            p.duration_seconds for p in cycle.mould_pourings
             if p.duration_seconds is not None
         )
         
@@ -468,6 +507,10 @@ class HeatCycleManager:
                 })
         
         cycle.mould_wise_pouring_time = mould_wise
+
+        if not cycle.mould_pourings:
+            cycle.total_pouring_time = 0
+            cycle.mould_wise_pouring_time = []
         
         # Move to finalized cycles
         self.finalized_cycles[cycle.heat_no] = cycle

@@ -481,8 +481,15 @@ class HiConDatabase:
             # Generate next serial number
             slno = self._get_next_slno(conn)
 
+            ladle_number = ladle_number or ""
+            pouring_start_time = pouring_start_time or ""
+            pouring_end_time = pouring_end_time or ""
+            total_pouring_time = total_pouring_time or "0"
+            tapping_start_time = tapping_start_time or ""
+            tapping_end_time = tapping_end_time or ""
+
             # Convert to JSON
-            mould_wise_json = json.dumps(mould_wise_pouring_time)
+            mould_wise_json = json.dumps(mould_wise_pouring_time or [])
             tapping_events_json = json.dumps(tapping_events) if tapping_events else None
             deslagging_events_json = json.dumps(deslagging_events) if deslagging_events else None
             spectro_events_json = json.dumps(spectro_events) if spectro_events else None

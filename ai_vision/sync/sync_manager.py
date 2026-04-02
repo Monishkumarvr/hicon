@@ -164,6 +164,8 @@ class SyncManager:
         # Prepare API payload
         pouring_items = []
         melting_items = []
+        melting_skipped_sync_ids = set()  # Cycles excluded from melting (no tapping detected)
+        pouring_skipped_sync_ids = set()  # Cycles excluded from pouring (incomplete session)
         cycle_by_sync = {}
         for cycle in cycles:
             cycle_by_sync[cycle['sync_id']] = cycle
@@ -194,51 +196,65 @@ class SyncManager:
 
             mould_count = len(mould_wise_timing) if mould_wise_timing else 0
 
-            # Pouring payload (new API format)
-            pouring_items.append({
-                'sync_id': cycle['sync_id'],
-                'customer_id': cycle['customer_id'],
-                'date': cycle['date'],
-                'heat_no': cycle.get('heat_no') or "",
-                'location': cycle['location'],
-                'camera_id': cycle['camera_id'],
-                'mould_count': mould_count,
-                'pouring_start_time': format_timestamp_for_api(cycle['pouring_start_time']),
-                'pouring_end_time': format_timestamp_for_api(cycle.get('pouring_end_time')),
-                'total_pouring_time': str(cycle.get('total_pouring_time', '0')),  # Seconds as string
-                'mould_wise_pouring_time': mould_wise_timing,  # Array of {mould_id, start, end, duration}
-            })
+            # Skip pouring sync for incomplete sessions — API requires valid timestamps.
+            pouring_start = format_timestamp_for_api(cycle.get('pouring_start_time'))
+            pouring_end = format_timestamp_for_api(cycle.get('pouring_end_time'))
+            if not pouring_start or not pouring_end:
+                pouring_skipped_sync_ids.add(cycle['sync_id'])
+                logger.debug(f"  Skipping pouring sync for {cycle['sync_id']}: incomplete session (start={pouring_start}, end={pouring_end})")
+            else:
+                # Pouring payload (new API format)
+                pouring_items.append({
+                    'sync_id': cycle['sync_id'],
+                    'customer_id': cycle['customer_id'],
+                    'date': cycle['date'],
+                    'heat_no': cycle.get('heat_no') or "",
+                    'location': cycle['location'],
+                    'camera_id': cycle['camera_id'],
+                    'mould_count': mould_count,
+                    'pouring_start_time': pouring_start,
+                    'pouring_end_time': pouring_end,
+                    'total_pouring_time': str(cycle.get('total_pouring_time', '0')),  # Seconds as string
+                    'mould_wise_pouring_time': mould_wise_timing,  # Array of {mould_id, start, end, duration}
+                })
 
             # Melting payload (new API format)
             tapping_start = format_timestamp_for_api(cycle.get('tapping_start_time'))
             tapping_end = format_timestamp_for_api(cycle.get('tapping_end_time'))
-            deslag_events = _parse_json_list(cycle.get('deslagging_events'))
-            spectro_events = _parse_json_list(cycle.get('spectro_events'))
-            pyro_events = _parse_json_list(cycle.get('pyrometer_events'))
 
-            cycle_start_iso = cycle.get('cycle_start_time')
-            cycle_end_iso = cycle.get('cycle_end_time')
-            melting_items.append({
-                'sync_id': cycle['sync_id'],
-                'customer_id': cycle['customer_id'],
-                'date': cycle['date'],
-                'camera_id': cycle['camera_id'],
-                'location': cycle['location'],
-                'pyrometer': bool(len(pyro_events) > 0),
-                'spectro': bool(len(spectro_events) > 0),
-                'furnace': self.furnace_id or "",
-                'heat_no': cycle.get('heat_no') or "",
-                'heat_start_time': format_timestamp_for_api(cycle_start_iso),
-                'heat_end_time': format_timestamp_for_api(cycle_end_iso),
-                'heat_duration': self._format_duration_hhmmss(cycle_start_iso, cycle_end_iso),
-                'tapping_start_time': tapping_start,
-                'tapping_end_time': tapping_end,
-                'deslagging': bool(len(deslag_events) > 0),
-            })
+            # Skip melting sync for cycles with no tapping detected — API requires valid timestamps.
+            # Track skipped IDs so they don't block the pouring sync from completing.
+            if not tapping_start or not tapping_end:
+                melting_skipped_sync_ids.add(cycle['sync_id'])
+                logger.debug(f"  Skipping melting sync for {cycle['sync_id']}: no tapping detected")
+            else:
+                deslag_events = _parse_json_list(cycle.get('deslagging_events'))
+                spectro_events = _parse_json_list(cycle.get('spectro_events'))
+                pyro_events = _parse_json_list(cycle.get('pyrometer_events'))
+
+                cycle_start_iso = cycle.get('cycle_start_time')
+                cycle_end_iso = cycle.get('cycle_end_time')
+                melting_items.append({
+                    'sync_id': cycle['sync_id'],
+                    'customer_id': cycle['customer_id'],
+                    'date': cycle['date'],
+                    'camera_id': cycle['camera_id'],
+                    'location': cycle['location'],
+                    'pyrometer': bool(len(pyro_events) > 0),
+                    'spectro': bool(len(spectro_events) > 0),
+                    'furnace': self.furnace_id or "",
+                    'heat_no': cycle.get('heat_no') or "",
+                    'heat_start_time': format_timestamp_for_api(cycle_start_iso),
+                    'heat_end_time': format_timestamp_for_api(cycle_end_iso),
+                    'heat_duration': self._format_duration_hhmmss(cycle_start_iso, cycle_end_iso),
+                    'tapping_start_time': tapping_start,
+                    'tapping_end_time': tapping_end,
+                    'deslagging': bool(len(deslag_events) > 0),
+                })
 
         # Send to API
-        pouring_result = self.api.send_pouring_data(pouring_items)
-        melting_result = self.api.send_melting_data(melting_items)
+        pouring_result = self.api.send_pouring_data(pouring_items) if pouring_items else {'results': []}
+        melting_result = self.api.send_melting_data(melting_items) if melting_items else {'results': []}
 
         # Extract successful sync_ids from results array
         pouring_results = pouring_result.get('results', [])
@@ -278,8 +294,11 @@ class SyncManager:
             for sync_id, error_msg in failed_melting_ids:
                 self.db.update_heat_cycle_sync_status(sync_id, error_msg)
 
-        # Mark successful records as synced
-        successful_ids = set(pouring_success) & set(melting_success)
+        # Mark successful records as synced.
+        # Cycles skipped from melting (no tapping) count as melting-complete to avoid blocking pouring sync.
+        melting_complete = set(melting_success) | melting_skipped_sync_ids
+        pouring_complete = set(pouring_success) | pouring_skipped_sync_ids
+        successful_ids = pouring_complete & melting_complete
         if successful_ids:
             self.db.mark_heat_cycles_synced(list(successful_ids))
             logger.info(f"  ✓ Marked {len(successful_ids)} heat cycles as synced")
