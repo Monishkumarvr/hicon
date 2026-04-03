@@ -20,7 +20,8 @@ import math
 import numpy as np
 import logging
 import time
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -365,8 +366,16 @@ class PouringProcessor:
         """
         self._frame_count += 1
 
-        frame_w = int(getattr(frame_meta, 'source_frame_width', 0) or 0) or self._frame_w or 1280
-        frame_h = int(getattr(frame_meta, 'source_frame_height', 0) or 0) or self._frame_h or 720
+        if frame is not None:
+            if hasattr(frame, "ndim") and frame.ndim == 2:
+                frame_h = frame.shape[0] * 2 // 3
+                frame_w = frame.shape[1]
+            else:
+                frame_h, frame_w = frame.shape[:2]
+        else:
+            frame_w = getattr(self.config, 'STREAM_0_MUX_WIDTH', 1600)
+            frame_h = getattr(self.config, 'STREAM_0_MUX_HEIGHT', 900)
+
         self._frame_w = frame_w
         self._frame_h = frame_h
         self._update_runtime_geometry(frame_w, frame_h)
@@ -623,14 +632,10 @@ class PouringProcessor:
         )
 
     def _is_mouth_in_expanded_trolley(self, mouth, trolley):
-        """Check if mouth center is inside trolley bbox expanded on all sides."""
+        """Check if mouth center is inside trolley bbox with only the top edge expanded."""
         mx, my = mouth['center']
         tx1, ty1, tx2, ty2 = trolley['bbox']
-        ex1 = tx1 - self.edge_expand_x_px
-        ey1 = ty1 - self.edge_expand_y_px
-        ex2 = tx2 + self.edge_expand_x_px
-        ey2 = ty2 + self.edge_expand_y_px
-        return ex1 <= mx <= ex2 and ey1 <= my <= ey2
+        return tx1 <= mx <= tx2 and (ty1 - self.edge_expand_y_px) <= my <= ty2
 
     def _lock_trolley(self, trolley, timestamp):
         """Lock onto a trolley (happens on first pour start)."""
@@ -648,10 +653,13 @@ class PouringProcessor:
             self.heat_cycle_manager.lock_trolley(trolley['track_id'])
 
     def _select_best_mouth_for_trolley(self, mouths, trolley):
-        """Select highest-confidence mouth inside target trolley expanded region."""
+        """Select highest-confidence mouth whose probe point falls inside the trolley bbox (top edge expanded)."""
         if not mouths or not trolley:
             return None
-        candidates = [m for m in mouths if self._is_mouth_in_expanded_trolley(m, trolley)]
+        tx1, ty1, tx2, ty2 = trolley['bbox']
+        top_expanded = (tx1, ty1 - self.edge_expand_y_px, tx2, ty2)
+        candidates = [m for m in mouths
+                      if self._point_in_bbox(*self._mouth_probe_point(m), top_expanded)]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m['confidence'])
@@ -694,17 +702,22 @@ class PouringProcessor:
             self.mouth_inside_since = None
 
             if self.session_active:
-                # Mouth missing tolerance: brief absence < 0.8s is tolerated
+                # Reference: end session if out_count >= N_EXIT (session_end_dur of consecutive
+                # absence) OR probe_missing > MOUTH_MISSING_TOL — whichever fires first.
                 if self.mouth_absent_since is None:
                     self.mouth_absent_since = timestamp
                 else:
                     absence_duration = timestamp - self.mouth_absent_since
-                    if absence_duration > self.mouth_missing_tol:
-                        # Past tolerance — check session end duration
-                        effective_absence = absence_duration - self.mouth_missing_tol
-                        if effective_absence >= self.session_end_dur:
-                            self._end_session(timestamp, datetime_obj,
-                                              mouths, trolleys, frame)
+                    # Condition 1: sustained absence >= session_end_dur (N_EXIT path)
+                    # Condition 2: probe not seen for > mouth_missing_tol (probe_missing path)
+                    probe_missing = (
+                        timestamp - self.mouth_last_seen_in_trolley
+                        if self.mouth_last_seen_in_trolley is not None
+                        else float('inf')
+                    )
+                    if absence_duration >= self.session_end_dur or probe_missing > self.mouth_missing_tol:
+                        self._end_session(timestamp, datetime_obj,
+                                          mouths, trolleys, frame)
 
     def _start_session(self, trolley, timestamp, datetime_obj, mouths, trolleys, frame):
         """Start a new pouring session."""
@@ -996,15 +1009,17 @@ class PouringProcessor:
 
         h, w = frame.shape[:2]
         r = self.probe_radius
+        base_x_i = int(round(float(base_x)))
+        base_y_i = int(round(float(base_y)))
         values = []
 
         for dx, dy in self.probe_offsets:
-            px = base_x + dx
-            py = base_y + dy
-            x1 = max(0, px - r)
-            y1 = max(0, py - r)
-            x2 = min(w, px + r)
-            y2 = min(h, py + r)
+            px = int(base_x_i + dx)
+            py = int(base_y_i + dy)
+            x1 = max(0, int(px - r))
+            y1 = max(0, int(py - r))
+            x2 = min(w, int(px + r))
+            y2 = min(h, int(py + r))
             if x2 <= x1 or y2 <= y1:
                 continue
             roi = frame[y1:y2, x1:x2]
@@ -1020,14 +1035,16 @@ class PouringProcessor:
         visible_h = frame.shape[0] * 2 // 3
         w = frame.shape[1]
         r = self.probe_radius
+        base_x_i = int(round(float(base_x)))
+        base_y_i = int(round(float(base_y)))
         boxes = []
         for dx, dy in self.probe_offsets:
-            px = base_x + dx
-            py = base_y + dy
-            x1 = max(0, px - r)
-            y1 = max(0, py - r)
-            x2 = min(w, px + r)
-            y2 = min(visible_h, py + r)
+            px = int(base_x_i + dx)
+            py = int(base_y_i + dy)
+            x1 = max(0, int(px - r))
+            y1 = max(0, int(py - r))
+            x2 = min(w, int(px + r))
+            y2 = min(visible_h, int(py + r))
             if x2 > x1 and y2 > y1:
                 boxes.append((x1, y1, x2, y2))
         if not boxes:
@@ -1136,8 +1153,7 @@ class PouringProcessor:
         hold = 0
         for idx in range(1, len(samples)):
             curr_x, curr_y = samples[idx]["norm"]
-            dist = math.sqrt((curr_x - anchor_x) ** 2 + (curr_y - anchor_y) ** 2)
-            if dist > self.displacement_thresh:
+            if math.sqrt((curr_x - anchor_x) ** 2 + (curr_y - anchor_y) ** 2) > self.displacement_thresh:
                 hold += 1
             else:
                 hold = 0
@@ -1270,30 +1286,42 @@ class PouringProcessor:
         if not self.heat_cycle_manager:
             return
 
+        # Group segments by spatial cluster — one MouldPouringRecord per cluster.
+        by_cluster = defaultdict(list)
         for record in self.mould_records:
-            slot_id = record["slot_id"]
+            by_cluster[record["cluster_id"]].append(record)
+
+        for cid in sorted(by_cluster):
+            slot_id = f"C{cid}"
             if slot_id in self._synced_mould_slot_ids:
                 continue
 
-            ladle_track_id = int(record.get("ladle_track_id") or self.locked_trolley_id or 0)
+            recs = by_cluster[cid]
+            ladle_track_id = int(
+                recs[0].get("ladle_track_id") or self.locked_trolley_id or 0
+            )
             if ladle_track_id <= 0:
                 continue
 
+            total_dur = sum(float(r["duration_s"]) for r in recs)
+            start_rec = min(recs, key=lambda r: r["start_time_wall"])
+            end_rec = max(recs, key=lambda r: r["end_time_wall"])
+
             self.heat_cycle_manager.add_pouring_to_cycle(
                 ladle_track_id=ladle_track_id,
-                mould_id=f"MOULD_{slot_id}",
+                mould_id=f"MOULD_C{cid}",
                 mould_track_id=ladle_track_id,
-                start_time=record["start_time_wall"],
-                start_datetime=record["start_datetime_obj"],
+                start_time=start_rec["start_time_wall"],
+                start_datetime=start_rec["start_datetime_obj"],
                 sync_id=self.pour_sync_id or "",
                 slno=self.pour_slno or 0,
             )
             self.heat_cycle_manager.update_pouring_end(
                 ladle_track_id=ladle_track_id,
-                mould_id=f"MOULD_{slot_id}",
-                end_time=record["end_time_wall"],
-                end_datetime=record["end_datetime_obj"],
-                duration_seconds=float(record["duration_s"]),
+                mould_id=f"MOULD_C{cid}",
+                end_time=end_rec["end_time_wall"],
+                end_datetime=end_rec["end_datetime_obj"],
+                duration_seconds=total_dur,
             )
             self._synced_mould_slot_ids.add(slot_id)
 
@@ -1477,7 +1505,10 @@ class PouringProcessor:
         if not self.pour_active or self.pour_start_time is None:
             return
 
-        duration = timestamp - self.pour_start_time
+        # Back-date pour end to when brightness dropped, not when the hold-count completed
+        effective_end_ts = timestamp - self.pour_end_dur
+        effective_end_dt = datetime_obj - timedelta(seconds=self.pour_end_dur)
+        duration = effective_end_ts - self.pour_start_time
         self.pour_active = False
         self.brightness_above_since = None
         self.brightness_below_since = None
@@ -1568,7 +1599,7 @@ class PouringProcessor:
             }
             self.db_manager.update_pouring_end(
                 sync_id=self.pour_sync_id,
-                pouring_end_time=datetime_obj.isoformat(),
+                pouring_end_time=effective_end_dt.isoformat(),
                 total_pouring_time=str(int(duration)),
                 mould_wise_pouring_time=mould_wise,
             )
@@ -1578,7 +1609,7 @@ class PouringProcessor:
         # Screenshot (include last known probe points)
         probe_base = self._last_probe_base or self._get_probe_base_from_mouths(mouths)
         self._save_event_screenshot(
-            "POUR END", mouths, trolleys, frame, datetime_obj,
+            "POUR END", mouths, trolleys, frame, effective_end_dt,
             probe_point=probe_base,
             probe_brightness=self._last_probe_brightness,
             extra_info=f"Duration: {duration:.1f}s  Moulds: {self.mould_count}"
@@ -1612,28 +1643,14 @@ class PouringProcessor:
         )
 
     def _normalize_mouth_position(self, mouth, trolley):
-        """Normalize mouth center to [0,1] in the expanded trolley coordinate space."""
-        native_norm = mouth.get('native_norm') if mouth else None
-        if native_norm is not None:
-            tx1, ty1, tx2, ty2 = self._get_mould_norm_bbox(trolley)
-            tw = max(tx2 - tx1, 1)
-            th = max(ty2 - ty1, 1)
-            return (
-                max(0.0, min(1.0, float(native_norm[0]))),
-                max(0.0, min(1.0, float(native_norm[1]))),
-                tw,
-                th,
-            )
-
-        mx, my = mouth['center']
-        tx1, ty1, tx2, ty2 = self._get_mould_norm_bbox(trolley)
+        """Normalize probe point to [0,1] in the raw trolley coordinate space."""
+        px, py = self._mouth_probe_point(mouth)
+        tx1, ty1, tx2, ty2 = trolley['bbox']
         tw = max(tx2 - tx1, 1)
         th = max(ty2 - ty1, 1)
-        norm_x = (mx - tx1) / tw
-        norm_y = (my - ty1) / th
         return (
-            max(0.0, min(1.0, norm_x)),
-            max(0.0, min(1.0, norm_y)),
+            max(0.0, min(1.0, (px - tx1) / tw)),
+            max(0.0, min(1.0, (py - ty1) / th)),
             tw,
             th,
         )
