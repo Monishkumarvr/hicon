@@ -37,7 +37,8 @@ class BrightnessProcessor:
     """
 
     def __init__(self, zones_config, db_manager, config, screenshot_dir,
-                 heat_cycle_manager=None, enable_display_meta=True):
+                 heat_cycle_manager=None, enable_display_meta=True,
+                 enable_tapping=True, enable_deslagging=True, enable_spectro=True):
         """
         Args:
             zones_config: Dict with tapping/deslagging/spectro zone configs from zones.json
@@ -51,6 +52,9 @@ class BrightnessProcessor:
         self.config = config
         self.heat_cycle_manager = heat_cycle_manager
         self.enable_display_meta = enable_display_meta
+        self.enable_tapping = enable_tapping
+        self.enable_deslagging = enable_deslagging
+        self.enable_spectro = enable_spectro
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.customer_id = config.CUSTOMER_ID
@@ -87,16 +91,22 @@ class BrightnessProcessor:
         # State machines
         self.tapping_tracker = BrightnessTracker(
             name="tapping",
-            brightness_threshold=self._tapping_config.get('brightness_threshold', 180),
-            start_white_ratio=self._tapping_config.get('start_white_ratio', 0.80),
-            start_frame_count=self._tapping_config.get('start_frame_count', 10),
-            end_white_ratio=self._tapping_config.get('end_white_ratio', 0.60),
-            end_frame_count=self._tapping_config.get('end_frame_count', 20),
+            brightness_threshold=self._tapping_config.get(
+                'abs_brightness_threshold',
+                self._tapping_config.get('brightness_threshold', 210),
+            ),
+            start_white_ratio=self._tapping_config.get('start_white_ratio', 0.25),
+            start_frame_count=self._tapping_config.get('start_frame_count', 20),
+            end_white_ratio=self._tapping_config.get('end_white_ratio', 0.10),
+            end_frame_count=self._tapping_config.get('end_frame_count', 25),
         )
 
         self.deslagging_tracker = BrightnessTracker(
             name="deslagging",
-            brightness_threshold=self._deslagging_config.get('brightness_threshold', 250),
+            brightness_threshold=self._deslagging_config.get(
+                'brightness_threshold',
+                self._deslagging_config.get('brightness_thresh', 250),
+            ),
             start_white_ratio=self._deslagging_config.get('start_white_ratio', 0.01),
             start_frame_count=self._deslagging_config.get('start_frame_count', 10),
             end_white_ratio=self._deslagging_config.get('end_white_ratio', 0.01),
@@ -105,7 +115,10 @@ class BrightnessProcessor:
 
         self.spectro_tracker = BrightnessTracker(
             name="spectro",
-            brightness_threshold=self._spectro_config.get('brightness_threshold', 250),
+            brightness_threshold=self._spectro_config.get(
+                'brightness_threshold',
+                self._spectro_config.get('brightness_thresh', 250),
+            ),
             start_white_ratio=self._spectro_config.get('start_white_ratio', 0.03),
             start_frame_count=self._spectro_config.get('start_frame_count', 10),
             end_white_ratio=self._spectro_config.get('end_white_ratio', 0.03),
@@ -113,13 +126,40 @@ class BrightnessProcessor:
             max_white_ratio=self._spectro_config.get('max_white_ratio', 0.20),
         )
 
-        logger.info("BrightnessProcessor initialized (tapping + deslagging + spectro)")
+        enabled_detectors = []
+        if self.enable_tapping:
+            enabled_detectors.append("tapping")
+        if self.enable_deslagging:
+            enabled_detectors.append("deslagging")
+        if self.enable_spectro:
+            enabled_detectors.append("spectro")
+        enabled_label = " + ".join(enabled_detectors) if enabled_detectors else "none"
+        logger.info("BrightnessProcessor initialized (%s)", enabled_label)
 
     def _scale_pts(self, pts):
         """Scale zone coordinates from calibration resolution to actual frame resolution."""
         if self._sx == 1.0 and self._sy == 1.0:
             return pts
         return [[int(round(x * self._sx)), int(round(y * self._sy))] for x, y in pts]
+
+    def _get_zone_pts_list(self, cfg):
+        """Return list of polygon arrays from config, handling both flat and multi-zone formats.
+
+        Flat (legacy):  {"roi_points": [[x,y], ...], ...}
+        Multi-zone:     {"zones": {"zone-1": {"roi_points": [[x,y], ...]}, ...}, ...}
+        """
+        pts_list = []
+        zones = cfg.get('zones', {})
+        if zones:
+            for zone in zones.values():
+                pts = self._scale_pts(zone.get('roi_points', []))
+                if pts:
+                    pts_list.append(np.array(pts, dtype=np.int32))
+        else:
+            pts = self._scale_pts(cfg.get('roi_points', []))
+            if pts:
+                pts_list.append(np.array(pts, dtype=np.int32))
+        return pts_list
 
     def _build_masks(self, frame_h, frame_w):
         """Build ROI masks once we know frame dimensions."""
@@ -132,32 +172,29 @@ class BrightnessProcessor:
                 f"{frame_w}x{frame_h} (frame) — sx={self._sx:.3f}, sy={self._sy:.3f}"
             )
 
-        # Tapping quad ROI
-        tapping_pts = self._scale_pts(self._tapping_config.get('roi_points', []))
-        if tapping_pts:
-            pts = np.array(tapping_pts, dtype=np.int32)
+        # Tapping ROI (flat or multi-zone)
+        tapping_polys = self._get_zone_pts_list(self._tapping_config)
+        if tapping_polys:
             self._tapping_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-            cv2.fillPoly(self._tapping_mask, [pts], 255)
+            cv2.fillPoly(self._tapping_mask, tapping_polys, 255)
             self._tapping_pixel_count = int(np.sum(self._tapping_mask > 0))
-            logger.info(f"Tapping ROI mask: {self._tapping_pixel_count} pixels")
+            logger.info(f"Tapping ROI mask: {len(tapping_polys)} zone(s), {self._tapping_pixel_count} pixels")
 
-        # Deslagging polygon ROI
-        deslag_pts = self._scale_pts(self._deslagging_config.get('roi_points', []))
-        if deslag_pts:
-            pts = np.array(deslag_pts, dtype=np.int32)
+        # Deslagging ROI (flat or multi-zone)
+        deslag_polys = self._get_zone_pts_list(self._deslagging_config)
+        if deslag_polys:
             self._deslagging_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-            cv2.fillPoly(self._deslagging_mask, [pts], 255)
+            cv2.fillPoly(self._deslagging_mask, deslag_polys, 255)
             self._deslagging_pixel_count = int(np.sum(self._deslagging_mask > 0))
-            logger.info(f"Deslagging ROI mask: {self._deslagging_pixel_count} pixels")
+            logger.info(f"Deslagging ROI mask: {len(deslag_polys)} zone(s), {self._deslagging_pixel_count} pixels")
 
-        # Spectro polygon ROI
-        spectro_pts = self._scale_pts(self._spectro_config.get('roi_points', []))
-        if spectro_pts:
-            pts = np.array(spectro_pts, dtype=np.int32)
+        # Spectro ROI (flat or multi-zone)
+        spectro_polys = self._get_zone_pts_list(self._spectro_config)
+        if spectro_polys:
             self._spectro_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-            cv2.fillPoly(self._spectro_mask, [pts], 255)
+            cv2.fillPoly(self._spectro_mask, spectro_polys, 255)
             self._spectro_pixel_count = int(np.sum(self._spectro_mask > 0))
-            logger.info(f"Spectro ROI mask: {self._spectro_pixel_count} pixels")
+            logger.info(f"Spectro ROI mask: {len(spectro_polys)} zone(s), {self._spectro_pixel_count} pixels")
 
         self._masks_built = True
 
@@ -167,7 +204,7 @@ class BrightnessProcessor:
         Molten metal brightness during tapping/pouring causes false deslagging triggers.
         """
         # Suppress during active tapping
-        if self.tapping_tracker.is_active:
+        if self.tapping_tracker.is_active or self.tapping_tracker.start_counter > 0:
             return True
 
         # Suppress during active pouring cycle (trolley locked = pouring in progress)
@@ -211,37 +248,108 @@ class BrightnessProcessor:
                 self._build_masks(frame_h, frame_w)
 
             # Process tapping zone
-            if self._tapping_mask is not None and self._tapping_pixel_count > 0:
+            if self.enable_tapping and self._tapping_mask is not None and self._tapping_pixel_count > 0:
                 self._process_zone(
                     gray, self._tapping_mask, self._tapping_pixel_count,
                     self.tapping_tracker, frame_for_ss
                 )
 
             # Process deslagging zone (suppressed during tapping or active pouring cycle)
-            if self._deslagging_mask is not None and self._deslagging_pixel_count > 0:
+            if self.enable_deslagging and self._deslagging_mask is not None and self._deslagging_pixel_count > 0:
                 if self._is_deslagging_suppressed():
                     # Reset tracker counters so partial counts don't carry over
                     self.deslagging_tracker.start_counter = 0
                     self.deslagging_tracker.end_counter = 0
                 else:
-                    self._process_zone(
-                        gray, self._deslagging_mask, self._deslagging_pixel_count,
-                        self.deslagging_tracker, frame_for_ss
-                    )
+                    # Check if we should use blob detection for deslagging
+                    if "min_blob_area" in self._deslagging_config:
+                        self._process_zone_blobs(
+                            gray, self._deslagging_mask, self._deslagging_pixel_count,
+                            self.deslagging_tracker, self._deslagging_config, frame_for_ss
+                        )
+                    else:
+                        self._process_zone(
+                            gray, self._deslagging_mask, self._deslagging_pixel_count,
+                            self.deslagging_tracker, frame_for_ss
+                        )
 
             # Process spectro zone (suppressed during tapping or active pouring cycle)
-            if self._spectro_mask is not None and self._spectro_pixel_count > 0:
+            if self.enable_spectro and self._spectro_mask is not None and self._spectro_pixel_count > 0:
                 if self._is_deslagging_suppressed():
                     self.spectro_tracker.start_counter = 0
                     self.spectro_tracker.end_counter = 0
                 else:
-                    self._process_zone(
-                        gray, self._spectro_mask, self._spectro_pixel_count,
-                        self.spectro_tracker, frame_for_ss
-                    )
+                    # Check if we should use blob detection for spectro
+                    if "min_blob_area" in self._spectro_config:
+                        self._process_zone_blobs(
+                            gray, self._spectro_mask, self._spectro_pixel_count,
+                            self.spectro_tracker, self._spectro_config, frame_for_ss
+                        )
+                    else:
+                        self._process_zone(
+                            gray, self._spectro_mask, self._spectro_pixel_count,
+                            self.spectro_tracker, frame_for_ss
+                        )
 
         except Exception as e:
             logger.error(f"BrightnessProcessor error: {e}", exc_info=True)
+
+    def _process_zone_blobs(self, gray, mask, pixel_count, tracker, zone_cfg, frame_rgba):
+        """Process a single zone using molten blob logic (contours)."""
+        threshold = tracker.brightness_threshold
+        min_area = zone_cfg.get("min_blob_area", 50)
+        max_ar = zone_cfg.get("max_aspect_ratio", 0.0)
+        max_cov = zone_cfg.get("max_coverage", 0.0)
+
+        # 1. Threshold within ROI
+        # We need a copy of the ROI area or apply threshold on white-on-black mask
+        # Optimization: use cv2.bitwise_and if gray is not already masked
+        _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        # Apply mask
+        thresh = cv2.bitwise_and(thresh, mask)
+
+        # 2. Find Contours (Blobs)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        valid_blobs = []
+        max_blob_area = 0.0
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+
+            # Aspect Ratio check
+            if max_ar > 0.0:
+                x, y, w, h = cv2.boundingRect(cnt)
+                ar = max(w, h) / max(1.0, min(w, h))
+                if ar > max_ar:
+                    continue
+
+            # Coverage check (blob area / zone area)
+            if max_cov > 0.0:
+                coverage = area / pixel_count if pixel_count > 0 else 0.0
+                if coverage > max_cov:
+                    continue
+
+            # Valid blob found
+            valid_blobs.append(cnt)
+            max_blob_area = max(max_blob_area, area)
+
+        has_valid_blobs = len(valid_blobs) > 0
+        
+        # update white ratio for display purposes even if using blob logic
+        white_pixels = np.sum(thresh > 0)
+        white_ratio = white_pixels / pixel_count if pixel_count > 0 else 0.0
+        self._last_white_ratios[tracker.name] = white_ratio
+
+        # 3. Update Tracker
+        event = tracker.update_blob_logic(has_valid_blobs)
+        if event:
+            if event.get("phase") == "start":
+                self._handle_event_start(event, frame_rgba, white_ratio)
+            else:
+                self._handle_event(event, frame_rgba, white_ratio)
 
     def _process_zone(self, gray, mask, pixel_count, tracker, frame_rgba):
         """Process a single brightness zone."""
@@ -251,6 +359,23 @@ class BrightnessProcessor:
         white_pixels = np.sum((gray > threshold) & (mask > 0))
         white_ratio = white_pixels / pixel_count if pixel_count > 0 else 0.0
         self._last_white_ratios[tracker.name] = white_ratio
+
+        # Periodic per-frame tapping diagnostic log (~1s interval at 25fps)
+        if tracker.name == "tapping":
+            if not hasattr(self, '_tap_log_counter'):
+                self._tap_log_counter = 0
+            self._tap_log_counter += 1
+            if self._tap_log_counter >= 25:
+                self._tap_log_counter = 0
+                logger.info(
+                    "[tapping] ratio=%.3f (need>=%.2f) thresh=Y>%d on=%d/%d state=%s",
+                    white_ratio,
+                    tracker.start_white_ratio,
+                    tracker.brightness_threshold,
+                    tracker.start_counter,
+                    tracker.start_frame_count,
+                    "ACTIVE" if tracker.is_active else "IDLE",
+                )
 
         # Update state machine
         event = tracker.update(white_ratio)
@@ -356,9 +481,12 @@ class BrightnessProcessor:
                     line_idx += 1
 
             if max_lines > 0:
-                _add_roi_poly(self._scale_pts(self._tapping_config.get('roi_points', [])), (1.0, 0.65, 0.0, 1.0))
-                _add_roi_poly(self._scale_pts(self._deslagging_config.get('roi_points', [])), (1.0, 0.0, 0.0, 1.0))
-                _add_roi_poly(self._scale_pts(self._spectro_config.get('roi_points', [])), (0.0, 1.0, 1.0, 1.0))
+                for poly in self._get_zone_pts_list(self._tapping_config):
+                    _add_roi_poly(poly.tolist(), (1.0, 0.65, 0.0, 1.0))
+                for poly in self._get_zone_pts_list(self._deslagging_config):
+                    _add_roi_poly(poly.tolist(), (1.0, 0.0, 0.0, 1.0))
+                for poly in self._get_zone_pts_list(self._spectro_config):
+                    _add_roi_poly(poly.tolist(), (0.0, 1.0, 1.0, 1.0))
                 display_meta.num_lines = line_idx
                 display_meta.num_rects = 0
             else:
@@ -386,9 +514,12 @@ class BrightnessProcessor:
                     rect.border_color.set(*color)
                     rect_idx += 1
 
-                _add_roi_rect(self._scale_pts(self._tapping_config.get('roi_points', [])), (1.0, 0.65, 0.0, 1.0))
-                _add_roi_rect(self._scale_pts(self._deslagging_config.get('roi_points', [])), (1.0, 0.0, 0.0, 1.0))
-                _add_roi_rect(self._scale_pts(self._spectro_config.get('roi_points', [])), (0.0, 1.0, 1.0, 1.0))
+                for poly in self._get_zone_pts_list(self._tapping_config):
+                    _add_roi_rect(poly.tolist(), (1.0, 0.65, 0.0, 1.0))
+                for poly in self._get_zone_pts_list(self._deslagging_config):
+                    _add_roi_rect(poly.tolist(), (1.0, 0.0, 0.0, 1.0))
+                for poly in self._get_zone_pts_list(self._spectro_config):
+                    _add_roi_rect(poly.tolist(), (0.0, 1.0, 1.0, 1.0))
 
                 display_meta.num_rects = rect_idx
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
@@ -474,20 +605,20 @@ class BrightnessProcessor:
 
             # Pick ROI config and color per event type (coordinates scaled to frame resolution)
             if event_type == "tapping":
-                roi_pts = self._scale_pts(self._tapping_config.get('roi_points', []))
+                roi_pts_list = self._get_zone_pts_list(self._tapping_config)
                 roi_color = (0, 165, 255)  # Orange
                 threshold = self.tapping_tracker.brightness_threshold
             elif event_type == "spectro":
-                roi_pts = self._scale_pts(self._spectro_config.get('roi_points', []))
+                roi_pts_list = self._get_zone_pts_list(self._spectro_config)
                 roi_color = (255, 255, 0)  # Cyan
                 threshold = self.spectro_tracker.brightness_threshold
             else:
-                roi_pts = self._scale_pts(self._deslagging_config.get('roi_points', []))
+                roi_pts_list = self._get_zone_pts_list(self._deslagging_config)
                 roi_color = (0, 0, 255)  # Red
                 threshold = self.deslagging_tracker.brightness_threshold
 
-            # Draw ROI region with semi-transparent fill + outline
-            if roi_pts:
+            # Draw ROI regions with semi-transparent fill + outline (one per zone)
+            for roi_pts in roi_pts_list:
                 draw_roi_overlay(annotated, roi_pts, roi_color,
                                  label=f"{event_type.upper()} ROI", alpha=0.2)
 

@@ -59,6 +59,79 @@ class BrightnessTracker:
             f"end_ratio<{end_white_ratio} x{end_frame_count}f{max_info}"
         )
 
+    def update_blob_logic(self, has_valid_blobs: bool) -> Optional[Dict]:
+        """
+        Update state machine with boolean detection signal (e.g. from molten blob detection).
+        Reuses the same consecutive frame logic as update().
+
+        Args:
+            has_valid_blobs: True if at least one valid blob was detected in the zone.
+
+        Returns:
+            Event dict on state transition, None otherwise.
+        """
+        # We simulate a "white_ratio" of 1.0 (on) or 0.0 (off) to reuse the logic,
+        # but ignoring the max_white_ratio check since blob filtering already handles that.
+        if self.state == "IDLE":
+            if has_valid_blobs:
+                self.start_counter += 1
+                if self.start_counter >= self.start_frame_count:
+                    self.state = "ACTIVE"
+                    self.event_start_time = time.time()
+                    self.event_start_datetime = datetime.now()
+                    self.start_counter = 0
+                    self.end_counter = 0
+                    self._exceeded_max = False # Blob detection is pre-filtered
+                    logger.info(
+                        f"[{self.name}] ACTIVE (blob) - "
+                        f"sustained for {self.start_frame_count} frames"
+                    )
+                    return {
+                        "type": self.name,
+                        "phase": "start",
+                        "start": self.event_start_datetime.isoformat(),
+                        "start_wall": self.event_start_time,
+                        "start_datetime": self.event_start_datetime,
+                    }
+            else:
+                self.start_counter = 0
+
+        elif self.state == "ACTIVE":
+            if not has_valid_blobs:
+                self.end_counter += 1
+                if self.end_counter >= self.end_frame_count:
+                    end_time = time.time()
+                    end_datetime = datetime.now()
+                    duration = end_time - self.event_start_time
+
+                    event = {
+                        "type": self.name,
+                        "phase": "end",
+                        "start": self.event_start_datetime.isoformat(),
+                        "end": end_datetime.isoformat(),
+                        "duration_sec": round(duration, 1),
+                        "start_wall": self.event_start_time,
+                        "end_wall": end_time,
+                        "start_datetime": self.event_start_datetime,
+                        "end_datetime": end_datetime,
+                    }
+
+                    logger.info(
+                        f"[{self.name}] IDLE (blob) - event ended, duration={duration:.1f}s"
+                    )
+
+                    self.state = "IDLE"
+                    self.end_counter = 0
+                    self.start_counter = 0
+                    self.event_start_time = None
+                    self.event_start_datetime = None
+
+                    return event
+            else:
+                self.end_counter = 0
+
+        return None
+
     def update(self, white_ratio: float) -> Optional[Dict]:
         """
         Update state machine with new frame's white ratio.
