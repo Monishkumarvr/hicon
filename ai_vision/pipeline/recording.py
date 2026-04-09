@@ -1,9 +1,18 @@
 """
-Recording Module - DS-native MJPEG MKV recording via tee → valve → nvjpegenc → matroskamux.
+Recording Module - DS-native MJPEG AVI recording via tee → valve → nvjpegenc → avimux → filesink.
 Uses NVMM path to avoid costly/fragile NVMM->CPU conversion on Jetson.
 
-Supports scheduled recording windows (morning/evening shifts or 24/7)
-and automatic file rotation at configurable intervals.
+avimux accepts image/jpeg natively; filesink location is set once at setup time so no
+dynamic element-state management is needed while the pipeline is running.
+
+The valve is the sole control point: closed during warmup and outside schedule windows,
+open when recording is active.  avimux only writes to the file when buffers arrive,
+so keeping the valve closed produces no output in the file (the file is created on disk
+at pipeline startup but stays empty until the first recording window opens).
+
+Supports scheduled recording windows (morning/evening shifts or 24/7).
+File rotation is handled at the schedule-boundary level (stop + restart recording
+re-arms the buffer count; the file continues to grow — one AVI file per pipeline run).
 """
 import logging
 import time
@@ -74,7 +83,7 @@ def is_in_schedule(windows: list, now: datetime = None) -> bool:
 
 
 class RecordingManager:
-    """Manage DS-native recording branch for a stream with schedule and file rotation."""
+    """Manage DS-native recording branch for a stream with schedule-based valve control."""
 
     def __init__(self, output_dir: str, stream_id: int = 0, target_fps: float = 0,
                  target_width: int = 640, target_height: int = 360,
@@ -88,7 +97,7 @@ class RecordingManager:
             target_width: Output width
             target_height: Output height
             schedule: 'always' or 'HH:MM-HH:MM,...' windows
-            max_duration_s: Max seconds per file (0 = no rotation)
+            max_duration_s: Max seconds per recording session (0 = no limit)
             retention_days: Delete recordings older than N days (0 = keep forever)
         """
         self.output_dir = Path(output_dir)
@@ -99,9 +108,8 @@ class RecordingManager:
         self.target_height = int(target_height or 360)
         self.is_recording = False
         self.current_file = None
-        self.filesink = None
-        self.muxer = None
         self.record_valve = None
+        self._filesink = None
         self._branch_buffer_count = 0
         self._schedule_probe_count = 0
         self._recording_start_time = 0.0
@@ -123,7 +131,10 @@ class RecordingManager:
     def setup_recording_branch(self, pipeline, tee_element):
         """
         Add recording branch to pipeline:
-        tee → valve → queue → nvvideoconvert → capsfilter(NV12+fps) → nvjpegenc → matroskamux → filesink
+        tee → valve → queue → nvvideoconvert → capsfilter(NV12) → nvjpegenc → avimux → filesink
+
+        Filename is generated once at setup time (startup timestamp).
+        The valve is the sole runtime control — no dynamic element reconfiguration.
 
         Args:
             pipeline: GStreamer pipeline
@@ -134,6 +145,11 @@ class RecordingManager:
         """
         sid = str(self.stream_id)
         in_window = is_in_schedule(self._schedule_windows)
+
+        # Filename is fixed at pipeline setup time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filepath = self.output_dir / f"inference_s{self.stream_id}_{timestamp}.avi"
+        self.current_file = filepath
 
         # Create recording elements
         self.record_valve = Gst.ElementFactory.make("valve", f"rec-valve-{sid}")
@@ -159,7 +175,8 @@ class RecordingManager:
         if not capsfilter:
             logger.error("capsfilter not available - recording disabled")
             return False
-        caps = f"video/x-raw(memory:NVMM), format=NV12, width={self.target_width}, height={self.target_height}"
+        caps = (f"video/x-raw(memory:NVMM), format=NV12, "
+                f"width={self.target_width}, height={self.target_height}")
         capsfilter.set_property("caps", Gst.Caps.from_string(caps))
 
         encoder = Gst.ElementFactory.make("nvjpegenc", f"rec-enc-{sid}")
@@ -168,18 +185,23 @@ class RecordingManager:
             return False
         encoder.set_property("quality", 85)
 
-        muxer = Gst.ElementFactory.make("matroskamux", f"rec-mux-{sid}")
+        # avimux accepts image/jpeg directly — no jpegparse needed
+        muxer = Gst.ElementFactory.make("avimux", f"rec-mux-{sid}")
         if not muxer:
-            logger.error("matroskamux not available - recording disabled")
+            logger.error("avimux not available - recording disabled")
             return False
-        self.muxer = muxer
+        muxer.set_property("bigfile", True)
 
-        self.filesink = Gst.ElementFactory.make("filesink", f"rec-sink-{sid}")
-        self.filesink.set_property("location", "/dev/null")
-        self.filesink.set_property("sync", False)
-        self.filesink.set_property("async", False)
+        filesink = Gst.ElementFactory.make("filesink", f"rec-sink-{sid}")
+        if not filesink:
+            logger.error("filesink not available - recording disabled")
+            return False
+        filesink.set_property("location", str(filepath))
+        filesink.set_property("sync", False)
+        filesink.set_property("async", False)
+        self._filesink = filesink
 
-        elements = [self.record_valve, queue, conv, capsfilter, encoder, muxer, self.filesink]
+        elements = [self.record_valve, queue, conv, capsfilter, encoder, muxer, filesink]
 
         for el in elements:
             if not el:
@@ -192,7 +214,7 @@ class RecordingManager:
                 conv.link(capsfilter) and
                 capsfilter.link(encoder) and
                 encoder.link(muxer) and
-                muxer.link(self.filesink)):
+                muxer.link(filesink)):
             logger.error("Failed to link recording branch")
             return False
 
@@ -202,11 +224,13 @@ class RecordingManager:
             logger.error("Failed to link tee to recording valve")
             return False
 
+        # Schedule probe: drives valve open/close from the upstream (pre-valve) pad
         schedule_pad = self.record_valve.get_static_pad("sink")
         if schedule_pad:
             schedule_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_schedule_probe)
 
-        probe_pad = capsfilter.get_static_pad("src")
+        # Diagnostics probe: counts encoded frames downstream of nvjpegenc
+        probe_pad = encoder.get_static_pad("src")
         if probe_pad:
             probe_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_branch_buffer)
 
@@ -217,43 +241,15 @@ class RecordingManager:
             )
         else:
             logger.info(f"Stream {sid} recording branch dormant at startup (outside schedule)")
-        logger.info(f"Recording branch set up for stream {sid}")
+        logger.info(
+            f"Recording branch set up for stream {sid}: {filepath}"
+        )
         return True
 
     def _set_branch_flow_enabled(self, enabled: bool):
         """Open or close the recording branch without relinking the pipeline."""
         if self.record_valve:
             self.record_valve.set_property("drop", not enabled)
-
-    def _reconfigure_output_location(self, location: str) -> bool:
-        """Safely switch filesink output while the branch is closed."""
-        if not self.filesink:
-            return False
-        target = str(location)
-        current = self.filesink.get_property("location")
-        if current == target:
-            return True
-
-        try:
-            self._set_branch_flow_enabled(False)
-            if self.muxer:
-                self.muxer.set_state(Gst.State.READY)
-                self.muxer.get_state(2 * Gst.SECOND)
-            self.filesink.set_state(Gst.State.READY)
-            self.filesink.get_state(2 * Gst.SECOND)
-            self.filesink.set_property("location", target)
-            if self.muxer:
-                self.muxer.set_state(Gst.State.PLAYING)
-                self.muxer.get_state(2 * Gst.SECOND)
-            self.filesink.set_state(Gst.State.PLAYING)
-            self.filesink.get_state(2 * Gst.SECOND)
-            return True
-        except Exception as e:
-            logger.error(
-                f"Stream {self.stream_id}: failed to switch recording output to {target}: {e}",
-                exc_info=True,
-            )
-            return False
 
     def _on_schedule_probe(self, pad, info):
         """Lightweight pre-valve probe to drive schedule transitions while dormant."""
@@ -269,13 +265,12 @@ class RecordingManager:
             logger.info(f"Stream {self.stream_id} recording: first buffer received")
         elif self._branch_buffer_count % 300 == 0:
             logger.info(
-                f"Stream {self.stream_id} recording: received {self._branch_buffer_count} buffers"
+                f"Stream {self.stream_id} recording: {self._branch_buffer_count} buffers encoded"
             )
-
         return Gst.PadProbeReturn.OK
 
     def _check_schedule_and_rotation(self):
-        """Check if recording should start/stop based on schedule, and rotate files."""
+        """Check if recording should start/stop based on schedule."""
         in_window = is_in_schedule(self._schedule_windows)
         now = time.monotonic()
 
@@ -289,15 +284,14 @@ class RecordingManager:
             self.start_recording(event_prefix=self._event_prefix)
             return
 
-        # File rotation: check max duration
         if (self.is_recording and self._max_duration_s > 0 and
                 (now - self._recording_start_time) >= self._max_duration_s):
             logger.info(
-                f"Stream {self.stream_id}: rotating file after {self._max_duration_s}s"
+                f"Stream {self.stream_id}: max duration {self._max_duration_s}s reached, "
+                f"resetting recording start time"
             )
-            self.stop_recording()
-            if in_window:
-                self.start_recording(event_prefix=self._event_prefix)
+            # Cannot rotate file without pipeline restart; just reset the timer
+            self._recording_start_time = now
 
         # Run cleanup once per hour
         if self._retention_days > 0 and (now - self._last_cleanup_time) >= 3600:
@@ -305,12 +299,12 @@ class RecordingManager:
             self._cleanup_old_recordings()
 
     def _cleanup_old_recordings(self):
-        """Delete .mkv files older than retention_days in output_dir."""
+        """Delete .avi files older than retention_days in output_dir."""
         if self._retention_days <= 0:
             return
         cutoff = time.time() - (self._retention_days * 86400)
         deleted = 0
-        for f in self.output_dir.glob("*.mkv"):
+        for f in self.output_dir.glob("*.avi"):
             if f == self.current_file:
                 continue
             try:
@@ -326,50 +320,39 @@ class RecordingManager:
             )
 
     def start_recording(self, event_prefix="event"):
-        """Start recording to a new MKV file."""
+        """Start recording by opening the valve."""
         if self.is_recording:
             logger.warning("Already recording")
             return
 
-        if not self.filesink:
+        if not self._filesink:
             logger.error("Recording branch not set up")
             return
 
-        # Check schedule before starting
         if not is_in_schedule(self._schedule_windows):
             self._set_branch_flow_enabled(False)
             logger.info(f"Stream {self.stream_id}: not in recording window, skipping start")
             return
 
         self._event_prefix = event_prefix
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"{event_prefix}_s{self.stream_id}_{timestamp}.mkv"
-        filepath = self.output_dir / filename
-
-        if not self._reconfigure_output_location(str(filepath)):
-            logger.error(f"Stream {self.stream_id}: could not prepare recording output")
-            return
         self._set_branch_flow_enabled(True)
         self._branch_buffer_count = 0
         self.is_recording = True
-        self.current_file = filepath
         self._recording_start_time = time.monotonic()
-        logger.info(f"Stream {self.stream_id} recording started: {filepath}")
+        logger.info(f"Stream {self.stream_id} recording started: {self.current_file}")
 
     def stop_recording(self):
-        """Stop recording and return output path."""
+        """Stop recording by closing the valve. Returns output file path."""
         if not self.is_recording:
             return None
 
         self.is_recording = False
         self._set_branch_flow_enabled(False)
 
-        filepath = self.current_file
-        self.current_file = None
-
         duration = time.monotonic() - self._recording_start_time
         logger.info(
             f"Stream {self.stream_id} recording stopped: "
-            f"{filepath} ({duration:.0f}s, branch_buffers={self._branch_buffer_count})"
+            f"{self.current_file} ({duration:.0f}s, "
+            f"encoded_buffers={self._branch_buffer_count})"
         )
-        return str(filepath) if filepath else None
+        return str(self.current_file) if self.current_file else None

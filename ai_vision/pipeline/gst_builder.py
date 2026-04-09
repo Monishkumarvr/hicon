@@ -45,6 +45,7 @@ class DeepStreamPipelineBuilder:
                 - config_pyrometer: Path to pyrometer nvinfer config
                 - tracker_lib: Path to tracker library
                 - tracker_config: Path to tracker config
+                - stream_0_tracker_config: Optional Stream 0 tracker config override
         """
         self.config = config
         self.pipeline = None
@@ -65,11 +66,21 @@ class DeepStreamPipelineBuilder:
         self.stream0_analysis_rgba_enabled = bool(
             config.get('stream_0_analysis_rgba_enabled', True)
         )
-        self.stream0_analysis_cpp_plugin_enabled = bool(
-            config.get('stream_0_analysis_cpp_plugin_enabled', True)
-        )
         self.stream0_analysis_probe_enabled = bool(
             config.get('stream_0_analysis_probe_enabled', True)
+        )
+        self.stream0_mux_width = int(config.get('stream_0_mux_width', 1280) or 1280)
+        self.stream0_mux_height = int(config.get('stream_0_mux_height', 720) or 720)
+        self.stream0_tracker_width = int(config.get('stream_0_tracker_width', 640) or 640)
+        self.stream0_tracker_height = int(config.get('stream_0_tracker_height', 384) or 384)
+        self.stream0_tracker_config = str(
+            config.get('stream_0_tracker_config', config.get('tracker_config', '')) or ''
+        )
+        self.use_safe_cuda_brightness = bool(
+            config.get('use_safe_cuda_brightness', False)
+        )
+        self.stream0_melting_config_ini = str(
+            config.get('stream_0_melting_config_ini', '') or ''
         )
         self.use_segment_buffer_0 = bool(config.get('use_segment_buffer_0', False))
         self.segment_buffer_dir_0 = str(
@@ -116,6 +127,48 @@ class DeepStreamPipelineBuilder:
         if self.stream0_bypass_pgie and not self.stream0_bypass_tracker:
             logger.info("Stream 0: pgie bypass requested; tracker bypass forced on as well")
             self.stream0_bypass_tracker = True
+
+    def _is_native_rtsp_stream(self, stream_id):
+        """True when the stream uses rtspsrc or nvurisrcbin directly."""
+        if self._is_ffmpeg_stream(stream_id) or self._is_segment_buffer_stream(stream_id):
+            return False
+        if stream_id == 0:
+            return not self.use_udp_loopback_0 and bool(self.config.get('rtsp_stream_0'))
+        if stream_id == 1:
+            return bool(self.config.get('rtsp_stream_1'))
+        if stream_id == 2:
+            return not self.use_udp_loopback_2 and bool(self.config.get('rtsp_stream_2'))
+        return False
+
+    def get_restartable_stream_ids(self):
+        return {
+            sid for sid in (0, 1, 2)
+            if self._is_native_rtsp_stream(sid)
+        }
+
+    def schedule_stream_restart(self, stream_id, reason=""):
+        """Cycle a native RTSP source through NULL -> READY -> PLAYING."""
+        if not self._is_native_rtsp_stream(stream_id):
+            logger.warning("Stream %s: local restart not supported (%s)", stream_id, reason)
+            return False
+
+        source = self.elements.get(f"source{stream_id}")
+        if source is None:
+            logger.error("Stream %s: source element missing; cannot restart (%s)", stream_id, reason)
+            return False
+
+        logger.warning("Stream %s: restarting native RTSP source (%s)", stream_id, reason)
+        try:
+            for state in (Gst.State.NULL, Gst.State.READY, Gst.State.PLAYING):
+                source.set_state(state)
+                try:
+                    source.get_state(2 * Gst.SECOND)
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            logger.error("Stream %s: local restart failed (%s): %s", stream_id, reason, exc, exc_info=True)
+            return False
 
     def terminate_ffmpeg_procs(self):
         """Terminate all wrapper/helper subprocesses. Call on pipeline shutdown.
@@ -293,7 +346,7 @@ class DeepStreamPipelineBuilder:
             f"Stream {sid}: nvurisrcbin created "
             f"(reconnect-interval={reconnect_s}s, reconnect-attempts=unlimited, "
             f"protocol={'tcp' if protocol == 'tcp' else 'multi'}, latency={latency_ms}ms, "
-            f"drop-on-latency=True, num-extra-surfaces=16, "
+            f"drop-on-latency=True, num-extra-surfaces=8, "
             f"premuxq={queue_name} leaky=2 max-buffers=128 max-time=5s)"
         )
         return True
@@ -426,7 +479,7 @@ class DeepStreamPipelineBuilder:
         if self.elements[f'decoder{sid}']:
             decoder = self.elements[f'decoder{sid}']
             decoder.set_property('drop-frame-interval', 0)
-            decoder.set_property('num-extra-surfaces', 4)
+            decoder.set_property('num-extra-surfaces', 8)
             if stream_id == 0:
                 try:
                     decoder.set_property('disable-dpb', True)
@@ -565,7 +618,7 @@ class DeepStreamPipelineBuilder:
         if self.elements[f'decoder{sid}']:
             decoder = self.elements[f'decoder{sid}']
             decoder.set_property('drop-frame-interval', 0)
-            decoder.set_property('num-extra-surfaces', 4)
+            decoder.set_property('num-extra-surfaces', 8)
             if stream_id == 0:
                 try:
                     decoder.set_property('disable-dpb', True)
@@ -728,7 +781,7 @@ class DeepStreamPipelineBuilder:
         if self.elements[f'decoder{sid}']:
             decoder = self.elements[f'decoder{sid}']
             decoder.set_property('drop-frame-interval', 0)
-            decoder.set_property('num-extra-surfaces', 4)
+            decoder.set_property('num-extra-surfaces', 8)
             if stream_id == 0:
                 try:
                     decoder.set_property('disable-dpb', True)
@@ -882,7 +935,11 @@ class DeepStreamPipelineBuilder:
                     "(bypassing mux, OSD, and recording path)"
                 )
             elif self.stream0_postconv_only_mode:
-                self.elements['mux_0'] = self._create_streammux("mux-0")
+                self.elements['mux_0'] = self._create_streammux(
+                    "mux-0",
+                    width=self.stream0_mux_width,
+                    height=self.stream0_mux_height,
+                )
                 if not self.use_nvurisrcbin_0:
                     self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
                 else:
@@ -903,7 +960,11 @@ class DeepStreamPipelineBuilder:
                     "(isolating nvvideoconvert from RGBA caps, nvdsosd, and downstream path)"
                 )
             elif self.stream0_preosd_only_mode:
-                self.elements['mux_0'] = self._create_streammux("mux-0")
+                self.elements['mux_0'] = self._create_streammux(
+                    "mux-0",
+                    width=self.stream0_mux_width,
+                    height=self.stream0_mux_height,
+                )
                 if not self.use_nvurisrcbin_0:
                     self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
@@ -928,7 +989,11 @@ class DeepStreamPipelineBuilder:
                     "(isolating RGBA conversion from nvdsosd and downstream path)"
                 )
             elif self.stream0_postmux_only_mode:
-                self.elements['mux_0'] = self._create_streammux("mux-0")
+                self.elements['mux_0'] = self._create_streammux(
+                    "mux-0",
+                    width=self.stream0_mux_width,
+                    height=self.stream0_mux_height,
+                )
                 if not self.use_nvurisrcbin_0:
                     self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
@@ -941,7 +1006,11 @@ class DeepStreamPipelineBuilder:
                     "(isolating nvstreammux from OSD/render and recording path)"
                 )
             else:
-                self.elements['mux_0'] = self._create_streammux("mux-0")
+                self.elements['mux_0'] = self._create_streammux(
+                    "mux-0",
+                    width=self.stream0_mux_width,
+                    height=self.stream0_mux_height,
+                )
                 if not self.use_nvurisrcbin_0:
                     self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
                 else:
@@ -959,50 +1028,22 @@ class DeepStreamPipelineBuilder:
                 if not self.stream0_bypass_tracker:
                     self.elements['tracker_0'] = Gst.ElementFactory.make("nvtracker", "tracker-0")
                     self.elements['tracker_0'].set_property('ll-lib-file', self.config['tracker_lib'])
-                    self.elements['tracker_0'].set_property('ll-config-file', self.config['tracker_config'])
-                    self.elements['tracker_0'].set_property('tracker-width', 640)
-                    self.elements['tracker_0'].set_property('tracker-height', 384)
-
-                # C++ pouring detection plugin (state machine, mould counting, OSD overlays)
-                stream0_cpp_plugin_enabled = self.config.get('use_cpp_pouring_plugin', False) and (
-                    not self.stream0_decoupled_analysis_mode or (
-                        self.stream0_analysis_cpp_plugin_enabled and (
-                            self.stream0_analysis_branch_enabled
-                            or not self.stream0_analysis_probe_enabled
-                        )
-                    )
-                )
-                if stream0_cpp_plugin_enabled:
-                    self.elements['hicon_pouring_0'] = Gst.ElementFactory.make(
-                        "hicon_pouring_detect", "hicon-pouring-0"
-                    )
-                    if self.elements['hicon_pouring_0']:
-                        enable_cpp_osd = not self.stream0_decoupled_analysis_mode
-                        self.elements['hicon_pouring_0'].set_property('enable-osd', enable_cpp_osd)
-                        logger.info("Stream 0: C++ pouring plugin created (hicon_pouring_detect)")
-                        if enable_cpp_osd:
-                            logger.info("Stream 0: C++ pouring OSD enabled on main path before nvosd_0")
-                        else:
-                            logger.info("Stream 0: C++ pouring OSD disabled on metadata-only Stream 0 path")
-                    else:
-                        logger.error("Stream 0: Failed to create hicon_pouring_detect element. "
-                                     "Check GST_PLUGIN_PATH includes the plugin .so directory.")
-                elif self.config.get('use_cpp_pouring_plugin', False) and self.stream0_decoupled_analysis_mode:
-                    if not self.stream0_analysis_branch_enabled:
-                        logger.info(
-                            "Stream 0: C++ pouring plugin skipped because analysis branch is disabled "
-                            "for isolation"
-                        )
-                    else:
-                        logger.info(
-                            "Stream 0: C++ pouring plugin skipped on analysis branch for staged isolation"
-                        )
+                    self.elements['tracker_0'].set_property('ll-config-file', self.stream0_tracker_config)
+                    self.elements['tracker_0'].set_property('tracker-width', self.stream0_tracker_width)
+                    self.elements['tracker_0'].set_property('tracker-height', self.stream0_tracker_height)
 
                 self.elements['nvosd_0'] = Gst.ElementFactory.make("nvdsosd", "nvosd-0")
                 if self.elements['nvosd_0']:
                     # CPU mode is more stable on the headless inference/recording path when
                     # Python processors attach display_meta with lines/rects/text.
                     self.elements['nvosd_0'].set_property('process-mode', _NVDSOSD_MODE_CPU)
+                    if self.stream0_decoupled_analysis_mode:
+                        # Stream 0 decoupled mode keeps the display path NV12-only for stability.
+                        # On this path, attempting to draw PGIE/tracker rectangles has been the
+                        # live failure boundary ("Unable to draw rectangles"). Keep the element in
+                        # place for downstream topology, but turn off bbox/text rendering.
+                        self.elements['nvosd_0'].set_property('display-bbox', False)
+                        self.elements['nvosd_0'].set_property('display-text', False)
                 if self.stream0_decoupled_analysis_mode:
                     # In decoupled mode, no nvvideoconvert is placed on Stream 0.
                     # Any nvvideoconvert on Stream 0 combined with a pre-OSD tee causes
@@ -1016,6 +1057,44 @@ class DeepStreamPipelineBuilder:
                     if self.stream0_analysis_branch_enabled:
                         self.elements['analysisq0'] = Gst.ElementFactory.make("queue", "analysisq0")
                         self._configure_queue(self.elements['analysisq0'], max_buffers=2, leaky=2)
+                        if self.use_safe_cuda_brightness:
+                            self.elements['hicon_melting_0'] = Gst.ElementFactory.make(
+                                "hicon_melting_detect", "hicon-melting-0"
+                            )
+                            if self.elements['hicon_melting_0']:
+                                self.elements['hicon_melting_0'].set_property(
+                                    'config-ini', self.stream0_melting_config_ini
+                                )
+                                try:
+                                    tapping_zones = self.elements['hicon_melting_0'].get_property(
+                                        'tapping-zone-count'
+                                    )
+                                    deslagging_zones = self.elements['hicon_melting_0'].get_property(
+                                        'deslagging-zone-count'
+                                    )
+                                    spectro_zones = self.elements['hicon_melting_0'].get_property(
+                                        'spectro-zone-count'
+                                    )
+                                    logger.info(
+                                        "Stream 0: C++ melting config applied "
+                                        "(len=%d, zones=%s/%s/%s)",
+                                        len(self.stream0_melting_config_ini),
+                                        tapping_zones,
+                                        deslagging_zones,
+                                        spectro_zones,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Stream 0: Failed to read melting plugin zone counts "
+                                        "after config-ini apply"
+                                    )
+                                logger.info(
+                                    "Stream 0: C++ melting plugin created (hicon_melting_detect)"
+                                )
+                            else:
+                                logger.error(
+                                    "Stream 0: Failed to create hicon_melting_detect element"
+                                )
                         self.elements['analysis_sink0'] = Gst.ElementFactory.make(
                             "fakesink", "analysis-sink0"
                         )
@@ -1153,18 +1232,6 @@ class DeepStreamPipelineBuilder:
             self.elements['tracker_2'].set_property('ll-config-file', self.config['tracker_config'])
             self.elements['tracker_2'].set_property('tracker-width', 640)
             self.elements['tracker_2'].set_property('tracker-height', 384)
-
-            # C++ pouring detection plugin for stream 2 (same detector logic, second camera)
-            if self.config.get('use_cpp_pouring_plugin', False):
-                self.elements['hicon_pouring_2'] = Gst.ElementFactory.make(
-                    "hicon_pouring_detect", "hicon-pouring-2"
-                )
-                if self.elements['hicon_pouring_2']:
-                    self.elements['hicon_pouring_2'].set_property('enable-osd', True)
-                    logger.info("Stream 2: C++ pouring plugin created (hicon_pouring_detect)")
-                    logger.info("Stream 2: C++ pouring OSD enabled on main path before nvosd_2")
-                else:
-                    logger.error("Stream 2: Failed to create hicon_pouring_detect element. Check GST plugin load path.")
 
             # OSD for stream 2
             self.elements['nvvidconv_osd_2'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-2")
@@ -1402,26 +1469,12 @@ class DeepStreamPipelineBuilder:
                 if self.stream0_decoupled_analysis_mode:
                     chain_0.append((stream0_head, 'tee_stream0_analysis'))
                 else:
-                    # hicon_pouring_0 must be placed AFTER nvvidconv_osd_0 (post-RGBA copy).
-                    # Placing it before nvvidconv (on the raw NV12 NVMM buffer) causes
-                    # NvBufSurfaceMap to invalidate nvtracker's live cuDCF CUDA texture
-                    # cache, producing cudaErrorIllegalAddress at cuDCFFrameTransformTexture.
-                    cpp_plugin = self.elements.get('hicon_pouring_0')
-                    if cpp_plugin:
-                        chain_0.extend([
-                            (stream0_head, 'nvvidconv_osd_0'),
-                            ('nvvidconv_osd_0', 'caps_osd_0'),
-                            ('caps_osd_0', 'hicon_pouring_0'),
-                            ('hicon_pouring_0', 'preosdq0'),
-                            ('preosdq0', 'nvosd_0'),
-                        ])
-                    else:
-                        chain_0.extend([
-                            (stream0_head, 'nvvidconv_osd_0'),
-                            ('nvvidconv_osd_0', 'caps_osd_0'),
-                            ('caps_osd_0', 'preosdq0'),
-                            ('preosdq0', 'nvosd_0'),
-                        ])
+                    chain_0.extend([
+                        (stream0_head, 'nvvidconv_osd_0'),
+                        ('nvvidconv_osd_0', 'caps_osd_0'),
+                        ('caps_osd_0', 'preosdq0'),
+                        ('preosdq0', 'nvosd_0'),
+                    ])
                 for src_name, dst_name in chain_0:
                     if not self.elements[src_name].link(self.elements[dst_name]):
                         logger.error(f"Failed to link {src_name} -> {dst_name}")
@@ -1430,18 +1483,8 @@ class DeepStreamPipelineBuilder:
                     if not self._link_tee_src_to_element('tee_stream0_analysis', 'displayq0'):
                         return False
                     display_chain = []
-                    if 'hicon_pouring_0' in self.elements and self.elements.get('hicon_pouring_0') \
-                            and not self.stream0_analysis_probe_enabled:
-                        display_chain.extend([
-                            ('displayq0', 'hicon_pouring_0'),
-                            ('hicon_pouring_0', 'nvosd_0'),
-                        ])
-                        logger.info(
-                            "Stream 0: C++ pouring plugin placed on display path "
-                            "(main-path analysis fallback)"
-                        )
-                    else:
-                        display_chain.append(('displayq0', 'nvosd_0'))
+                    display_head = 'displayq0'
+                    display_chain.append((display_head, 'nvosd_0'))
                     for src_name, dst_name in display_chain:
                         if not self.elements[src_name].link(self.elements[dst_name]):
                             logger.error(f"Failed to link {src_name} -> {dst_name}")
@@ -1451,16 +1494,12 @@ class DeepStreamPipelineBuilder:
                             return False
                         analysis_chain = []
                         analysis_head = 'analysisq0'
-                        if (
-                            'hicon_pouring_0' in self.elements
-                            and self.elements.get('hicon_pouring_0')
-                            and self.stream0_analysis_probe_enabled
-                        ):
-                            analysis_chain.append(('analysisq0', 'hicon_pouring_0'))
-                            analysis_head = 'hicon_pouring_0'
+                        if 'hicon_melting_0' in self.elements and self.elements.get('hicon_melting_0'):
+                            analysis_chain.append((analysis_head, 'hicon_melting_0'))
+                            analysis_head = 'hicon_melting_0'
                             logger.info(
-                                "Stream 0: C++ pouring plugin placed on analysis branch "
-                                "(off main path)"
+                                "Stream 0: C++ melting plugin placed on analysis branch "
+                                "(metadata-only CUDA path)"
                             )
                         analysis_chain.append((analysis_head, 'analysis_sink0'))
                         for src_name, dst_name in analysis_chain:
@@ -1558,9 +1597,6 @@ class DeepStreamPipelineBuilder:
             chain_2.append(('mux_2', 'pgie_pouring_2'))
             chain_2.append(('pgie_pouring_2', 'tracker_2'))
             stream2_head = 'tracker_2'
-            if 'hicon_pouring_2' in self.elements and self.elements.get('hicon_pouring_2'):
-                chain_2.append(('tracker_2', 'hicon_pouring_2'))
-                stream2_head = 'hicon_pouring_2'
             chain_2.append((stream2_head, 'nvvidconv_osd_2'))
             chain_2.extend([
                 ('nvvidconv_osd_2', 'caps_osd_2'),

@@ -33,7 +33,7 @@
 **Pour Indicator:**
 - **Visible dot** 50px below mouth bbox bottom
 - Green filled circle (10px radius) with white border
-- Only appears when `brightness >= TH_ON (230)`
+- Only appears when `brightness >= TH_ON (240)`
 - **Position:** Horizontal center of mouth bbox, vertical = `y2 + 50px`
 
 **Panel Features:**
@@ -76,7 +76,7 @@ POURING INFERENCE | 2026-02-17 14:22:15 | SESSION:ON POUR:ON MOULDS:3 CLUSTERS:2
 |-----------|----------|------------|--------|
 | **Session Enter** | Mouth center in expanded trolley ≥1.0s | Same | ✅ |
 | **Session Exit** | Mouth absent >0.8s + 1.5s | Same | ✅ |
-| **Pour ON** | Brightness >230 for 0.25s | Same | ✅ |
+| **Pour ON** | Brightness >240 for 0.25s | Same | ✅ |
 | **Pour OFF** | Brightness <180 for 1.0s | Same | ✅ |
 | **Min Pour Duration** | 2.0s before mould switch | Same | ✅ |
 | **Trolley Locking** | Lock on first pour start | Same | ✅ |
@@ -238,7 +238,7 @@ st.mould_anchor_pt = mouth_pt_norm  # Update to new mould position
 **Pour Indicator (Large Visible Dot):**
 - **Position:** 50px below mouth bbox bottom, horizontally centered
 - **Style:** Green filled circle (12px radius), white border (2px)
-- **Visibility:** Only when `brightness >= 230`
+- **Visibility:** Only when `brightness >= 240`
 - **Label:** `B:245` next to dot
 
 ---

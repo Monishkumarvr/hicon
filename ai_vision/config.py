@@ -125,12 +125,22 @@ EDGE_EXPAND_PX = int(os.getenv('HICON_EDGE_EXPAND_PX', '180'))
 MOUTH_MISSING_TOL_S = float(os.getenv('HICON_MOUTH_MISSING_TOL_S', '0.6'))
 MOUTH_HOLD_S = float(os.getenv('HICON_MOUTH_HOLD_S', '0.4'))
 
+# How long to use frozen (phantom) trolley bbox when the real trolley disappears (e.g., occluded by ladle)
+PHANTOM_TROLLEY_TIMEOUT_S = float(os.getenv('HICON_PHANTOM_TROLLEY_TIMEOUT', '60.0'))
+
 # Multiple brightness probe offsets: (dx, dy) from mouth bottom-center
 POUR_PROBE_OFFSETS = [(0, 0), (12, 0), (-12, 0), (24, 0), (-24, 0)]
 POUR_PROBE_BELOW_PX = int(os.getenv('HICON_POUR_PROBE_BELOW_PX', '30'))
 
 # Pouring cycle timeout: mouth absent from locked trolley region (5 min)
-POURING_CYCLE_TIMEOUT_S = float(os.getenv('HICON_POURING_CYCLE_TIMEOUT', '300.0'))
+POURING_CYCLE_TIMEOUT_S = float(os.getenv('HICON_POURING_CYCLE_TIMEOUT', '600.0'))
+
+# Tapping-only cycle timeout: how long to wait for a pouring session after tapping ends (15 min)
+# Longer than POURING_CYCLE_TIMEOUT_S because the ladle travels from furnace to pouring station
+TAPPING_ONLY_CYCLE_TIMEOUT_S = float(os.getenv('HICON_TAPPING_ONLY_CYCLE_TIMEOUT', '900.0'))
+
+# Minimum pyrometer rod bbox area in pixels² — rejects small false-positive detections
+PYROMETER_MIN_AREA_PX2 = int(os.getenv('HICON_PYROMETER_MIN_AREA', '6000'))
 
 # Mould switch requires last pour >= this duration
 MOULD_SWITCH_MIN_POUR_S = float(os.getenv('HICON_MOULD_SWITCH_MIN_POUR', '2.0'))
@@ -141,15 +151,17 @@ MIN_CLUSTER_POUR_S = float(os.getenv('HICON_MIN_CLUSTER_POUR_S', '1.5'))
 # Enable per-frame CPU extraction for processors
 ENABLE_FRAME_PROCESSING = os.getenv('HICON_ENABLE_FRAME_PROCESSING', 'true').lower() == 'true'
 
-# C++ pouring detection plugin (replaces Python pouring_processor with compiled GstBaseTransform)
-USE_CPP_POURING_PLUGIN = os.getenv('HICON_USE_CPP_POURING_PLUGIN', 'false').lower() == 'true'
 
-# CUDA-accelerated brightness detection (replaces CPU NumPy brightness_processor).
-# Supported Stream 0 hybrid runtime keeps this disabled because the production
-# analysis branch is NV12-only and shares one CPU-extracted frame across
-# tapping/deslagging/spectro plus the hybrid pouring controller.
-# Set to 'true' only for explicit diagnostics or a future NV12-safe redesign.
+# CUDA-accelerated brightness detection request flag.
+# The supported runtime uses a native NV12-safe CUDA v2 plugin when available,
+# otherwise it auto-falls back to the CPU BrightnessProcessor.
 USE_CUDA_BRIGHTNESS = os.getenv('HICON_USE_CUDA_BRIGHTNESS', 'true').lower() != 'false'
+
+# Stream 0 geometry overrides for controlled source-resolution experiments.
+STREAM_0_MUX_WIDTH = int(os.getenv('HICON_STREAM_0_MUX_WIDTH', '1280'))
+STREAM_0_MUX_HEIGHT = int(os.getenv('HICON_STREAM_0_MUX_HEIGHT', '720'))
+STREAM_0_TRACKER_WIDTH = int(os.getenv('HICON_STREAM_0_TRACKER_WIDTH', '640'))
+STREAM_0_TRACKER_HEIGHT = int(os.getenv('HICON_STREAM_0_TRACKER_HEIGHT', '384'))
 
 # Annotated inference video (DS-native: tee + nvosd + RecordingManager)
 ENABLE_INFERENCE_VIDEO = os.getenv('HICON_ENABLE_INFERENCE_VIDEO', 'false').lower() == 'true'
@@ -287,20 +299,8 @@ STREAM_0_ANALYSIS_BRANCH_ENABLED = os.getenv(
 STREAM_0_ANALYSIS_RGBA_ENABLED = os.getenv(
     'HICON_STREAM_0_ANALYSIS_RGBA_ENABLED', 'false'
 ).lower() == 'true'
-STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED = os.getenv(
-    'HICON_STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED', 'true'
-).lower() == 'true'
 STREAM_0_ANALYSIS_PROBE_ENABLED = os.getenv(
     'HICON_STREAM_0_ANALYSIS_PROBE_ENABLED', 'true'
-).lower() == 'true'
-STREAM_0_CPP_META_ATTACH_ENABLED = os.getenv(
-    'HICON_STREAM_0_CPP_META_ATTACH_ENABLED', 'true'
-).lower() == 'true'
-STREAM_0_CPP_META_DECODE_ENABLED = os.getenv(
-    'HICON_STREAM_0_CPP_META_DECODE_ENABLED', 'true'
-).lower() == 'true'
-STREAM_0_HYBRID_CONTROLLER_ENABLED = os.getenv(
-    'HICON_STREAM_0_HYBRID_CONTROLLER_ENABLED', 'true'
 ).lower() == 'true'
 ENABLE_STREAM_0_POURING_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_POURING_PROCESSOR', 'true').lower() == 'true'
 ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR', 'true').lower() == 'true'
@@ -349,6 +349,11 @@ TRACKER_LIB = os.getenv(
 TRACKER_CONFIG = os.getenv(
     'HICON_TRACKER_CONFIG',
     str(CONFIG_DIR / 'config_tracker.yml')
+)
+
+STREAM_0_TRACKER_CONFIG = os.getenv(
+    'HICON_STREAM_0_TRACKER_CONFIG',
+    TRACKER_CONFIG
 )
 
 # =============================================================================
@@ -463,11 +468,11 @@ def get_config_summary():
         'stream_0_decoupled_analysis_mode': STREAM_0_DECOUPLED_ANALYSIS_MODE,
         'stream_0_analysis_branch_enabled': STREAM_0_ANALYSIS_BRANCH_ENABLED,
         'stream_0_analysis_rgba_enabled': STREAM_0_ANALYSIS_RGBA_ENABLED,
-        'stream_0_analysis_cpp_plugin_enabled': STREAM_0_ANALYSIS_CPP_PLUGIN_ENABLED,
         'stream_0_analysis_probe_enabled': STREAM_0_ANALYSIS_PROBE_ENABLED,
-        'stream_0_cpp_meta_attach_enabled': STREAM_0_CPP_META_ATTACH_ENABLED,
-        'stream_0_cpp_meta_decode_enabled': STREAM_0_CPP_META_DECODE_ENABLED,
-        'stream_0_hybrid_controller_enabled': STREAM_0_HYBRID_CONTROLLER_ENABLED,
+        'stream_0_mux_width': STREAM_0_MUX_WIDTH,
+        'stream_0_mux_height': STREAM_0_MUX_HEIGHT,
+        'stream_0_tracker_width': STREAM_0_TRACKER_WIDTH,
+        'stream_0_tracker_height': STREAM_0_TRACKER_HEIGHT,
         'enable_stream_0_pouring_processor': ENABLE_STREAM_0_POURING_PROCESSOR,
         'enable_stream_0_brightness_processor': ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR,
         'base_dir': str(BASE_DIR),

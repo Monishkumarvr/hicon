@@ -6,11 +6,16 @@ so each processor only adds its domain-specific drawings.
 """
 
 import cv2
+import json
 import numpy as np
 import logging
+import queue
+import threading
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
+
+from utils.perf import timed_section
 
 logger = logging.getLogger(__name__)
 
@@ -70,16 +75,243 @@ def draw_roi_overlay(annotated: np.ndarray, points, color: Tuple[int, int, int],
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
-def save(annotated: np.ndarray, prefix: str, tag: str,
-         timestamp: datetime, screenshot_dir: Path) -> Optional[str]:
-    """Save annotated screenshot and return file path, or None on error."""
+def _to_coco_bbox(x1: int, y1: int, x2: int, y2: int) -> List[int]:
+    """Convert (x1,y1,x2,y2) → COCO [x, y, w, h] with top-left origin."""
+    return [x1, y1, x2 - x1, y2 - y1]
+
+
+def _write_coco_sidecar(
+    jpg_path: Path,
+    annotated: np.ndarray,
+    timestamp: datetime,
+    annotations: List[dict],
+    event_type: Optional[str],
+    camera_id: Optional[str],
+    categories: Optional[List[dict]],
+    raw_filename: Optional[str] = None,
+) -> None:
+    """Write a COCO-format JSON sidecar file next to the saved JPEG.
+
+    ``image.file_name`` points to the clean raw frame when available so the
+    JSON can be used directly as a training annotation without overlay pixels.
+    """
+    h, w = annotated.shape[:2]
+    coco = {
+        "image": {
+            "file_name": raw_filename or jpg_path.name,
+            "width": w,
+            "height": h,
+            "date_captured": timestamp.isoformat(),
+        },
+        "annotations": annotations,
+        "categories": categories or [],
+        "event": {
+            "event_type": event_type or "",
+            "camera_id": camera_id or "",
+        },
+    }
+    json_path = jpg_path.with_suffix(".json")
+    with open(str(json_path), "w") as f:
+        json.dump(coco, f, indent=2)
+    logger.info(f"Saved COCO sidecar: {json_path.name}")
+
+
+def _build_output_paths(
+    prefix: str,
+    tag: str,
+    timestamp: datetime,
+    screenshot_dir: Path,
+) -> tuple[Path, str, Path]:
+    ts = timestamp.strftime("%Y%m%d_%H%M%S")
+    filename = f"{prefix}_{tag}_{ts}.jpg"
+    filepath = screenshot_dir / filename
+    raw_filename = f"{prefix}_{tag}_{ts}_raw.jpg"
+    raw_filepath = screenshot_dir / raw_filename
+    return filepath, raw_filename, raw_filepath
+
+
+def _write_screenshot_bundle(
+    filepath: Path,
+    raw_filename: str,
+    raw_filepath: Path,
+    annotated: np.ndarray,
+    timestamp: datetime,
+    annotations: Optional[List[dict]] = None,
+    *,
+    raw_frame: Optional[np.ndarray] = None,
+    event_type: Optional[str] = None,
+    camera_id: Optional[str] = None,
+    categories: Optional[List[dict]] = None,
+) -> Optional[str]:
     try:
-        ts = timestamp.strftime("%Y%m%d_%H%M%S")
-        filename = f"{prefix}_{tag}_{ts}.jpg"
-        filepath = screenshot_dir / filename
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(filepath), annotated)
-        logger.info(f"Saved screenshot: {filename}")
+        logger.info(f"Saved screenshot: {filepath.name}")
+
+        image_name = None
+        if raw_frame is not None:
+            cv2.imwrite(str(raw_filepath), raw_frame)
+            logger.info(f"Saved raw screenshot: {raw_filename}")
+            image_name = raw_filename
+
+        if annotations:
+            try:
+                _write_coco_sidecar(
+                    filepath,
+                    annotated,
+                    timestamp,
+                    annotations,
+                    event_type,
+                    camera_id,
+                    categories,
+                    raw_filename=image_name,
+                )
+            except Exception as exc:
+                logger.error(f"Error saving COCO sidecar: {exc}")
         return str(filepath)
-    except Exception as e:
-        logger.error(f"Error saving screenshot: {e}")
+    except Exception as exc:
+        logger.error(f"Error saving screenshot: {exc}")
         return None
+
+
+class AsyncScreenshotWriter:
+    """Background screenshot writer for event-driven captures."""
+
+    _SENTINEL = object()
+
+    def __init__(self, maxsize: int = 20):
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="hicon-screenshot-writer",
+            daemon=False,
+        )
+        self._thread.start()
+        logger.info("AsyncScreenshotWriter initialized (maxsize=%d)", maxsize)
+
+    def save(
+        self,
+        annotated: np.ndarray,
+        prefix: str,
+        tag: str,
+        timestamp: datetime,
+        screenshot_dir: Path,
+        annotations: Optional[List[dict]] = None,
+        *,
+        raw_frame: Optional[np.ndarray] = None,
+        event_type: Optional[str] = None,
+        camera_id: Optional[str] = None,
+        categories: Optional[List[dict]] = None,
+    ) -> Optional[str]:
+        filepath, raw_filename, raw_filepath = _build_output_paths(
+            prefix,
+            tag,
+            timestamp,
+            screenshot_dir,
+        )
+        job = {
+            "filepath": filepath,
+            "raw_filename": raw_filename,
+            "raw_filepath": raw_filepath,
+            "annotated": annotated,
+            "timestamp": timestamp,
+            "annotations": annotations,
+            "raw_frame": raw_frame,
+            "event_type": event_type,
+            "camera_id": camera_id,
+            "categories": categories,
+        }
+
+        if self._stopped:
+            logger.warning("AsyncScreenshotWriter stopped; saving %s synchronously", filepath.name)
+            return _write_screenshot_bundle(**job)
+
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            logger.warning("Screenshot queue full; dropping %s", filepath.name)
+            return None
+        return str(filepath)
+
+    def _worker(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._SENTINEL:
+                    return
+                with timed_section("screenshot.write.async", threshold_ms=20.0, logger=logger):
+                    _write_screenshot_bundle(**item)
+            except Exception as exc:
+                logger.error("AsyncScreenshotWriter failed: %s", exc, exc_info=True)
+            finally:
+                self._queue.task_done()
+
+    def stop(self, timeout: float = 5.0, drain: bool = True) -> None:
+        if self._stopped:
+            return
+        if drain:
+            self._queue.join()
+        self._queue.put(self._SENTINEL)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning("AsyncScreenshotWriter did not stop cleanly within %.1fs", timeout)
+        self._stopped = True
+
+
+def save(
+    annotated: np.ndarray,
+    prefix: str,
+    tag: str,
+    timestamp: datetime,
+    screenshot_dir: Path,
+    annotations: Optional[List[dict]] = None,
+    *,
+    raw_frame: Optional[np.ndarray] = None,
+    event_type: Optional[str] = None,
+    camera_id: Optional[str] = None,
+    categories: Optional[List[dict]] = None,
+    writer: Optional[AsyncScreenshotWriter] = None,
+) -> Optional[str]:
+    """Save annotated screenshot and return file path, or None on error.
+
+    If *raw_frame* is provided, a clean JPEG (no overlays) is saved as
+    ``{prefix}_{tag}_{ts}_raw.jpg`` alongside the annotated one.
+
+    If *annotations* is a non-empty list, a COCO-format JSON sidecar is written
+    alongside the JPEG (same stem, ``.json`` extension). ``image.file_name``
+    in the JSON points to the raw frame when available.
+    """
+    if writer is not None:
+        return writer.save(
+            annotated,
+            prefix,
+            tag,
+            timestamp,
+            screenshot_dir,
+            annotations,
+            raw_frame=raw_frame,
+            event_type=event_type,
+            camera_id=camera_id,
+            categories=categories,
+        )
+
+    filepath, raw_filename, raw_filepath = _build_output_paths(
+        prefix,
+        tag,
+        timestamp,
+        screenshot_dir,
+    )
+    with timed_section("screenshot.write.sync", threshold_ms=20.0, logger=logger):
+        return _write_screenshot_bundle(
+            filepath,
+            raw_filename,
+            raw_filepath,
+            annotated,
+            timestamp,
+            annotations,
+            raw_frame=raw_frame,
+            event_type=event_type,
+            camera_id=camera_id,
+            categories=categories,
+        )

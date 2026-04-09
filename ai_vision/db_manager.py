@@ -3,10 +3,14 @@ Database module for HiCon - Local SQLite with 7-day rotation
 """
 import sqlite3
 import logging
+import queue
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import json
+
+from utils.perf import timed_section
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +437,18 @@ class HiConDatabase:
         conn.close()
         logger.debug(f"✓ Updated pouring event end: {sync_id}")
 
+    def delete_pouring_event(self, sync_id: str) -> None:
+        """Delete a pouring event row (cleans up discarded sub-minimum pours)."""
+        conn = self._get_connection()
+        try:
+            conn.execute('DELETE FROM pouring_events WHERE sync_id = ?', (sync_id,))
+            conn.commit()
+            logger.debug(f"✓ Deleted discarded pouring event: {sync_id}")
+        except Exception as exc:
+            logger.warning(f"Failed to delete pouring event {sync_id}: {exc}")
+        finally:
+            conn.close()
+
     # === HEAT CYCLES ===
 
     def insert_heat_cycle(self, sync_id: str, heat_no: str, customer_id: str, date: str,
@@ -485,8 +501,7 @@ class HiConDatabase:
             pouring_start_time = pouring_start_time or ""
             pouring_end_time = pouring_end_time or ""
             total_pouring_time = total_pouring_time or "0"
-            tapping_start_time = tapping_start_time or ""
-            tapping_end_time = tapping_end_time or ""
+            # Keep None as None (SQL NULL) — empty string breaks API timestamp validation
 
             # Convert to JSON
             mould_wise_json = json.dumps(mould_wise_pouring_time or [])
@@ -512,6 +527,41 @@ class HiConDatabase:
             logger.info(f"Inserted heat cycle: {heat_no} (slno: {slno})")
             return slno
 
+        finally:
+            conn.close()
+
+    def save_active_cycle_checkpoint(self, cycle_json: str):
+        """Persist active cycle state to DB for crash/restart recovery."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                '''INSERT INTO metadata (key, value, updated_at)
+                   VALUES ('active_cycle_checkpoint', ?, ?)
+                   ON CONFLICT(key) DO UPDATE
+                   SET value = excluded.value, updated_at = excluded.updated_at''',
+                (cycle_json, datetime.now().isoformat())
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_active_cycle_checkpoint(self) -> Optional[str]:
+        """Load active cycle JSON from DB checkpoint, or None if absent."""
+        conn = self._get_connection()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT value FROM metadata WHERE key = 'active_cycle_checkpoint'")
+            row = c.fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def clear_active_cycle_checkpoint(self):
+        """Remove active cycle checkpoint after successful finalization."""
+        conn = self._get_connection()
+        try:
+            conn.execute("DELETE FROM metadata WHERE key = 'active_cycle_checkpoint'")
+            conn.commit()
         finally:
             conn.close()
 
@@ -724,3 +774,83 @@ class HiConDatabase:
         conn.close()
 
         return stats
+
+
+class AsyncDBWriter:
+    """Serialize hot-path database writes onto a background worker thread."""
+
+    _SENTINEL = object()
+
+    def __init__(self, db: HiConDatabase, maxsize: int = 64):
+        self._db = db
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="hicon-async-db",
+            daemon=False,
+        )
+        self._thread.start()
+        logger.info("AsyncDBWriter initialized (maxsize=%d)", maxsize)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def _enqueue(self, method_name: str, kwargs: Dict[str, Any]):
+        if self._stopped:
+            logger.warning("AsyncDBWriter stopped; executing %s synchronously", method_name)
+            with timed_section(f"db.{method_name}.sync_stopped", logger=logger):
+                return getattr(self._db, method_name)(**kwargs)
+
+        try:
+            self._queue.put_nowait((method_name, kwargs))
+        except queue.Full:
+            logger.critical(
+                "AsyncDBWriter queue full while scheduling %s; falling back to sync write",
+                method_name,
+            )
+            with timed_section(f"db.{method_name}.sync_fallback", logger=logger):
+                return getattr(self._db, method_name)(**kwargs)
+        return None
+
+    def _worker(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._SENTINEL:
+                    return
+
+                method_name, kwargs = item
+                with timed_section(f"db.{method_name}.async", logger=logger):
+                    getattr(self._db, method_name)(**kwargs)
+            except Exception as exc:
+                logger.error("AsyncDBWriter %s failed: %s", method_name, exc, exc_info=True)
+            finally:
+                self._queue.task_done()
+
+    def insert_melting_event(self, **kwargs) -> Optional[str]:
+        return self._enqueue("insert_melting_event", kwargs)
+
+    def insert_pouring_event(self, **kwargs) -> Optional[str]:
+        return self._enqueue("insert_pouring_event", kwargs)
+
+    def update_pouring_end(self, **kwargs) -> None:
+        self._enqueue("update_pouring_end", kwargs)
+
+    def delete_pouring_event(self, **kwargs) -> None:
+        self._enqueue("delete_pouring_event", kwargs)
+
+    def insert_heat_cycle(self, **kwargs) -> Optional[str]:
+        return self._enqueue("insert_heat_cycle", kwargs)
+
+    def stop(self, timeout: float = 5.0, drain: bool = True) -> None:
+        if self._stopped:
+            return
+
+        if drain:
+            self._queue.join()
+        self._queue.put(self._SENTINEL)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning("AsyncDBWriter did not stop cleanly within %.1fs", timeout)
+        self._stopped = True

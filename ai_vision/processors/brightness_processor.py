@@ -38,7 +38,8 @@ class BrightnessProcessor:
 
     def __init__(self, zones_config, db_manager, config, screenshot_dir,
                  heat_cycle_manager=None, enable_display_meta=True,
-                 enable_tapping=True, enable_deslagging=True, enable_spectro=True):
+                 enable_tapping=True, enable_deslagging=True, enable_spectro=True,
+                 screenshot_writer=None):
         """
         Args:
             zones_config: Dict with tapping/deslagging/spectro zone configs from zones.json
@@ -55,6 +56,7 @@ class BrightnessProcessor:
         self.enable_tapping = enable_tapping
         self.enable_deslagging = enable_deslagging
         self.enable_spectro = enable_spectro
+        self.screenshot_writer = screenshot_writer
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.customer_id = config.CUSTOMER_ID
@@ -80,8 +82,6 @@ class BrightnessProcessor:
         meta = zones_config.get('metadata', {})
         self._ref_w = int(meta.get('ref_width', 1280))
         self._ref_h = int(meta.get('ref_height', 720))
-        self._sx = 1.0
-        self._sy = 1.0
         self._last_white_ratios = {
             "tapping": 0.0,
             "deslagging": 0.0,
@@ -136,27 +136,34 @@ class BrightnessProcessor:
         enabled_label = " + ".join(enabled_detectors) if enabled_detectors else "none"
         logger.info("BrightnessProcessor initialized (%s)", enabled_label)
 
-    def _scale_pts(self, pts):
+    def _scale_pts(self, pts, frame_w, frame_h, ref_w, ref_h):
         """Scale zone coordinates from calibration resolution to actual frame resolution."""
-        if self._sx == 1.0 and self._sy == 1.0:
+        sx = frame_w / float(ref_w) if ref_w > 0 else 1.0
+        sy = frame_h / float(ref_h) if ref_h > 0 else 1.0
+        if sx == 1.0 and sy == 1.0:
             return pts
-        return [[int(round(x * self._sx)), int(round(y * self._sy))] for x, y in pts]
+        return [[int(round(x * sx)), int(round(y * sy))] for x, y in pts]
 
-    def _get_zone_pts_list(self, cfg):
+    def _get_zone_pts_list(self, cfg, frame_w, frame_h):
         """Return list of polygon arrays from config, handling both flat and multi-zone formats.
 
-        Flat (legacy):  {"roi_points": [[x,y], ...], ...}
-        Multi-zone:     {"zones": {"zone-1": {"roi_points": [[x,y], ...]}, ...}, ...}
+        Uses 'annotation_size' from config if present, else falls back to global ref_width/ref_height.
         """
+        ref_size = cfg.get('annotation_size')
+        if ref_size and len(ref_size) == 2:
+            ref_w, ref_h = ref_size
+        else:
+            ref_w, ref_h = self._ref_w, self._ref_h
+
         pts_list = []
         zones = cfg.get('zones', {})
         if zones:
             for zone in zones.values():
-                pts = self._scale_pts(zone.get('roi_points', []))
+                pts = self._scale_pts(zone.get('roi_points', []), frame_w, frame_h, ref_w, ref_h)
                 if pts:
                     pts_list.append(np.array(pts, dtype=np.int32))
         else:
-            pts = self._scale_pts(cfg.get('roi_points', []))
+            pts = self._scale_pts(cfg.get('roi_points', []), frame_w, frame_h, ref_w, ref_h)
             if pts:
                 pts_list.append(np.array(pts, dtype=np.int32))
         return pts_list
@@ -164,16 +171,10 @@ class BrightnessProcessor:
     def _build_masks(self, frame_h, frame_w):
         """Build ROI masks once we know frame dimensions."""
         self._frame_shape = (frame_h, frame_w)
-        self._sx = frame_w / self._ref_w if self._ref_w > 0 else 1.0
-        self._sy = frame_h / self._ref_h if self._ref_h > 0 else 1.0
-        if self._sx != 1.0 or self._sy != 1.0:
-            logger.info(
-                f"Zone scaling: {self._ref_w}x{self._ref_h} (calibration) → "
-                f"{frame_w}x{frame_h} (frame) — sx={self._sx:.3f}, sy={self._sy:.3f}"
-            )
+        logger.info(f"Building ROI masks for {frame_w}x{frame_h} frame")
 
         # Tapping ROI (flat or multi-zone)
-        tapping_polys = self._get_zone_pts_list(self._tapping_config)
+        tapping_polys = self._get_zone_pts_list(self._tapping_config, frame_w, frame_h)
         if tapping_polys:
             self._tapping_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
             cv2.fillPoly(self._tapping_mask, tapping_polys, 255)
@@ -181,7 +182,7 @@ class BrightnessProcessor:
             logger.info(f"Tapping ROI mask: {len(tapping_polys)} zone(s), {self._tapping_pixel_count} pixels")
 
         # Deslagging ROI (flat or multi-zone)
-        deslag_polys = self._get_zone_pts_list(self._deslagging_config)
+        deslag_polys = self._get_zone_pts_list(self._deslagging_config, frame_w, frame_h)
         if deslag_polys:
             self._deslagging_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
             cv2.fillPoly(self._deslagging_mask, deslag_polys, 255)
@@ -189,7 +190,7 @@ class BrightnessProcessor:
             logger.info(f"Deslagging ROI mask: {len(deslag_polys)} zone(s), {self._deslagging_pixel_count} pixels")
 
         # Spectro ROI (flat or multi-zone)
-        spectro_polys = self._get_zone_pts_list(self._spectro_config)
+        spectro_polys = self._get_zone_pts_list(self._spectro_config, frame_w, frame_h)
         if spectro_polys:
             self._spectro_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
             cv2.fillPoly(self._spectro_mask, spectro_polys, 255)
@@ -386,9 +387,13 @@ class BrightnessProcessor:
             else:
                 self._handle_event(event, frame_rgba, white_ratio)
 
-    def add_inference_display_meta(self, batch_meta, frame_meta):
-        """Attach DS-native overlay for tapping/deslagging/spectro status + ROI bounds."""
-        if not self.enable_display_meta:
+    def add_inference_display_meta(self, batch_meta, frame_meta, force: bool = False):
+        """Attach DS-native overlay for tapping/deslagging/spectro status + ROI bounds.
+
+        force=True bypasses the enable_display_meta guard — used by the decoupled-mode
+        recording display_meta writer probe which runs on the main path.
+        """
+        if not force and not self.enable_display_meta:
             return
         try:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
@@ -481,11 +486,12 @@ class BrightnessProcessor:
                     line_idx += 1
 
             if max_lines > 0:
-                for poly in self._get_zone_pts_list(self._tapping_config):
+                f_h, f_w = self._frame_shape if self._frame_shape else (1080, 1920)
+                for poly in self._get_zone_pts_list(self._tapping_config, f_w, f_h):
                     _add_roi_poly(poly.tolist(), (1.0, 0.65, 0.0, 1.0))
-                for poly in self._get_zone_pts_list(self._deslagging_config):
+                for poly in self._get_zone_pts_list(self._deslagging_config, f_w, f_h):
                     _add_roi_poly(poly.tolist(), (1.0, 0.0, 0.0, 1.0))
-                for poly in self._get_zone_pts_list(self._spectro_config):
+                for poly in self._get_zone_pts_list(self._spectro_config, f_w, f_h):
                     _add_roi_poly(poly.tolist(), (0.0, 1.0, 1.0, 1.0))
                 display_meta.num_lines = line_idx
                 display_meta.num_rects = 0
@@ -493,6 +499,7 @@ class BrightnessProcessor:
                 # Fallback: ROI bounding rectangles if line params unavailable
                 rect_idx = 0
                 max_rects = len(display_meta.rect_params)
+                f_h, f_w = self._frame_shape if self._frame_shape else (1080, 1920)
 
                 def _add_roi_rect(roi_pts, color):
                     nonlocal rect_idx
@@ -514,11 +521,11 @@ class BrightnessProcessor:
                     rect.border_color.set(*color)
                     rect_idx += 1
 
-                for poly in self._get_zone_pts_list(self._tapping_config):
+                for poly in self._get_zone_pts_list(self._tapping_config, f_w, f_h):
                     _add_roi_rect(poly.tolist(), (1.0, 0.65, 0.0, 1.0))
-                for poly in self._get_zone_pts_list(self._deslagging_config):
+                for poly in self._get_zone_pts_list(self._deslagging_config, f_w, f_h):
                     _add_roi_rect(poly.tolist(), (1.0, 0.0, 0.0, 1.0))
-                for poly in self._get_zone_pts_list(self._spectro_config):
+                for poly in self._get_zone_pts_list(self._spectro_config, f_w, f_h):
                     _add_roi_rect(poly.tolist(), (0.0, 1.0, 1.0, 1.0))
 
                 display_meta.num_rects = rect_idx
@@ -602,18 +609,22 @@ class BrightnessProcessor:
         try:
             annotated = prepare_frame(frame_rgba)
             phase = phase or event.get("phase", "end")
+            screenshot_dt = event.get(
+                "end_datetime" if phase == "end" else "start_datetime"
+            ) or datetime.now()
 
             # Pick ROI config and color per event type (coordinates scaled to frame resolution)
+            f_h, f_w = frame_rgba.shape[:2]
             if event_type == "tapping":
-                roi_pts_list = self._get_zone_pts_list(self._tapping_config)
+                roi_pts_list = self._get_zone_pts_list(self._tapping_config, f_w, f_h)
                 roi_color = (0, 165, 255)  # Orange
                 threshold = self.tapping_tracker.brightness_threshold
             elif event_type == "spectro":
-                roi_pts_list = self._get_zone_pts_list(self._spectro_config)
+                roi_pts_list = self._get_zone_pts_list(self._spectro_config, f_w, f_h)
                 roi_color = (255, 255, 0)  # Cyan
                 threshold = self.spectro_tracker.brightness_threshold
             else:
-                roi_pts_list = self._get_zone_pts_list(self._deslagging_config)
+                roi_pts_list = self._get_zone_pts_list(self._deslagging_config, f_w, f_h)
                 roi_color = (0, 0, 255)  # Red
                 threshold = self.deslagging_tracker.brightness_threshold
 
@@ -635,12 +646,18 @@ class BrightnessProcessor:
             # Standard header/footer
             title = f"{event_type.upper()} EVENT {phase.upper()}"
             add_header(annotated, title,
-                       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       screenshot_dt.strftime("%Y-%m-%d %H:%M:%S"),
                        extra_lines)
             add_footer(annotated, self.camera_id)
 
-            return save_screenshot(annotated, event_type, phase, datetime.now(),
-                                   self.screenshot_dir)
+            return save_screenshot(
+                annotated,
+                event_type,
+                phase,
+                screenshot_dt,
+                self.screenshot_dir,
+                writer=self.screenshot_writer,
+            )
 
         except Exception as e:
             logger.error(f"Error saving {event_type} screenshot: {e}")

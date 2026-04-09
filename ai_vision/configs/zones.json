@@ -21,7 +21,7 @@
         "roi_points": [[1694, 720], [1741, 698], [1692, 610], [1647, 644]]
       }
     },
-    "abs_brightness_threshold": 150,
+    "abs_brightness_threshold": 180,
     "start_white_ratio": 0.15,
     "start_frame_count": 20,
     "end_white_ratio": 0.05,
@@ -49,7 +49,7 @@
         "roi_points": [[152, 76], [152, 284], [362, 284], [362, 76]]
       }
     },
-    "confidence_threshold": 0.25,
+    "confidence_threshold": 0.4,
     "temporal_in_frames": 10,
     "temporal_out_frames": 10
   },

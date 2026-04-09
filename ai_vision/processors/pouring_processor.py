@@ -28,13 +28,19 @@ from pathlib import Path
 import pyds
 
 from utils.utils import generate_sync_id
-from utils.screenshot import prepare_frame, add_header, add_footer, save as save_screenshot
+from utils.screenshot import (prepare_frame, add_header, add_footer,
+                               save as save_screenshot, _to_coco_bbox)
 
 logger = logging.getLogger(__name__)
 
 # Class IDs from labels_pouring.txt
 CLASS_MOUTH = 0
 CLASS_TROLLEY = 1
+
+_POURING_CATEGORIES = [
+    {"id": CLASS_MOUTH,   "name": "ladle_mouth"},
+    {"id": CLASS_TROLLEY, "name": "trolley"},
+]
 
 
 class PouringProcessor:
@@ -51,10 +57,12 @@ class PouringProcessor:
     """
 
     def __init__(self, db_manager, config, screenshot_dir: str, heat_cycle_manager=None,
-                 camera_id_override: str = None, enable_display_meta: bool = True):
+                 camera_id_override: str = None, enable_display_meta: bool = True,
+                 screenshot_writer=None):
         self.db_manager = db_manager
         self.config = config
         self.enable_display_meta = enable_display_meta
+        self.screenshot_writer = screenshot_writer
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,6 +148,8 @@ class PouringProcessor:
         self.locked_trolley_bbox: Optional[Tuple[int, int, int, int]] = None
         self.trolley_locked = False
         self.relock_hold_s = 0.8
+        self.phantom_trolley_timeout = config.PHANTOM_TROLLEY_TIMEOUT_S
+        self.trolley_last_detected_time: Optional[float] = None  # last time trolley was physically seen (not phantom)
 
         # --- Session state ---
         self.session_active = False
@@ -217,6 +227,11 @@ class PouringProcessor:
         # --- DS-native inference overlay toggle (recorded post-OSD via tee branch) ---
         self.enable_inference_video = bool(getattr(config, 'ENABLE_INFERENCE_VIDEO', False))
 
+        # --- Cached display state for decoupled-mode recording overlay probe ---
+        # Updated by process_frame() on the analysis branch; read by the main-path
+        # display_meta writer probe (osd_sink_pad_probe_stream0_display_meta).
+        self._cached_display_data: Optional[Dict] = None
+
         # --- Per-mould timing tracker (for live overlay) ---
         self.mould_completed_times = {}  # mould_id → total frames accumulated
         self.mould_records: List[Dict[str, Any]] = []  # accepted moulds with timing/axis/cluster metadata
@@ -261,12 +276,15 @@ class PouringProcessor:
             f"  Edge expand: x={self.edge_expand_x_px:.1f}px y={self.edge_expand_y_px:.1f}px, Mouth missing tol: {self.mouth_missing_tol}s, "
             f"mouth hold: {self.mouth_hold_s}s"
         )
-        logger.info(f"  Cycle timeout: {self.cycle_timeout}s")
+        logger.info(f"  Cycle timeout: {self.cycle_timeout}s, Phantom trolley timeout: {self.phantom_trolley_timeout:.0f}s")
         logger.info(
             "  DS-native inference overlay enabled=%s (display_meta=%s)",
             self.enable_inference_video,
             self.enable_display_meta,
         )
+
+    def needs_frame(self, obj_count: int) -> bool:
+        return bool(obj_count > 0 or self.pour_active)
 
     @staticmethod
     def _scale_pixel_value(value, scale, minimum=0, as_float=False):
@@ -408,8 +426,8 @@ class PouringProcessor:
                     self._last_probe_tail_brightness = None
                     self._last_probe_is_pouring = None
 
-        # 4. Update trolley bbox (keep latest position for locked trolley)
-        if target_trolley and self.trolley_locked:
+        # 4. Update trolley bbox (keep latest position for locked trolley; skip phantom)
+        if target_trolley and self.trolley_locked and not target_trolley.get('is_phantom', False):
             self.locked_trolley_bbox = target_trolley['bbox']
 
         # 5. Session manager
@@ -446,7 +464,18 @@ class PouringProcessor:
         # 10. Finalize heat cycles periodically
         self._finalize_heat_cycles_if_due(timestamp, datetime_obj)
 
-        # 11. DS-native overlay annotations (rendered by nvosd and captured via tee branch)
+        # 11. Cache latest detection state for the decoupled-mode recording display_meta probe.
+        # The main-path probe (osd_sink_pad_probe_stream0_display_meta) reads this to write
+        # NvDsDisplayMeta on the main GStreamer path without re-running analysis.
+        self._cached_display_data = {
+            'mouths': mouths,
+            'trolleys': trolleys,
+            'target_trolley': target_trolley,
+            'timestamp': timestamp,
+            'datetime_obj': datetime_obj,
+        }
+
+        # 12. DS-native overlay annotations (rendered by nvosd and captured via tee branch)
         if self.enable_inference_video and self.enable_display_meta and batch_meta is not None:
             self._add_inference_display_meta(
                 batch_meta=batch_meta,
@@ -511,29 +540,55 @@ class PouringProcessor:
     # =========================================================================
 
     def _get_target_trolley(self, trolleys, timestamp=None, mouths=None):
-        """Get the target trolley: locked one if exists, else best candidate."""
-        if not trolleys:
-            return None
+        """Get the target trolley: locked one if exists, else best candidate.
+
+        When the locked trolley disappears (e.g., occluded by ladle during pour),
+        returns a phantom trolley from the last known bbox for up to
+        phantom_trolley_timeout seconds, allowing sessions to continue uninterrupted.
+        """
+        ts = timestamp or time.time()
 
         if self.trolley_locked and self.locked_trolley_id is not None:
-            # Find locked trolley by track_id
+            # 1. Find locked trolley by track_id
             for t in trolleys:
                 if t['track_id'] == self.locked_trolley_id:
+                    self.trolley_last_detected_time = ts  # real detection — update clock
                     self._relock_candidate_id = None
                     self._relock_candidate_since = None
                     return t
 
-            # Locked trolley missing: relock only when candidate is stable and
-            # movement/new-trolley conditions indicate a genuine transition.
-            relock = self._select_relock_trolley(trolleys, mouths=mouths)
-            if relock and self._should_relock_trolley(relock, trolleys, timestamp or time.time()):
-                self._relock_trolley(relock, timestamp or time.time(), reason="missing_locked_id")
-                self._relock_candidate_id = None
-                self._relock_candidate_since = None
-                return relock
+            # 2. Locked trolley missing — try relock if any trolleys are visible
+            if trolleys:
+                relock = self._select_relock_trolley(trolleys, mouths=mouths)
+                if relock and self._should_relock_trolley(relock, trolleys, ts):
+                    self._relock_trolley(relock, ts, reason="missing_locked_id")
+                    self.trolley_last_detected_time = ts
+                    self._relock_candidate_id = None
+                    self._relock_candidate_since = None
+                    return relock
+
+            # 3. No trolleys visible (or relock failed) — use phantom frozen bbox
+            if (self.locked_trolley_bbox is not None and
+                    self.trolley_last_detected_time is not None):
+                phantom_age = ts - self.trolley_last_detected_time
+                if phantom_age <= self.phantom_trolley_timeout:
+                    x1, y1, x2, y2 = self.locked_trolley_bbox
+                    logger.debug(
+                        "[trolley] phantom bbox (age=%.1fs, id=%s, bbox=%s)",
+                        phantom_age, self.locked_trolley_id, self.locked_trolley_bbox,
+                    )
+                    return {
+                        'track_id': self.locked_trolley_id,
+                        'bbox': self.locked_trolley_bbox,
+                        'center': ((x1 + x2) / 2, (y1 + y2) / 2),
+                        'confidence': 0.0,
+                        'is_phantom': True,
+                    }
             return None
 
         # No lock yet — return highest-confidence trolley
+        if not trolleys:
+            return None
         return max(trolleys, key=lambda t: t['confidence'])
 
     @staticmethod
@@ -775,6 +830,9 @@ class PouringProcessor:
         # Do NOT reset: mould_count, moved_positions, anchor_position, locked trolley
         # These persist until pouring cycle ends (5 min timeout)
 
+        if self.heat_cycle_manager:
+            self.heat_cycle_manager.notify_session_ended()
+
     # =========================================================================
     # Sub-system 2: Pour Detector (multi-probe)
     # =========================================================================
@@ -942,25 +1000,40 @@ class PouringProcessor:
             self.brightness_below_since = None
 
             if self.pour_on_count >= self.pour_start_frames and selected_mouth is not None:
+                # If the tracked (selected) probe isn't the one triggering pouring,
+                # anchor the frozen probe to the actually-pouring hit instead so that
+                # the active pour monitors the correct location.
+                start_brightness = head_score
+                start_probe_x = int(round(probe_x_use))
+                start_probe_y = int(round(probe_y_use))
+                start_mouth = selected_mouth
+                if selected is None or not selected["is_pouring"]:
+                    pouring_hits = [h for h in probe_hits if h["is_pouring"]]
+                    if pouring_hits:
+                        best_pour_hit = max(pouring_hits, key=lambda h: h["head_score"])
+                        start_brightness = best_pour_hit["head_score"]
+                        start_probe_x = int(round(best_pour_hit["probe_x"]))
+                        start_probe_y = int(round(best_pour_hit["probe_y"]))
+                        start_mouth = best_pour_hit["mouth"]
                 self._start_pour(
                     timestamp,
                     datetime_obj,
                     mouths,
                     trolleys,
                     frame,
-                    head_score,
-                    int(round(probe_x_use)),
-                    int(round(probe_y_use)),
+                    start_brightness,
+                    start_probe_x,
+                    start_probe_y,
                     target_trolley,
-                    selected_mouth,
+                    start_mouth,
                 )
                 self.pour_on_count = 0
                 self.pour_off_count = 0
                 self.frozen_probe_active = True
-                self.frozen_probe_x = float(probe_x_use)
-                self.frozen_probe_y = float(probe_y_use)
-                if selected_mouth is not None:
-                    self.frozen_probe_bbox = tuple(selected_mouth.get("bbox", (0, 0, 0, 0)))
+                self.frozen_probe_x = float(start_probe_x)
+                self.frozen_probe_y = float(start_probe_y)
+                if start_mouth is not None:
+                    self.frozen_probe_bbox = tuple(start_mouth.get("bbox", (0, 0, 0, 0)))
                     self.frozen_probe_bbox_valid = True
                 elif self.active_probe_bbox_valid:
                     self.frozen_probe_bbox = self.active_probe_bbox
@@ -1518,6 +1591,13 @@ class PouringProcessor:
 
         if duration < self.pour_min_dur:
             logger.info(f"[pour] DISCARDED - duration={duration:.1f}s < {self.pour_min_dur}s minimum")
+            if self.pour_sync_id:
+                try:
+                    self.db_manager.delete_pouring_event(self.pour_sync_id)
+                except Exception as e:
+                    logger.warning(f"[pour] Failed to clean up discarded pour row: {e}")
+                self.pour_sync_id = None
+                self.pour_slno = None
             self.pour_start_time = None
             self.pour_start_datetime = None
             self._active_segment = None
@@ -1750,6 +1830,7 @@ class PouringProcessor:
         self.locked_trolley_id = None
         self.locked_trolley_bbox = None
         self.trolley_locked = False
+        self.trolley_last_detected_time = None
         self.session_active = False
         self.mouth_inside_since = None
         self.mouth_absent_since = None
@@ -2073,6 +2154,26 @@ class PouringProcessor:
         except Exception as exc:
             logger.error(f"[osd] Failed to attach inference display meta: {exc}", exc_info=True)
 
+    def write_recording_overlay(self, batch_meta, frame_meta):
+        """Write display overlay from latest cached detection state.
+
+        Called from the main-path display_meta writer probe in decoupled analysis mode.
+        Uses state already computed by the analysis branch — zero additional analysis.
+        Safe to call from a different GStreamer thread; reads a snapshot dict reference.
+        """
+        data = self._cached_display_data
+        if not data or not self.enable_inference_video:
+            return
+        self._add_inference_display_meta(
+            batch_meta=batch_meta,
+            frame_meta=frame_meta,
+            mouths=data['mouths'],
+            trolleys=data['trolleys'],
+            target_trolley=data['target_trolley'],
+            timestamp=data['timestamp'],
+            datetime_obj=data['datetime_obj'],
+        )
+
     def close(self):
         """Compatibility no-op. DS-native recording is managed by pipeline/RecordingManager."""
         return None
@@ -2093,7 +2194,8 @@ class PouringProcessor:
             return None
 
         try:
-            annotated = prepare_frame(self._prepare_frame_for_annotation(frame))
+            raw_bgr = prepare_frame(self._prepare_frame_for_annotation(frame))
+            annotated = raw_bgr.copy()
 
             # Draw trolley bboxes (green) + expanded region
             for t in trolleys:
@@ -2134,9 +2236,41 @@ class PouringProcessor:
                 status += f"  Trolley: T{self.locked_trolley_id} [LOCKED]"
             add_footer(annotated, self.camera_id, status)
 
+            ann_list = []
+            ann_id = 1
+            for m in (mouths or []):
+                x1, y1, x2, y2 = m['bbox']
+                ann_list.append({
+                    "id": ann_id, "category_id": CLASS_MOUTH,
+                    "bbox": _to_coco_bbox(x1, y1, x2, y2),
+                    "area": (x2 - x1) * (y2 - y1),
+                    "confidence": round(float(m['confidence']), 4),
+                    "track_id": int(m['track_id']),
+                    "iscrowd": 0,
+                })
+                ann_id += 1
+            for t in (trolleys or []):
+                x1, y1, x2, y2 = t['bbox']
+                ann_list.append({
+                    "id": ann_id, "category_id": CLASS_TROLLEY,
+                    "bbox": _to_coco_bbox(x1, y1, x2, y2),
+                    "area": (x2 - x1) * (y2 - y1),
+                    "confidence": round(float(t['confidence']), 4),
+                    "track_id": int(t['track_id']),
+                    "iscrowd": 0,
+                })
+                ann_id += 1
+
             tag = title.lower().replace(" ", "_")
-            return save_screenshot(annotated, "pouring", tag, datetime_obj,
-                                   self.screenshot_dir)
+            return save_screenshot(
+                annotated, "pouring", tag, datetime_obj, self.screenshot_dir,
+                annotations=ann_list or None,
+                raw_frame=raw_bgr,
+                event_type=tag,
+                camera_id=str(self.camera_id),
+                categories=_POURING_CATEGORIES,
+                writer=self.screenshot_writer,
+            )
 
         except Exception as e:
             logger.error(f"Error saving screenshot: {e}")

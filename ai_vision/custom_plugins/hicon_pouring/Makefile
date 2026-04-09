@@ -11,10 +11,11 @@
 ################################################################################
 
 LIB:= libgsthiconpouring.so
+TEST_BIN:= test_association_logic
 
 CXX:= g++
 
-SRCS:= gsthiconpouring.cpp
+SRCS:= gsthiconpouring.cpp association_logic.cpp
 INCS:= $(wildcard *.h)
 OBJS:= $(SRCS:.cpp=.o)
 
@@ -42,7 +43,7 @@ LIBS+= -L$(DS_LIB) \
 # Default install location — DeepStream's plugin directory
 INSTALL_DIR:= $(DS_LIB)/gst-plugins
 
-.PHONY: all clean install
+.PHONY: all clean install test-association
 
 all: $(LIB)
 
@@ -58,5 +59,13 @@ install: $(LIB)
 	@echo "  INSTALL $(INSTALL_DIR)/$(LIB)"
 	cp -f $(LIB) $(INSTALL_DIR)/
 
+$(TEST_BIN): association_logic.cpp association_logic.h test_association_logic.cpp
+	@echo "  CXX   $@"
+	$(CXX) -std=c++14 -Wall -O2 -I. -o $@ association_logic.cpp test_association_logic.cpp
+
+test-association: $(TEST_BIN)
+	@echo "  RUN   $(TEST_BIN)"
+	./$(TEST_BIN)
+
 clean:
-	rm -f $(OBJS) $(LIB)
+	rm -f $(OBJS) $(LIB) $(TEST_BIN)

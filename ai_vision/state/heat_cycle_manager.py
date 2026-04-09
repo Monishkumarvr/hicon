@@ -7,10 +7,14 @@ Manages heat cycles where:
 - Tapping-only cycles are allowed and finalized after a confirmation window
 - Aggregates pouring + melting-side timings for API POST
 """
+import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
+
+_CHECKPOINT_INTERVAL_S = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -88,16 +92,20 @@ class HeatCycleManager:
     - Finalized cycles are posted to API
     """
     
-    def __init__(self, db_manager, ladle_absence_timeout: float = 300.0):
+    def __init__(self, db_manager, ladle_absence_timeout: float = 300.0,
+                 tapping_only_timeout: float = 900.0):
         """
         Initialize heat cycle manager.
-        
+
         Args:
             db_manager: Database manager instance for querying existing counters
-            ladle_absence_timeout: Seconds of pouring-session/tapping inactivity before finalizing cycle
+            ladle_absence_timeout: Seconds of pouring-session inactivity before finalizing cycle
+            tapping_only_timeout: Seconds after tapping ends to wait for a pouring session before
+                                  finalizing (longer than ladle_absence_timeout to allow ladle travel)
         """
         self.db_manager = db_manager
         self.ladle_absence_timeout = ladle_absence_timeout
+        self.tapping_only_timeout = tapping_only_timeout
         
         # Single active cycle (time-based, not per-ladle ID)
         self.active_cycle: Optional[HeatCycle] = None
@@ -108,8 +116,14 @@ class HeatCycleManager:
         # Finalized cycles ready for sync (keyed by heat_no)
         self.finalized_cycles: Dict[str, HeatCycle] = {}
         self.previous_cycle_end_time, self.previous_cycle_end_datetime = self._get_last_cycle_end()
-        
-        logger.info(f"✓ HeatCycleManager initialized (ladle timeout: {ladle_absence_timeout}s)")
+
+        # Checkpoint throttle
+        self._last_checkpoint_time: float = float('-inf')
+
+        # Restore any active cycle that was in-progress before the last restart
+        self._restore_from_checkpoint()
+
+        logger.info(f"✓ HeatCycleManager initialized (ladle timeout: {ladle_absence_timeout}s, tapping-only timeout: {tapping_only_timeout}s)")
         logger.info(f"  Heat counter starting at: {self.heat_counter}")
     
     def _get_last_heat_counter(self) -> int:
@@ -171,6 +185,236 @@ class HeatCycleManager:
             return self.previous_cycle_end_time, self.previous_cycle_end_datetime
         return event_time, event_datetime
 
+    MAX_BACKFILL_HOURS = 8  # Safety cap — don't pull events older than this
+
+    def _backfill_pre_tapping_events(
+        self, cycle: 'HeatCycle', tapping_start_dt: datetime
+    ) -> None:
+        """
+        Retroactively attach deslagging/spectro/pyrometer events that fired
+        before tapping opened the heat cycle.
+
+        Lookback window:
+          start = max(previous_cycle_end, tapping_start - MAX_BACKFILL_HOURS)
+          end   = tapping_start (exclusive)
+        """
+        from datetime import timedelta
+        window_end = tapping_start_dt
+        cap = tapping_start_dt - timedelta(hours=self.MAX_BACKFILL_HOURS)
+
+        if self.previous_cycle_end_datetime is not None:
+            window_start = max(self.previous_cycle_end_datetime, cap)
+        else:
+            window_start = cap
+
+        window_start_iso = window_start.isoformat()
+        window_end_iso = window_end.isoformat()
+
+        try:
+            conn = self.db_manager._get_connection()
+            c = conn.cursor()
+            c.execute(
+                """SELECT event_type, start_time, end_time, duration_sec
+                   FROM melting_events
+                   WHERE event_type IN ('deslagging', 'spectro', 'pyrometer')
+                     AND end_time > ? AND end_time <= ?
+                   ORDER BY start_time ASC""",
+                (window_start_iso, window_end_iso),
+            )
+            rows = c.fetchall()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Backfill query failed: {e}")
+            return
+
+        counts = {"deslagging": 0, "spectro": 0, "pyrometer": 0}
+        for row in rows:
+            ev_type, start_iso, end_iso, dur = row
+            event = {"start": start_iso, "end": end_iso, "duration_sec": dur}
+            if ev_type == "deslagging":
+                cycle.deslagging_events.append(event)
+                counts["deslagging"] += 1
+            elif ev_type == "spectro":
+                cycle.spectro_events.append(event)
+                counts["spectro"] += 1
+            elif ev_type == "pyrometer":
+                cycle.pyrometer_events.append(event)
+                counts["pyrometer"] += 1
+
+        if any(counts.values()):
+            logger.info(
+                f"  {cycle.heat_no}: Backfilled pre-tapping events — "
+                f"deslagging={counts['deslagging']}, spectro={counts['spectro']}, "
+                f"pyrometer={counts['pyrometer']} "
+                f"(window {window_start_iso[:19]} \u2192 {window_end_iso[:19]})"
+            )
+            # Update cycle_start to the earliest backfilled event
+            earliest_iso = rows[0][1]
+            try:
+                earliest_dt = datetime.fromisoformat(earliest_iso)
+                if earliest_dt < cycle.cycle_start_datetime:
+                    cycle.cycle_start_time = earliest_dt.timestamp()
+                    cycle.cycle_start_datetime = earliest_dt
+                    logger.info(f"  {cycle.heat_no}: cycle_start updated to {earliest_iso[:19]}")
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Checkpoint helpers                                                  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _dt_iso(dt: Optional[datetime]) -> Optional[str]:
+        return dt.isoformat() if dt else None
+
+    def _cycle_to_dict(self, cycle: HeatCycle) -> dict:
+        """Serialize active HeatCycle to a JSON-safe dict."""
+        return {
+            'heat_no': cycle.heat_no,
+            'ladle_number': cycle.ladle_number,
+            'ladle_track_ids': cycle.ladle_track_ids,
+            'cycle_start_time': cycle.cycle_start_time,
+            'cycle_start_datetime': self._dt_iso(cycle.cycle_start_datetime),
+            'has_pouring_session': cycle.has_pouring_session,
+            'last_pouring_presence_time': cycle.last_pouring_presence_time,
+            'last_pouring_presence_datetime': self._dt_iso(cycle.last_pouring_presence_datetime),
+            'tapping_start_time': cycle.tapping_start_time,
+            'tapping_start_datetime': self._dt_iso(cycle.tapping_start_datetime),
+            'tapping_end_time': cycle.tapping_end_time,
+            'tapping_end_datetime': self._dt_iso(cycle.tapping_end_datetime),
+            'last_tapping_end_time': cycle.last_tapping_end_time,
+            'last_tapping_end_datetime': self._dt_iso(cycle.last_tapping_end_datetime),
+            'tapping_events': cycle.tapping_events,
+            'deslagging_events': cycle.deslagging_events,
+            'spectro_events': cycle.spectro_events,
+            'pyrometer_events': cycle.pyrometer_events,
+            'locked_trolley_id': cycle.locked_trolley_id,
+            'mould_pourings': [
+                {
+                    'mould_id': p.mould_id,
+                    'mould_track_id': p.mould_track_id,
+                    'start_time': p.start_time,
+                    'start_datetime': self._dt_iso(p.start_datetime),
+                    'end_time': p.end_time,
+                    'end_datetime': self._dt_iso(p.end_datetime),
+                    'duration_seconds': p.duration_seconds,
+                    'sync_id': p.sync_id,
+                    'slno': p.slno,
+                }
+                for p in cycle.mould_pourings
+            ],
+        }
+
+    @staticmethod
+    def _cycle_from_dict(d: dict) -> HeatCycle:
+        """Reconstruct a HeatCycle from a serialized dict."""
+        def _dt(s):
+            return datetime.fromisoformat(s) if s else None
+
+        mould_pourings = [
+            MouldPouringRecord(
+                mould_id=p['mould_id'],
+                mould_track_id=p['mould_track_id'],
+                start_time=p['start_time'],
+                start_datetime=_dt(p.get('start_datetime')),
+                end_time=p.get('end_time'),
+                end_datetime=_dt(p.get('end_datetime')),
+                duration_seconds=p.get('duration_seconds'),
+                sync_id=p.get('sync_id', ''),
+                slno=p.get('slno', 0),
+            )
+            for p in d.get('mould_pourings', [])
+        ]
+
+        return HeatCycle(
+            heat_no=d['heat_no'],
+            ladle_number=d.get('ladle_number', ''),
+            ladle_track_ids=d.get('ladle_track_ids', []),
+            cycle_start_time=d['cycle_start_time'],
+            cycle_start_datetime=_dt(d.get('cycle_start_datetime')),
+            mould_pourings=mould_pourings,
+            cycle_active=True,
+            has_pouring_session=d.get('has_pouring_session', False),
+            last_pouring_presence_time=d.get('last_pouring_presence_time'),
+            last_pouring_presence_datetime=_dt(d.get('last_pouring_presence_datetime')),
+            tapping_start_time=d.get('tapping_start_time'),
+            tapping_start_datetime=_dt(d.get('tapping_start_datetime')),
+            tapping_end_time=d.get('tapping_end_time'),
+            tapping_end_datetime=_dt(d.get('tapping_end_datetime')),
+            last_tapping_end_time=d.get('last_tapping_end_time'),
+            last_tapping_end_datetime=_dt(d.get('last_tapping_end_datetime')),
+            tapping_events=d.get('tapping_events', []),
+            deslagging_events=d.get('deslagging_events', []),
+            spectro_events=d.get('spectro_events', []),
+            pyrometer_events=d.get('pyrometer_events', []),
+            locked_trolley_id=d.get('locked_trolley_id'),
+        )
+
+    def _restore_from_checkpoint(self) -> None:
+        """On startup, restore active cycle from DB checkpoint if present and fresh."""
+        try:
+            raw = self.db_manager.load_active_cycle_checkpoint()
+            if not raw:
+                return
+            d = json.loads(raw)
+            cycle = self._cycle_from_dict(d)
+
+            # Discard if older than 4 hours (well beyond the 300s finalization window)
+            age_s = time.time() - cycle.cycle_start_time
+            if age_s > 4 * 3600:
+                logger.warning(
+                    f"Discarding stale active cycle checkpoint ({age_s / 3600:.1f}h old): {cycle.heat_no}"
+                )
+                self.db_manager.clear_active_cycle_checkpoint()
+                return
+
+            self.active_cycle = cycle
+
+            # Ensure heat_counter is at least as high as the restored cycle
+            try:
+                counter = int(cycle.heat_no.split('_')[1])
+                if counter > self.heat_counter:
+                    self.heat_counter = counter
+            except (IndexError, ValueError):
+                pass
+
+            logger.info(
+                f"✓ Restored active cycle from checkpoint: {cycle.heat_no} "
+                f"(age={age_s:.0f}s, tapping={len(cycle.tapping_events)}, "
+                f"deslagging={len(cycle.deslagging_events)}, "
+                f"moulds={len(cycle.mould_pourings)})"
+            )
+        except Exception as e:
+            logger.error(f"Failed to restore active cycle checkpoint: {e}", exc_info=True)
+            try:
+                self.db_manager.clear_active_cycle_checkpoint()
+            except Exception:
+                pass
+
+    def _maybe_checkpoint(self) -> None:
+        """Write active cycle to DB if the checkpoint interval has elapsed."""
+        if self.active_cycle is None:
+            return
+        now = time.monotonic()
+        if now - self._last_checkpoint_time < _CHECKPOINT_INTERVAL_S:
+            return
+        try:
+            d = self._cycle_to_dict(self.active_cycle)
+            self.db_manager.save_active_cycle_checkpoint(json.dumps(d))
+            self._last_checkpoint_time = now
+            logger.debug(f"Checkpointed {self.active_cycle.heat_no}")
+        except Exception as e:
+            logger.warning(f"Active cycle checkpoint failed: {e}")
+
+    def _clear_checkpoint(self) -> None:
+        """Remove the checkpoint row after a cycle is finalized."""
+        try:
+            self.db_manager.clear_active_cycle_checkpoint()
+        except Exception as e:
+            logger.warning(f"Failed to clear active cycle checkpoint: {e}")
+
+    # ------------------------------------------------------------------ #
+
     def _create_new_cycle(
         self,
         creator_track_id: Optional[int],
@@ -225,11 +469,27 @@ class HeatCycleManager:
 
         if track_id not in cycle.ladle_track_ids:
             cycle.ladle_track_ids.append(track_id)
+        self._maybe_checkpoint()
 
     def update_ladle_presence(self, ladle_track_id: int, current_time: float, current_datetime: datetime) -> None:
         """Backward-compatible alias for older callers."""
         self.update_pouring_session_presence(ladle_track_id, current_time, current_datetime)
-    
+
+    def notify_session_ended(self) -> None:
+        """Called when a pouring session ends. If no moulds were confirmed, reset the
+        has_pouring_session flag so the cycle waits under the tapping_only_timeout path
+        instead of the short ladle_absence_timeout."""
+        if self.active_cycle is None:
+            return
+        cycle = self.active_cycle
+        if cycle.has_pouring_session and not cycle.mould_pourings:
+            cycle.has_pouring_session = False
+            logger.info(
+                "[%s] Session ended with no confirmed moulds — resetting session flag "
+                "(will wait %.0fs for next pour)",
+                cycle.heat_no, self.tapping_only_timeout,
+            )
+
     def add_tapping_event(self, start_wall: float, start_dt: datetime,
                           end_wall: float, end_dt: datetime, duration: float) -> None:
         """
@@ -238,6 +498,7 @@ class HeatCycleManager:
         """
         if self.active_cycle is None:
             self._create_new_cycle(None, start_wall, start_dt, reason="tapping")
+            self._backfill_pre_tapping_events(self.active_cycle, start_dt)
 
         cycle = self.active_cycle
         event = {
@@ -261,6 +522,7 @@ class HeatCycleManager:
             f"  {cycle.heat_no}: Added tapping event ({len(cycle.tapping_events)} total), "
             f"duration={duration:.1f}s"
         )
+        self._maybe_checkpoint()
 
     def add_deslagging_event(self, start_wall: float, start_dt: datetime,
                              end_wall: float, end_dt: datetime, duration: float) -> None:
@@ -280,6 +542,7 @@ class HeatCycleManager:
             f"  {cycle.heat_no}: Added deslagging event ({len(cycle.deslagging_events)} total), "
             f"duration={duration:.1f}s"
         )
+        self._maybe_checkpoint()
 
     def add_spectro_event(self, start_wall: float, start_dt: datetime,
                           end_wall: float, end_dt: datetime, duration: float) -> None:
@@ -299,6 +562,7 @@ class HeatCycleManager:
             f"  {cycle.heat_no}: Added spectro event ({len(cycle.spectro_events)} total), "
             f"duration={duration:.1f}s"
         )
+        self._maybe_checkpoint()
 
     def add_pyrometer_event(self, start_wall: float, start_dt: datetime,
                             end_wall: float, end_dt: datetime, duration: float,
@@ -322,6 +586,7 @@ class HeatCycleManager:
             f"  {cycle.heat_no}: Added pyrometer event{zone_label} "
             f"({len(cycle.pyrometer_events)} total), duration={duration:.1f}s"
         )
+        self._maybe_checkpoint()
 
     def lock_trolley(self, trolley_track_id: int) -> None:
         """Lock the active cycle to a specific trolley (first pour trolley)."""
@@ -374,7 +639,8 @@ class HeatCycleManager:
         
         cycle.mould_pourings.append(pouring)
         logger.info(f"  📊 Added {mould_id} to {cycle.heat_no} ({len(cycle.mould_pourings)} moulds)")
-        
+        self._maybe_checkpoint()
+
         return cycle.heat_no
     
     def update_pouring_end(
@@ -411,8 +677,9 @@ class HeatCycleManager:
                 pouring.end_datetime = end_datetime
                 pouring.duration_seconds = duration_seconds
                 logger.debug(f"  ✓ Updated {mould_id} end time in {cycle.heat_no}")
+                self._maybe_checkpoint()
                 return True
-        
+
         logger.warning(f"Could not find active pouring for {mould_id} in {cycle.heat_no}")
         return False
     
@@ -443,7 +710,7 @@ class HeatCycleManager:
                 finalize_reason = f"pouring session absent for {time_since_last_presence:.1f}s"
         elif cycle.tapping_events and cycle.last_tapping_end_time is not None:
             time_since_tapping_end = current_time - cycle.last_tapping_end_time
-            if time_since_tapping_end >= self.ladle_absence_timeout:
+            if time_since_tapping_end >= self.tapping_only_timeout:
                 finalize_time = cycle.last_tapping_end_time
                 finalize_datetime = cycle.last_tapping_end_datetime or current_datetime
                 finalize_reason = f"no pouring after tapping for {time_since_tapping_end:.1f}s"
@@ -457,6 +724,7 @@ class HeatCycleManager:
         self.previous_cycle_end_datetime = cycle.cycle_end_datetime
         self.finalized_cycles[cycle.heat_no] = cycle
         self.active_cycle = None
+        self._clear_checkpoint()
         return [cycle]
     
     def _finalize_cycle(self, cycle: HeatCycle, end_time: float, end_datetime: datetime) -> None:

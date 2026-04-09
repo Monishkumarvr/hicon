@@ -72,6 +72,7 @@ static constexpr float SESSION_ENTER_S     = 1.0f;
 static constexpr float SESSION_EXIT_S      = 1.5f;
 static constexpr float MOUTH_MISSING_TOL_S = 0.6f;
 static constexpr float MOUTH_HOLD_S        = 0.4f;
+static constexpr float TROLLEY_HOLD_S      = 1.0f;
 
 // Pour ON/OFF hysteresis
 static constexpr float POUR_ON_S           = 0.20f;
@@ -343,7 +344,8 @@ struct _GstHiConPouring {
     /* Frame-count thresholds (recomputed from FPS) */
     int N_ENTER, N_EXIT, K_ON, K_OFF;
     int MOULD_SWITCH_HOLD_F, MIN_POUR_FRAMES, MIN_POUR_DURATION_FRAMES;
-    int MOUTH_MISSING_TOL, MOUTH_HOLD_DUR, T_HOLD_F, MIN_CLUSTER_POUR_F;
+    int MOUTH_MISSING_TOL, MOUTH_HOLD_DUR, TROLLEY_HOLD_DUR, SESSION_END_TOTAL_MISSING;
+    int T_HOLD_F, MIN_CLUSTER_POUR_F;
 
     /* Per-trolley state */
     std::unordered_map<uint64_t, TrolleyState*> *trolley_states;

@@ -20,7 +20,7 @@ TargetManagement:
   # [Creation & Termination Policy]
   minIouDiff4NewTarget: 0.50    # Discard new detections with >50% IOU overlap with existing tracks (lowered from 0.74 to prevent duplicate IDs for same object)
   minTrackerConfidence: 0.4009    # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
-  probationAge: 5    # Require 5 consecutive frames before assigning track ID (increased from 2 to filter transient false detections)
+  probationAge: 1    # Require 1 frame before assigning track ID (mouth flickers at frame level — 2 was too strict)
 
   # HiCon custom: increased from 51 to 2400 frames (~120 seconds at 20 FPS)
   # Prevents new ID assignment when ladle/trolley temporarily leaves frame or is occluded during pouring

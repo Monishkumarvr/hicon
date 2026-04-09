@@ -56,7 +56,12 @@ class BusHandler:
                  stream0_segment_buffer_mode=False, stream0_segment_buffer_state_path="",
                  stream0_startup_grace_sec=None, stream_startup_grace_overrides=None,
                  stream_segment_buffer_state_paths=None,
-                 warn_safety_cap_sec=90):
+                 warn_safety_cap_sec=90,
+                 rtsp_restart_stale_sec=90,
+                 rtsp_restart_cooldown_sec=60,
+                 rtsp_restart_backoff_sec=5,
+                 stream_restart_cb=None,
+                 restartable_stream_ids=None):
         """
         Args:
             pipeline: GStreamer pipeline
@@ -103,6 +108,13 @@ class BusHandler:
             if p
         }
         self._healthcheck_url = (healthcheck_url or "").rstrip("/")
+        self._rtsp_restart_stale_sec = max(1, int(rtsp_restart_stale_sec or 90))
+        self._rtsp_restart_cooldown_sec = max(0, int(rtsp_restart_cooldown_sec or 60))
+        self._rtsp_restart_backoff_sec = max(0, int(rtsp_restart_backoff_sec or 5))
+        self._stream_restart_cb = stream_restart_cb
+        self._restartable_stream_ids = set(restartable_stream_ids or [])
+        self._last_stream_restart = {}
+        self._pending_stream_restarts = set()
 
         # Per-source RTSP error timestamps for rate-limiting
         self._rtsp_errors = {}  # {source_name: [timestamp, ...]}
@@ -126,6 +138,14 @@ class BusHandler:
             logger.info("Stream %s: startup grace extended to %ss", sid, grace)
         if self._healthcheck_url:
             logger.info(f"Healthcheck enabled: {self._healthcheck_url}")
+        if self._restartable_stream_ids:
+            logger.info(
+                "Per-stream restart enabled for streams=%s (stale=%ss cooldown=%ss backoff=%ss)",
+                sorted(self._restartable_stream_ids),
+                self._rtsp_restart_stale_sec,
+                self._rtsp_restart_cooldown_sec,
+                self._rtsp_restart_backoff_sec,
+            )
 
     def _stream_startup_grace_sec(self, stream_id: int) -> int:
         if stream_id in self._stream_startup_grace_overrides:
@@ -189,6 +209,70 @@ class BusHandler:
         """Check if the error source is an rtspsrc element."""
         return src_name.startswith(_RTSP_SOURCE_PREFIX)
 
+    @staticmethod
+    def _stream_id_from_name(src_name: str) -> int:
+        if src_name.startswith(_RTSP_SOURCE_PREFIX):
+            suffix = src_name[len(_RTSP_SOURCE_PREFIX):]
+            return int(suffix) if suffix.isdigit() else -1
+        if src_name.startswith("mux_"):
+            suffix = src_name.split("_", 1)[1]
+            return int(suffix) if suffix.isdigit() else -1
+        return -1
+
+    def _schedule_stream_restart(self, stream_id: int, reason: str) -> bool:
+        if stream_id not in self._restartable_stream_ids or self._stream_restart_cb is None:
+            return False
+
+        now = time.time()
+        if stream_id in self._pending_stream_restarts:
+            logger.warning("[RTSP-RESTART] Stream %s restart already pending (%s)", stream_id, reason)
+            return True
+
+        last_restart = self._last_stream_restart.get(stream_id)
+        if last_restart is not None:
+            elapsed = now - last_restart
+            if elapsed < self._rtsp_restart_cooldown_sec:
+                logger.warning(
+                    "[RTSP-RESTART] Stream %s restart suppressed by cooldown (%.1fs < %ss): %s",
+                    stream_id,
+                    elapsed,
+                    self._rtsp_restart_cooldown_sec,
+                    reason,
+                )
+                return True
+
+        self._pending_stream_restarts.add(stream_id)
+        delay_sec = self._rtsp_restart_backoff_sec
+        logger.warning(
+            "[RTSP-RESTART] Stream %s restart scheduled in %ss (%s)",
+            stream_id,
+            delay_sec,
+            reason,
+        )
+
+        def _run_restart():
+            try:
+                restarted = bool(self._stream_restart_cb(stream_id, reason))
+                if restarted:
+                    self._last_stream_restart[stream_id] = time.time()
+                    self._zero_fps_counts[stream_id] = 0
+                    self.last_frame_time[stream_id] = time.time()
+                else:
+                    logger.error("[RTSP-RESTART] Stream %s restart callback failed (%s)", stream_id, reason)
+            except Exception as exc:
+                logger.error(
+                    "[RTSP-RESTART] Stream %s restart raised: %s",
+                    stream_id,
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                self._pending_stream_restarts.discard(stream_id)
+            return False
+
+        GLib.timeout_add_seconds(delay_sec, _run_restart)
+        return True
+
     def _track_rtsp_error(self, src_name: str) -> bool:
         """
         Track an RTSP error and check if rate limit is exceeded.
@@ -228,7 +312,12 @@ class BusHandler:
         t = message.type
 
         if t == Gst.MessageType.EOS:
-            logger.error("Unexpected end of stream received")
+            src_name = message.src.get_name() if message.src else "unknown"
+            stream_id = self._stream_id_from_name(src_name)
+            if self._schedule_stream_restart(stream_id, f"EOS from {src_name}"):
+                logger.warning("[RTSP-EOS] Recoverable EOS from %s; stream restart scheduled", src_name)
+                return
+            logger.error("Unexpected end of stream received from %s", src_name)
             self._ping_healthcheck("/fail")
             self.fatal_exit = True
             self.loop.quit()
@@ -243,6 +332,9 @@ class BusHandler:
             # Classify: RTSP source errors are non-fatal (rtspsrc retries)
             if self._is_rtsp_source(src_name):
                 if self._track_rtsp_error(src_name):
+                    stream_id = self._stream_id_from_name(src_name)
+                    if self._schedule_stream_restart(stream_id, f"RTSP error rate from {src_name}"):
+                        return
                     # Rate limit exceeded — check per-stream policy
                     try:
                         stream_id = int(src_name.replace(_RTSP_SOURCE_PREFIX, ''))
@@ -360,6 +452,18 @@ class BusHandler:
                     self._zero_fps_counts[sid] = self._zero_fps_counts.get(sid, 0) + 1
                     if self._zero_fps_counts[sid] >= self._zero_fps_limit:
                         stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
+                        if sid in self._restartable_stream_ids:
+                            logger.warning(
+                                f"[FPS-WATCHDOG] Stream {sid} at 0fps for {stall_sec}s — "
+                                f"waiting for per-stream restart threshold"
+                            )
+                            if stall_sec >= self._rtsp_restart_stale_sec:
+                                if self._schedule_stream_restart(
+                                    sid,
+                                    f"0fps for {stall_sec}s",
+                                ):
+                                    self._zero_fps_counts[sid] = 0
+                            continue
                         policy = self._stream_zero_fps_policy.get(sid, 'restart')
                         if policy == 'warn':
                             logger.warning(

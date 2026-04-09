@@ -45,6 +45,7 @@ class DummyConfig:
     EDGE_EXPAND_PX = 180
     MOUTH_MISSING_TOL_S = 0.6
     MOUTH_HOLD_S = 0.4
+    PHANTOM_TROLLEY_TIMEOUT_S = 5.0
     POURING_CYCLE_TIMEOUT_S = 300.0
     ENABLE_INFERENCE_VIDEO = False
     VIDEO_DIR = Path("/tmp")
@@ -276,11 +277,26 @@ def test_reference_probe_uses_v_channel_and_five_offsets(tmp_path):
     assert abs(brightness - 210.0) < 1.0
 
 
-def test_mouth_in_trolley_uses_full_bbox_expand(tmp_path):
+def test_probe_brightness_accepts_float_probe_coordinates(tmp_path):
+    proc = _make_proc(tmp_path)
+    frame = np.zeros((120, 160, 4), dtype=np.uint8)
+    frame[45:65, 70:90, :3] = 255
+
+    brightness = proc._measure_multi_probe_brightness(frame, 80.4, 55.6)
+    assert brightness >= 0.0
+
+
+def test_mouth_in_trolley_expands_top_edge_only(tmp_path):
     proc = _make_proc(tmp_path)
     trolley = {"bbox": (100, 100, 200, 200)}
-    mouth = {"center": (40, 150)}
-    assert proc._is_mouth_in_expanded_trolley(mouth, trolley) is True
+    # Above top edge within expand window → True
+    assert proc._is_mouth_in_expanded_trolley({"center": (150, 50)}, trolley) is True
+    # Outside left edge (no left expansion) → False
+    assert proc._is_mouth_in_expanded_trolley({"center": (40, 150)}, trolley) is False
+    # Outside right edge (no right expansion) → False
+    assert proc._is_mouth_in_expanded_trolley({"center": (260, 150)}, trolley) is False
+    # Below bottom edge (no bottom expansion) → False
+    assert proc._is_mouth_in_expanded_trolley({"center": (150, 250)}, trolley) is False
 
 
 def test_reference_motion_split_uses_sustained_hold(tmp_path):

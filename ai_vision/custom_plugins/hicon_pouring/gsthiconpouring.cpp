@@ -10,6 +10,7 @@
  */
 
 #include "gsthiconpouring.h"
+#include "association_logic.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,12 +19,15 @@
 #include <climits>
 #include <cfloat>
 #include <algorithm>
+#include <iomanip>
 #include <numeric>
 #include <iostream>
 #include <sstream>
 
 GST_DEBUG_CATEGORY_STATIC(gst_hicon_pouring_debug);
 #define GST_CAT_DEFAULT gst_hicon_pouring_debug
+
+namespace assoc = hicon_pouring_assoc;
 
 /* Default property values */
 enum {
@@ -172,6 +176,11 @@ static gint env_int_value(const char *name, gint default_value) {
     return (gint)value;
 }
 
+static inline bool should_log_assoc_frame(int frame_idx) {
+    return frame_idx == 10 || frame_idx == 25 || frame_idx == 50 ||
+           frame_idx == 100 || (frame_idx % 250) == 0;
+}
+
 static inline gint scale_pixel_value_int(float value, float scale, gint minimum = 0) {
     return std::max(minimum, (gint)std::lround(value * scale));
 }
@@ -182,6 +191,16 @@ static inline gint scale_offset_value(gint value, float scale) {
 
 static inline float scale_pixel_value_float(float value, float scale, float minimum = 0.0f) {
     return std::max(minimum, value * scale);
+}
+
+static inline bool trolley_state_has_handoff_context(const TrolleyState *st) {
+    return st->session_active ||
+           st->in_count > 0 ||
+           st->out_count > 0 ||
+           st->active_probe_track_id != UINT64_MAX ||
+           st->active_probe_bbox_valid ||
+           !st->completed.empty() ||
+           !st->mould_completed_times.empty();
 }
 
 /* ================================================================
@@ -567,6 +586,8 @@ static void recompute_thresholds(GstHiConPouring *self) {
     self->MIN_POUR_DURATION_FRAMES = sec_to_frames(MIN_POUR_DURATION_S, fps);
     self->MOUTH_MISSING_TOL     = sec_to_frames(MOUTH_MISSING_TOL_S, fps);
     self->MOUTH_HOLD_DUR        = sec_to_frames(MOUTH_HOLD_S, fps);
+    self->TROLLEY_HOLD_DUR      = sec_to_frames(TROLLEY_HOLD_S, fps);
+    self->SESSION_END_TOTAL_MISSING = self->MOUTH_MISSING_TOL + self->N_EXIT;
     self->T_HOLD_F              = sec_to_frames(T_HOLD_S, fps);
     self->MIN_CLUSTER_POUR_F    = sec_to_frames(MIN_CLUSTER_POUR_S, fps);
 }
@@ -653,6 +674,86 @@ static void recompute_runtime_geometry(GstHiConPouring *self, int frame_w, int f
     );
 }
 
+static TrolleyState *handoff_trolley_state_if_needed(
+    GstHiConPouring *self,
+    uint64_t new_tid,
+    const float new_bbox[4],
+    const std::set<uint64_t> &seen_tids,
+    int frame_idx,
+    guint source_id,
+    gboolean session_diag_enabled)
+{
+    const int max_gap_frames = sec_to_frames(TROLLEY_GONE_S, self->video_fps);
+    const assoc::Box incoming_bbox{new_bbox[0], new_bbox[1], new_bbox[2], new_bbox[3]};
+    std::vector<assoc::TrolleyCandidate> candidates;
+    std::vector<uint64_t> candidate_ids;
+
+    for (auto &kv : *self->trolley_states) {
+        const uint64_t old_tid = kv.first;
+        TrolleyState *st = kv.second;
+        if (old_tid == new_tid || seen_tids.find(old_tid) != seen_tids.end()) {
+            continue;
+        }
+        if (!st->bbox_valid || st->last_seen_f < 0) {
+            continue;
+        }
+        if ((frame_idx - st->last_seen_f) > max_gap_frames) {
+            continue;
+        }
+        if (!trolley_state_has_handoff_context(st)) {
+            continue;
+        }
+        candidates.push_back(
+            assoc::TrolleyCandidate{
+                old_tid,
+                assoc::Box{st->bbox[0], st->bbox[1], st->bbox[2], st->bbox[3]},
+            });
+        candidate_ids.push_back(old_tid);
+    }
+
+    const int handoff_idx = assoc::find_best_handoff_trolley(incoming_bbox, candidates, 0.25f);
+    if (handoff_idx < 0) {
+        return nullptr;
+    }
+
+    const uint64_t old_tid = candidate_ids[(size_t)handoff_idx];
+    auto existing_it = self->trolley_states->find(old_tid);
+    if (existing_it == self->trolley_states->end()) {
+        return nullptr;
+    }
+
+    TrolleyState *st = existing_it->second;
+    const float handoff_iou = assoc::bbox_iou(incoming_bbox, candidates[(size_t)handoff_idx].bbox);
+    const int frame_gap = frame_idx - st->last_seen_f;
+
+    self->trolley_states->erase(existing_it);
+    st->tid = new_tid;
+    st->last_disappeared_f = -1;
+    (*self->trolley_states)[new_tid] = st;
+
+    int carried_count = 0;
+    auto count_it = self->trolley_id_to_count->find(old_tid);
+    if (count_it != self->trolley_id_to_count->end()) {
+        carried_count = count_it->second;
+        self->trolley_id_to_count->erase(count_it);
+    }
+    (*self->trolley_id_to_count)[new_tid] = carried_count;
+
+    if (session_diag_enabled) {
+        g_print(
+            "[CPP-SESSION][stream%u] frame=%d handoff old_tid=%lu new_tid=%lu gap=%d iou=%.3f session=%d\n",
+            source_id,
+            frame_idx,
+            (unsigned long)old_tid,
+            (unsigned long)new_tid,
+            frame_gap,
+            handoff_iou,
+            st->session_active ? 1 : 0);
+    }
+
+    return st;
+}
+
 static GstPadProbeReturn
 hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
 {
@@ -720,18 +821,39 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
             else if (det.class_id == CLASS_LADLE_MOUTH) mouth_dets.push_back(det);
         }
 
+        const bool assoc_log_enabled =
+            env_flag_enabled("HICON_STREAM_0_CPP_ASSOC_LOG", FALSE) &&
+            frame_meta->source_id == 0 &&
+            should_log_assoc_frame(frame_idx);
+        const bool session_diag_enabled =
+            env_flag_enabled("HICON_STREAM_0_CPP_SESSION_DIAG", FALSE) &&
+            frame_meta->source_id == 0;
+        const bool session_diag_frame = session_diag_enabled && should_log_assoc_frame(frame_idx);
+
         /* Steps 2-4 restored from original probe code below */
         std::set<uint64_t> seen_tids;
-        for (auto &tr : trolley_dets) {
+        for (const auto &tr : trolley_dets) {
             seen_tids.insert(tr.track_id);
+        }
+        for (auto &tr : trolley_dets) {
             TrolleyState *st = nullptr;
             auto it = self->trolley_states->find(tr.track_id);
             if (it == self->trolley_states->end()) {
-                st = new TrolleyState();
-                st->tid = tr.track_id;
-                (*self->trolley_states)[tr.track_id] = st;
-                if (self->trolley_id_to_count->find(tr.track_id) == self->trolley_id_to_count->end())
-                    (*self->trolley_id_to_count)[tr.track_id] = 0;
+                st = handoff_trolley_state_if_needed(
+                    self,
+                    tr.track_id,
+                    tr.bbox,
+                    seen_tids,
+                    frame_idx,
+                    frame_meta->source_id,
+                    session_diag_enabled);
+                if (st == nullptr) {
+                    st = new TrolleyState();
+                    st->tid = tr.track_id;
+                    (*self->trolley_states)[tr.track_id] = st;
+                    if (self->trolley_id_to_count->find(tr.track_id) == self->trolley_id_to_count->end())
+                        (*self->trolley_id_to_count)[tr.track_id] = 0;
+                }
             } else {
                 st = it->second;
                 if (st->last_disappeared_f >= 0 &&
@@ -748,10 +870,15 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
 
         /* Step 3: Finalize disappeared trolleys */
         std::vector<uint64_t> to_remove;
+        const int trolley_gone_frames = sec_to_frames(TROLLEY_GONE_S, self->video_fps);
         for (auto &kv : *self->trolley_states) {
             TrolleyState *st = kv.second;
+            int removal_threshold = trolley_gone_frames;
+            if (st->session_active || st->active_probe_track_id != UINT64_MAX || st->active_probe_bbox_valid) {
+                removal_threshold = std::max(removal_threshold, self->SESSION_END_TOTAL_MISSING);
+            }
             if (st->last_seen_f >= 0 &&
-                (frame_idx - st->last_seen_f) > sec_to_frames(TROLLEY_GONE_S, self->video_fps)) {
+                (frame_idx - st->last_seen_f) > removal_threshold) {
                 if (!st->completed.empty() || st->session_active ||
                     !st->mould_completed_times.empty()) {
                     finalize_trolley(self, st, frame_idx);
@@ -776,50 +903,83 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
         meta_out.version = HICON_POURING_META_VERSION;
         meta_out.event = HiConPouringMeta::NONE;
 
-        struct ProbeHit {
+        struct MouthHit {
             const Detection *det = nullptr;
+            float mouth_cx = 0.0f;
+            float mouth_cy = 0.0f;
             float probe_x = 0.0f;
             float probe_y = 0.0f;
         };
 
-        std::unordered_map<uint64_t, std::vector<ProbeHit>> probes_by_trolley;
-        probes_by_trolley.reserve(self->trolley_states->size());
+        std::unordered_map<uint64_t, std::vector<MouthHit>> mouth_candidates_by_trolley;
+        mouth_candidates_by_trolley.reserve(self->trolley_states->size());
+        std::vector<assoc::TrolleyCandidate> associable_trolleys;
+        associable_trolleys.reserve(self->trolley_states->size());
 
         for (auto &kv : *self->trolley_states) {
             TrolleyState *st = kv.second;
             st->active_probe_from_hold = false;
+            bool bbox_fresh = st->bbox_valid && st->last_seen_f == frame_idx;
+            bool trolley_hold_active =
+                st->bbox_valid &&
+                st->session_active &&
+                !bbox_fresh &&
+                assoc::is_within_hold_window(
+                    frame_idx, st->last_seen_f, self->TROLLEY_HOLD_DUR);
+            if (bbox_fresh || trolley_hold_active) {
+                associable_trolleys.push_back(
+                    assoc::TrolleyCandidate{
+                        st->tid,
+                        assoc::Box{st->bbox[0], st->bbox[1], st->bbox[2], st->bbox[3]},
+                    });
+            }
         }
 
         for (auto &m : mouth_dets) {
+            assoc::MouthCandidate mouth_candidate{
+                m.track_id,
+                m.conf,
+                assoc::Box{m.bbox[0], m.bbox[1], m.bbox[2], m.bbox[3]},
+            };
+            int best_idx = assoc::find_best_trolley_for_mouth(
+                mouth_candidate,
+                associable_trolleys,
+                self->edge_expand_x_px,
+                self->edge_expand_y_px);
+            if (best_idx < 0) continue;
+
+            float mouth_cx = 0.0f;
+            float mouth_cy = 0.0f;
+            bbox_center(m.bbox, mouth_cx, mouth_cy);
             float probe_x = 0.0f;
             float probe_y = 0.0f;
             mouth_probe_point_scaled(m.bbox, self->probe_below_px, probe_x, probe_y);
 
-            TrolleyState *best_st = nullptr;
-            float best_center_y = -FLT_MAX;
-            for (auto &kv : *self->trolley_states) {
-                TrolleyState *st = kv.second;
-                bool bbox_fresh = (st->bbox_valid && st->last_seen_f == frame_idx);
-                if (!bbox_fresh) continue;
-                float tb_exp[4];
-                expand_bbox_xy(st->bbox, self->edge_expand_x_px, self->edge_expand_y_px, tb_exp);
-                if (!point_in_bbox(probe_x, probe_y, tb_exp)) continue;
-
-                float tcx = 0.0f, tcy = 0.0f;
-                bbox_center(st->bbox, tcx, tcy);
-                if (!best_st || tcy > best_center_y) {
-                    best_st = st;
-                    best_center_y = tcy;
-                }
-            }
-
-            if (!best_st) continue;
-
-            ProbeHit hit;
+            MouthHit hit;
             hit.det = &m;
+            hit.mouth_cx = mouth_cx;
+            hit.mouth_cy = mouth_cy;
             hit.probe_x = probe_x;
             hit.probe_y = probe_y;
-            probes_by_trolley[best_st->tid].push_back(hit);
+            mouth_candidates_by_trolley[associable_trolleys[(size_t)best_idx].tid].push_back(hit);
+        }
+
+        std::string tracked_mouths_summary = "none";
+        if (assoc_log_enabled && !mouth_dets.empty()) {
+            std::ostringstream tracked_mouths_desc;
+            for (size_t i = 0; i < mouth_dets.size(); ++i) {
+                float mouth_cx = 0.0f;
+                float mouth_cy = 0.0f;
+                bbox_center(mouth_dets[i].bbox, mouth_cx, mouth_cy);
+                if (i > 0) tracked_mouths_desc << ";";
+                tracked_mouths_desc << "tid=" << (unsigned long)mouth_dets[i].track_id
+                                    << "@"
+                                    << std::fixed << std::setprecision(3)
+                                    << mouth_dets[i].conf
+                                    << " center=(" << std::setprecision(1)
+                                    << mouth_cx << "," << mouth_cy << ")";
+            }
+            tracked_mouths_summary = tracked_mouths_desc.str();
         }
 
         auto meta_priority = [](const HiConPouringMeta &meta) -> int {
@@ -842,25 +1002,41 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
             if (!st->bbox_valid) continue;
 
             bool bbox_fresh = (st->last_seen_f == frame_idx);
-            auto probes_it = probes_by_trolley.find(st->tid);
-            std::vector<ProbeHit> *probes =
-                (probes_it != probes_by_trolley.end()) ? &probes_it->second : nullptr;
-            bool has_current_probe = (probes && !probes->empty());
-            const ProbeHit *selected = nullptr;
+            bool trolley_hold_active =
+                st->session_active &&
+                !bbox_fresh &&
+                assoc::is_within_hold_window(
+                    frame_idx, st->last_seen_f, self->TROLLEY_HOLD_DUR);
+            bool bbox_available_for_assoc = bbox_fresh || trolley_hold_active;
+            float tb_exp[4];
+            expand_bbox_xy(st->bbox, self->edge_expand_x_px, self->edge_expand_y_px, tb_exp);
 
-            if (has_current_probe) {
-                for (auto &probe : *probes) {
-                    if (probe.det->track_id == st->active_probe_track_id) {
-                        selected = &probe;
-                    }
+            auto mouths_it = mouth_candidates_by_trolley.find(st->tid);
+            std::vector<MouthHit> *current_mouths =
+                (mouths_it != mouth_candidates_by_trolley.end()) ? &mouths_it->second : nullptr;
+            bool has_current_mouth = (current_mouths && !current_mouths->empty());
+            const MouthHit *selected = nullptr;
+
+            if (has_current_mouth) {
+                std::vector<assoc::MouthCandidate> selection_candidates;
+                selection_candidates.reserve(current_mouths->size());
+                for (auto &mouth : *current_mouths) {
+                    selection_candidates.push_back(
+                        assoc::MouthCandidate{
+                            mouth.det->track_id,
+                            mouth.det->conf,
+                            assoc::Box{
+                                mouth.det->bbox[0],
+                                mouth.det->bbox[1],
+                                mouth.det->bbox[2],
+                                mouth.det->bbox[3],
+                            },
+                        });
                 }
-                if (!selected) {
-                    selected = &(*probes)[0];
-                    for (auto &probe : *probes) {
-                        if (probe.det->conf > selected->det->conf) {
-                            selected = &probe;
-                        }
-                    }
+                int selected_idx = assoc::select_mouth_candidate_index(
+                    selection_candidates, st->active_probe_track_id);
+                if (selected_idx >= 0) {
+                    selected = &(*current_mouths)[(size_t)selected_idx];
                 }
             }
 
@@ -888,24 +1064,36 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
             local_meta.trolley_track_id = st->tid;
             memcpy(local_meta.trolley_bbox, st->bbox, sizeof(float) * 4);
 
-            if (!st->session_active && has_current_probe && st->out_count == 0 && st->in_count >= self->N_ENTER) {
+            if (!st->session_active && bbox_fresh && selected &&
+                st->out_count == 0 && st->in_count >= self->N_ENTER) {
                 st->session_active  = true;
                 st->session_start_f = frame_idx - self->N_ENTER + 1;
                 st->session_end_f   = -1;
                 clear_frozen_probe(st);
-                clear_active_probe(st);
                 local_meta.event = HiConPouringMeta::SESSION_START;
             }
 
             /* Session end */
             if (st->session_active) {
                 int probe_missing = frame_idx - st->active_probe_last_seen_f;
-                if (st->out_count >= self->N_EXIT || probe_missing > self->MOUTH_MISSING_TOL) {
+                if (!selected && probe_missing >= self->SESSION_END_TOTAL_MISSING) {
                     st->session_active = false;
                     st->session_end_f  = frame_idx;
                     clear_frozen_probe(st);
                     clear_active_probe(st);
                     local_meta.event = HiConPouringMeta::SESSION_END;
+                    if (session_diag_enabled) {
+                        g_print(
+                            "[CPP-SESSION][stream%u] frame=%d trolley=%lu event=end reason=missing_total "
+                            "missing=%d threshold=%d out_count=%d trolley_hold=%d\n",
+                            frame_meta->source_id,
+                            frame_idx,
+                            (unsigned long)st->tid,
+                            probe_missing,
+                            self->SESSION_END_TOTAL_MISSING,
+                            st->out_count,
+                            trolley_hold_active ? 1 : 0);
+                    }
                     int priority = meta_priority(local_meta);
                     if (priority > best_meta_priority) {
                         meta_out = local_meta;
@@ -919,26 +1107,40 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
             bool mouth_present_in_trolley = false;
             float mouth_bbox_use[4] = {0, 0, 0, 0};
             float probe_x_use = 0.0f, probe_y_use = 0.0f;
+            float mouth_center_x_use = 0.0f, mouth_center_y_use = 0.0f;
+            bool mouth_center_valid = false;
             float mouth_nx = -1.0f, mouth_ny = -1.0f;
             uint64_t mouth_track_id = UINT64_MAX;
+            const char *assoc_rejection_reason = "no_current_mouth_center_inside_expanded_trolley";
 
             if (selected) {
                 probe_x_use = selected->probe_x;
                 probe_y_use = selected->probe_y;
+                mouth_center_x_use = selected->mouth_cx;
+                mouth_center_y_use = selected->mouth_cy;
+                mouth_center_valid = true;
                 memcpy(mouth_bbox_use, selected->det->bbox, sizeof(float) * 4);
                 mouth_track_id = selected->det->track_id;
                 mouth_present_in_trolley = true;
                 use_probe = true;
             } else if (st->active_probe_pt_valid &&
-                       (frame_idx - st->active_probe_last_seen_f) <= self->MOUTH_HOLD_DUR) {
+                       assoc::is_within_hold_window(
+                           frame_idx, st->active_probe_last_seen_f, self->MOUTH_HOLD_DUR)) {
                 probe_x_use = st->active_probe_pt_px[0];
                 probe_y_use = st->active_probe_pt_px[1];
                 if (st->active_probe_bbox_valid) {
                     memcpy(mouth_bbox_use, st->active_probe_bbox, sizeof(float) * 4);
+                    bbox_center(st->active_probe_bbox, mouth_center_x_use, mouth_center_y_use);
+                    mouth_center_valid = true;
                 }
                 mouth_track_id = st->active_probe_track_id;
                 st->active_probe_from_hold = true;
                 use_probe = true;
+                assoc_rejection_reason = "using_hold_state";
+            } else if (!bbox_available_for_assoc) {
+                assoc_rejection_reason = "stale_trolley_bbox";
+            } else if (mouth_dets.empty()) {
+                assoc_rejection_reason = "no_tracked_mouths";
             }
 
             local_meta.session_active = st->session_active ? 1u : 0u;
@@ -950,16 +1152,18 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
                 local_meta.probe_x_px = probe_x_use;
                 local_meta.probe_y_px = probe_y_use;
                 memcpy(local_meta.mouth_bbox, mouth_bbox_use, sizeof(float) * 4);
-                norm_point_in_expanded_trolley(
-                    probe_x_use,
-                    probe_y_use,
-                    st->bbox,
-                    self->edge_expand_x_px,
-                    self->edge_expand_y_px,
-                    mouth_nx,
-                    mouth_ny
-                );
-                if (bbox_fresh && mouth_nx >= 0.0f && mouth_ny >= 0.0f) {
+                if (bbox_available_for_assoc && mouth_center_valid) {
+                    assoc::normalize_point_in_expanded_trolley(
+                        mouth_center_x_use,
+                        mouth_center_y_use,
+                        assoc::Box{st->bbox[0], st->bbox[1], st->bbox[2], st->bbox[3]},
+                        self->edge_expand_x_px,
+                        self->edge_expand_y_px,
+                        mouth_nx,
+                        mouth_ny
+                    );
+                }
+                if (bbox_available_for_assoc && mouth_center_valid && mouth_nx >= 0.0f && mouth_ny >= 0.0f) {
                     local_meta.mouth_norm_x = mouth_nx;
                     local_meta.mouth_norm_y = mouth_ny;
                 } else {
@@ -975,6 +1179,76 @@ hicon_pouring_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
             if (priority > best_meta_priority) {
                 meta_out = local_meta;
                 best_meta_priority = priority;
+            }
+
+            if (session_diag_frame &&
+                (st->session_active || local_meta.event != HiConPouringMeta::NONE || trolley_hold_active)) {
+                const int probe_missing = frame_idx - st->active_probe_last_seen_f;
+                g_print(
+                    "[CPP-SESSION][stream%u] frame=%d trolley=%lu session=%d event=%u fresh=%d "
+                    "trolley_hold=%d selected=%d out_count=%d missing=%d end_total=%d\n",
+                    frame_meta->source_id,
+                    frame_idx,
+                    (unsigned long)st->tid,
+                    st->session_active ? 1 : 0,
+                    local_meta.event,
+                    bbox_fresh ? 1 : 0,
+                    trolley_hold_active ? 1 : 0,
+                    selected ? 1 : 0,
+                    st->out_count,
+                    probe_missing,
+                    self->SESSION_END_TOTAL_MISSING);
+            }
+
+            if (assoc_log_enabled) {
+                std::ostringstream candidates_desc;
+                if (current_mouths && !current_mouths->empty()) {
+                    for (size_t i = 0; i < current_mouths->size(); ++i) {
+                        const auto &mouth = (*current_mouths)[i];
+                        if (i > 0) candidates_desc << ";";
+                        candidates_desc << "tid=" << (unsigned long)mouth.det->track_id
+                                        << "@"
+                                        << std::fixed << std::setprecision(3)
+                                        << mouth.det->conf
+                                        << " center=(" << std::setprecision(1)
+                                        << mouth.mouth_cx << "," << mouth.mouth_cy << ")";
+                    }
+                } else {
+                    candidates_desc << "none";
+                }
+
+                std::ostringstream assoc_log;
+                assoc_log << "[CPP-ASSOC][stream" << frame_meta->source_id << "]"
+                          << " frame=" << frame_idx
+                          << " trolley=" << (unsigned long)st->tid
+                          << " fresh=" << (bbox_fresh ? 1 : 0)
+                          << " trolley_hold=" << (trolley_hold_active ? 1 : 0)
+                          << " expanded=(" << std::fixed << std::setprecision(1)
+                          << tb_exp[0] << "," << tb_exp[1] << ","
+                          << tb_exp[2] << "," << tb_exp[3] << ")"
+                          << " tracked_mouths=" << tracked_mouths_summary
+                          << " candidates=" << candidates_desc.str();
+
+                if (selected) {
+                    assoc_log << " selected_tid=" << (unsigned long)selected->det->track_id
+                              << " mode=current"
+                              << " mouth_center=(" << selected->mouth_cx << ","
+                              << selected->mouth_cy << ")"
+                              << " probe=(" << selected->probe_x << ","
+                              << selected->probe_y << ")";
+                } else if (use_probe) {
+                    assoc_log << " selected_tid=" << (unsigned long)mouth_track_id
+                              << " mode=hold"
+                              << " mouth_center=(" << mouth_center_x_use << ","
+                              << mouth_center_y_use << ")"
+                              << " probe=(" << probe_x_use << ","
+                              << probe_y_use << ")";
+                } else {
+                    assoc_log << " selected_tid=none mode=none reject="
+                              << assoc_rejection_reason;
+                }
+
+                g_print("%s\n", assoc_log.str().c_str());
             }
         }
 

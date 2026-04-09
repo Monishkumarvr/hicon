@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from db_manager import HiConDatabase
-from processors.pouring_analysis_controller import HybridPouringController
-from processors.pouring_meta_reader import DecodedPouringState, EVENT_SESSION_START
+from processors.melting_analysis_controller import MeltingAnalysisController
+from processors.melting_meta_reader import DecodedMeltingState, DecodedMeltingZoneState
 from processors.pouring_processor import PouringProcessor
 from state.heat_cycle_manager import HeatCycleManager
 
@@ -15,6 +15,7 @@ class DummyDB:
     def __init__(self):
         self.inserted_heat_cycles = []
         self.inserted_pouring_events = []
+        self.inserted_melting_events = []
 
     def insert_pouring_event(self, **kwargs):
         self.inserted_pouring_events.append(kwargs)
@@ -27,11 +28,14 @@ class DummyDB:
         self.inserted_heat_cycles.append(kwargs)
         return "0001"
 
+    def insert_melting_event(self, **kwargs):
+        self.inserted_melting_events.append(kwargs)
+        return "0002"
+
 
 class DummyConfig:
     CUSTOMER_ID = "C1"
     LOCATION = "Loc"
-    CAMERA_ID = "Cam-0"
     CAMERA_ID_STREAM_0 = "Cam-0"
     MOUTH_CONFIDENCE = 0.4
     TROLLEY_CONFIDENCE = 0.25
@@ -55,12 +59,13 @@ class DummyConfig:
     EDGE_EXPAND_PX = 180
     MOUTH_MISSING_TOL_S = 0.6
     MOUTH_HOLD_S = 0.4
+    PHANTOM_TROLLEY_TIMEOUT_S = 5.0
     POURING_CYCLE_TIMEOUT_S = 300.0
     ENABLE_INFERENCE_VIDEO = False
     VIDEO_DIR = Path("/tmp")
 
 
-class CaptureHeatCycleManager:
+class CapturePresenceHeatCycleManager:
     def __init__(self):
         self.calls = []
 
@@ -71,27 +76,12 @@ class CaptureHeatCycleManager:
         return []
 
 
-class HeatBootstrapManager(CaptureHeatCycleManager):
-    def __init__(self, heat_no="HEAT_TEST"):
-        super().__init__()
-        self.active_cycle = None
-        self.heat_no = heat_no
+class CaptureTappingHeatCycleManager:
+    def __init__(self):
+        self.calls = []
 
-    def update_pouring_session_presence(self, track_id, current_time, current_datetime):
-        super().update_pouring_session_presence(track_id, current_time, current_datetime)
-        self.active_cycle = SimpleNamespace(heat_no=self.heat_no)
-
-
-class FinalizingHeatCycleManager:
-    def __init__(self, cycle):
-        self.cycle = cycle
-        self.calls = 0
-
-    def check_and_finalize_cycles(self, current_time, current_datetime):
-        self.calls += 1
-        if self.calls == 1:
-            return [self.cycle]
-        return []
+    def add_tapping_event(self, **kwargs):
+        self.calls.append(kwargs)
 
 
 def _make_db(tmp_path):
@@ -107,12 +97,52 @@ def _make_processor(tmp_path, heat_cycle_manager):
     )
 
 
-def _make_hybrid_controller(tmp_path, heat_cycle_manager):
-    return HybridPouringController(
-        db_manager=DummyDB(),
-        config=DummyConfig(),
+def _make_melting_controller(tmp_path, db_manager, heat_cycle_manager=None):
+    zones = {
+        "metadata": {"ref_width": 40, "ref_height": 40},
+        "tapping": {
+            "zones": {
+                "tap-1": {"roi_points": [[5, 5], [20, 5], [20, 20], [5, 20]]}
+            },
+            "abs_brightness_threshold": 210,
+            "start_white_ratio": 0.25,
+            "start_frame_count": 20,
+            "end_white_ratio": 0.1,
+            "end_frame_count": 25,
+        },
+        "deslagging": {"zones": {}},
+        "spectro": {"zones": {}},
+    }
+    return MeltingAnalysisController(
+        zones_config=zones,
+        db_manager=db_manager,
+        config=DummyConfig,
         screenshot_dir=str(tmp_path),
         heat_cycle_manager=heat_cycle_manager,
+        enable_display_meta=False,
+    )
+
+
+def _native_melting_state(*, tapping_active):
+    return DecodedMeltingState(
+        version=1,
+        debug_code=0,
+        blackout_active=False,
+        frame_num=1,
+        ntp_timestamp=0,
+        tapping=[
+            DecodedMeltingZoneState(
+                valid=True,
+                active=tapping_active,
+                raw_count=1 if tapping_active else 0,
+                filtered_count=1 if tapping_active else 0,
+                white_ratio=0.4 if tapping_active else 0.0,
+                max_blob_area=0.0,
+                max_blob_brightness=0.0,
+            )
+        ],
+        deslagging=[],
+        spectro=[],
     )
 
 
@@ -142,7 +172,11 @@ def test_pouring_cycle_finalizes_at_last_valid_presence_and_backfills_next_start
 
 def test_tapping_only_cycle_finalizes_at_last_tapping_end(tmp_path):
     db = _make_db(tmp_path)
-    manager = HeatCycleManager(db, ladle_absence_timeout=300.0)
+    manager = HeatCycleManager(
+        db,
+        ladle_absence_timeout=300.0,
+        tapping_only_timeout=300.0,
+    )
 
     tap1_start = datetime(2026, 3, 31, 11, 0, 0)
     tap1_end = tap1_start + timedelta(seconds=15)
@@ -162,8 +196,6 @@ def test_tapping_only_cycle_finalizes_at_last_tapping_end(tmp_path):
     assert cycle.cycle_end_datetime == tap2_end
     assert cycle.total_pouring_time == 0
     assert cycle.mould_wise_pouring_time == []
-    assert cycle.pouring_start_time is None
-    assert cycle.pouring_end_time is None
 
 
 def test_non_creator_events_do_not_create_cycle(tmp_path):
@@ -179,7 +211,7 @@ def test_non_creator_events_do_not_create_cycle(tmp_path):
 
 
 def test_pouring_processor_refreshes_heat_cycle_only_after_session_is_active(tmp_path):
-    heat_cycle_manager = CaptureHeatCycleManager()
+    heat_cycle_manager = CapturePresenceHeatCycleManager()
     processor = _make_processor(tmp_path, heat_cycle_manager)
 
     mouth = {
@@ -207,107 +239,50 @@ def test_pouring_processor_refreshes_heat_cycle_only_after_session_is_active(tmp
         processor.session_active = True
 
     processor._update_session = _activate_session
-    processor.process_frame(frame_meta, object(), 11.0, datetime(2026, 3, 31, 13, 0, 1))
-    assert len(heat_cycle_manager.calls) == 1
-    assert heat_cycle_manager.calls[0][0] == 5
-
-
-def test_hybrid_controller_refreshes_heat_cycle_only_for_mouth_in_trolley(tmp_path):
-    heat_cycle_manager = CaptureHeatCycleManager()
-    controller = _make_hybrid_controller(tmp_path, heat_cycle_manager)
-    frame_meta = SimpleNamespace(source_frame_width=1280, source_frame_height=720)
-
-    active_state = DecodedPouringState(
-        version=2,
-        session_active=True,
-        mouth_present_in_trolley=True,
-        probe_valid=True,
-        event=EVENT_SESSION_START,
-        trolley_track_id=7,
-        mouth_track_id=5,
-        trolley_bbox=(100.0, 100.0, 200.0, 220.0),
-        mouth_bbox=(120.0, 120.0, 150.0, 150.0),
-        probe_x_px=135.0,
-        probe_y_px=200.0,
-        mouth_norm_x=0.35,
-        mouth_norm_y=0.40,
-    )
-    controller.process_native_state(
-        frame_meta=frame_meta,
-        native_state=active_state,
-        frame=None,
-        timestamp=10.0,
-        datetime_obj=datetime(2026, 3, 31, 13, 0, 0),
+    processor.process_frame(
+        frame_meta,
+        np.zeros((8, 8, 4), dtype=np.uint8),
+        11.0,
+        datetime(2026, 3, 31, 13, 0, 1),
     )
     assert len(heat_cycle_manager.calls) == 1
     assert heat_cycle_manager.calls[0][0] == 5
 
-    heat_cycle_manager.calls.clear()
-    no_presence_state = DecodedPouringState(
-        version=2,
-        session_active=True,
-        mouth_present_in_trolley=False,
-        probe_valid=True,
-        event=0,
-        trolley_track_id=7,
-        mouth_track_id=5,
-        trolley_bbox=(100.0, 100.0, 200.0, 220.0),
-        mouth_bbox=(120.0, 120.0, 150.0, 150.0),
-        probe_x_px=135.0,
-        probe_y_px=200.0,
-        mouth_norm_x=0.35,
-        mouth_norm_y=0.40,
-    )
-    controller.process_native_state(
-        frame_meta=frame_meta,
-        native_state=no_presence_state,
-        frame=None,
-        timestamp=11.0,
-        datetime_obj=datetime(2026, 3, 31, 13, 0, 1),
-    )
-    assert heat_cycle_manager.calls == []
 
-
-def test_hybrid_controller_needs_frame_for_active_native_session(tmp_path):
-    controller = _make_hybrid_controller(tmp_path, heat_cycle_manager=None)
-    idle_state = DecodedPouringState(
-        version=2,
-        session_active=False,
-        mouth_present_in_trolley=False,
-        probe_valid=False,
-        event=0,
-        trolley_track_id=0,
-        mouth_track_id=0,
-        trolley_bbox=(0.0, 0.0, 0.0, 0.0),
-        mouth_bbox=(0.0, 0.0, 0.0, 0.0),
-        probe_x_px=0.0,
-        probe_y_px=0.0,
-        mouth_norm_x=-1.0,
-        mouth_norm_y=-1.0,
-    )
-    active_state = DecodedPouringState(
-        version=2,
-        session_active=True,
-        mouth_present_in_trolley=True,
-        probe_valid=True,
-        event=EVENT_SESSION_START,
-        trolley_track_id=7,
-        mouth_track_id=5,
-        trolley_bbox=(100.0, 100.0, 200.0, 220.0),
-        mouth_bbox=(120.0, 120.0, 150.0, 150.0),
-        probe_x_px=135.0,
-        probe_y_px=200.0,
-        mouth_norm_x=0.35,
-        mouth_norm_y=0.40,
-    )
-
-    assert controller.needs_frame(idle_state) is False
-    assert controller.needs_frame(active_state) is True
-
-
-def test_hybrid_controller_inserts_heat_cycle_without_ladle_number_or_fallback_name_error(tmp_path):
+def test_melting_controller_emits_tapping_event_and_updates_heat_cycle(tmp_path):
     db = DummyDB()
-    controller = HybridPouringController(
+    heat_cycle_manager = CaptureTappingHeatCycleManager()
+    controller = _make_melting_controller(tmp_path, db, heat_cycle_manager)
+    frame = np.zeros((40, 40, 4), dtype=np.uint8)
+
+    start_state = _native_melting_state(tapping_active=True)
+    end_state = _native_melting_state(tapping_active=False)
+
+    assert controller.needs_frame(start_state) is True
+    controller.process_native_state(
+        native_state=start_state,
+        frame_meta=None,
+        frame=frame,
+        timestamp=10.0,
+    )
+    assert controller.needs_frame(end_state) is True
+    controller.process_native_state(
+        native_state=end_state,
+        frame_meta=None,
+        frame=frame,
+        timestamp=14.5,
+    )
+
+    assert len(db.inserted_melting_events) == 1
+    assert db.inserted_melting_events[0]["event_type"] == "tapping"
+    assert db.inserted_melting_events[0]["duration_sec"] == 4.5
+    assert db.inserted_melting_events[0]["screenshot_path"]
+    assert len(heat_cycle_manager.calls) == 1
+
+
+def test_pouring_processor_inserts_heat_cycle_with_empty_ladle_number(tmp_path):
+    db = DummyDB()
+    processor = PouringProcessor(
         db_manager=db,
         config=DummyConfig(),
         screenshot_dir=str(tmp_path),
@@ -331,197 +306,11 @@ def test_hybrid_controller_inserts_heat_cycle_without_ladle_number_or_fallback_n
         pyrometer_events=[],
     )
 
-    controller._insert_heat_cycle_to_db(cycle)
+    processor._insert_heat_cycle_to_db(cycle)
 
     assert len(db.inserted_heat_cycles) == 1
     inserted = db.inserted_heat_cycles[0]
     assert inserted["ladle_number"] == ""
     assert inserted["cycle_end_time"]
-    assert inserted["pouring_start_time"] == ""
-    assert inserted["pouring_end_time"] == ""
-
-
-def test_pouring_processor_refreshes_heat_before_pour_logic_runs(tmp_path):
-    heat_cycle_manager = HeatBootstrapManager("HEAT_1234")
-    db = DummyDB()
-    processor = PouringProcessor(
-        db_manager=db,
-        config=DummyConfig(),
-        screenshot_dir=str(tmp_path),
-        heat_cycle_manager=heat_cycle_manager,
-    )
-
-    mouth = {
-        "track_id": 5,
-        "confidence": 0.95,
-        "bbox": (120, 120, 150, 150),
-        "bottom_center": (135, 150),
-    }
-    trolley = {"track_id": 7, "bbox": (100, 100, 200, 220), "confidence": 0.9}
-    frame_meta = SimpleNamespace(source_frame_width=1280, source_frame_height=720)
-
-    processor._extract_detections = lambda _frame_meta: ([mouth], [trolley])
-    processor._get_target_trolley = lambda _trolleys, _timestamp=None, _mouths=None: trolley
-    processor._select_best_mouth_for_trolley = lambda _mouths, _trolley: mouth
-    processor._check_cycle_timeout = lambda *args, **kwargs: None
-    processor._update_session = lambda *args, **kwargs: setattr(processor, "session_active", True)
-
-    seen = {}
-
-    def _capture_update_pour(*args, **kwargs):
-        seen["heat_no"] = getattr(
-            getattr(heat_cycle_manager, "active_cycle", None),
-            "heat_no",
-            None,
-        )
-
-    processor._update_pour = _capture_update_pour
-    processor.process_frame(
-        frame_meta,
-        np.zeros((8, 8, 4), dtype=np.uint8),
-        11.0,
-        datetime(2026, 3, 31, 13, 0, 1),
-    )
-
-    assert seen["heat_no"] == "HEAT_1234"
-
-
-def test_hybrid_controller_refreshes_heat_before_pour_logic_runs(tmp_path):
-    heat_cycle_manager = HeatBootstrapManager("HEAT_5678")
-    controller = _make_hybrid_controller(tmp_path, heat_cycle_manager)
-    frame_meta = SimpleNamespace(source_frame_width=1280, source_frame_height=720)
-
-    active_state = DecodedPouringState(
-        version=2,
-        session_active=True,
-        mouth_present_in_trolley=True,
-        probe_valid=True,
-        event=EVENT_SESSION_START,
-        trolley_track_id=7,
-        mouth_track_id=5,
-        trolley_bbox=(100.0, 100.0, 200.0, 220.0),
-        mouth_bbox=(120.0, 120.0, 150.0, 150.0),
-        probe_x_px=135.0,
-        probe_y_px=200.0,
-        mouth_norm_x=0.35,
-        mouth_norm_y=0.40,
-    )
-
-    seen = {}
-
-    def _capture_update_pour(*args, **kwargs):
-        seen["heat_no"] = getattr(
-            getattr(heat_cycle_manager, "active_cycle", None),
-            "heat_no",
-            None,
-        )
-
-    controller._update_pour = _capture_update_pour
-    controller._check_cycle_timeout = lambda *args, **kwargs: None
-
-    controller.process_native_state(
-        frame_meta=frame_meta,
-        native_state=active_state,
-        frame=np.zeros((8, 8, 4), dtype=np.uint8),
-        timestamp=10.0,
-        datetime_obj=datetime(2026, 3, 31, 13, 0, 0),
-    )
-
-    assert seen["heat_no"] == "HEAT_5678"
-
-
-def test_hybrid_controller_uses_actual_frame_detections_for_pour_logic(tmp_path):
-    controller = _make_hybrid_controller(tmp_path, heat_cycle_manager=None)
-    frame_meta = SimpleNamespace(source_frame_width=1280, source_frame_height=720)
-    actual_trolley = {"track_id": 7, "bbox": (100, 100, 200, 220), "confidence": 0.9}
-    actual_mouth = {
-        "track_id": 5,
-        "confidence": 0.95,
-        "bbox": (120, 120, 150, 150),
-        "center": (135, 135),
-        "bottom_center": (135, 150),
-    }
-    controller._extract_detections = lambda _frame_meta: ([actual_mouth], [actual_trolley])
-
-    seen = {}
-
-    def _capture_update_pour(mouths, _frame, _timestamp, _datetime_obj, _trolleys, target_trolley):
-        seen["mouths"] = mouths
-        seen["target_trolley"] = target_trolley
-        return actual_mouth
-
-    controller._update_pour = _capture_update_pour
-    controller._check_cycle_timeout = lambda *args, **kwargs: None
-
-    active_state = DecodedPouringState(
-        version=2,
-        session_active=True,
-        mouth_present_in_trolley=True,
-        probe_valid=True,
-        event=EVENT_SESSION_START,
-        trolley_track_id=7,
-        mouth_track_id=5,
-        trolley_bbox=(100.0, 100.0, 200.0, 220.0),
-        mouth_bbox=(120.0, 120.0, 150.0, 150.0),
-        probe_x_px=135.0,
-        probe_y_px=180.0,
-        mouth_norm_x=0.35,
-        mouth_norm_y=0.40,
-    )
-
-    controller.process_native_state(
-        frame_meta=frame_meta,
-        native_state=active_state,
-        frame=np.zeros((8, 8, 4), dtype=np.uint8),
-        timestamp=10.0,
-        datetime_obj=datetime(2026, 3, 31, 13, 0, 0),
-    )
-
-    assert seen["mouths"][0]["track_id"] == 5
-    assert seen["target_trolley"]["track_id"] == 7
-
-
-def test_hybrid_controller_finalizes_tapping_only_cycle_without_native_meta(tmp_path):
-    db = DummyDB()
-    controller = HybridPouringController(
-        db_manager=db,
-        config=DummyConfig(),
-        screenshot_dir=str(tmp_path),
-        heat_cycle_manager=None,
-    )
-
-    cycle = SimpleNamespace(
-        heat_no="HEAT_9001",
-        mould_pourings=[],
-        tapping_events=[{"start": "2026-03-31T14:00:00", "end": "2026-03-31T14:00:10"}],
-        cycle_start_datetime=datetime(2026, 3, 31, 14, 0, 0),
-        cycle_end_datetime=datetime(2026, 3, 31, 14, 0, 10),
-        pouring_start_time=None,
-        pouring_end_time=None,
-        total_pouring_time=0,
-        mould_wise_pouring_time=[],
-        tapping_start_datetime=datetime(2026, 3, 31, 14, 0, 0),
-        tapping_end_datetime=datetime(2026, 3, 31, 14, 0, 10),
-        deslagging_events=[],
-        spectro_events=[],
-        pyrometer_events=[],
-    )
-    manager = FinalizingHeatCycleManager(cycle)
-    controller.heat_cycle_manager = manager
-    frame_meta = SimpleNamespace(source_frame_width=1280, source_frame_height=720)
-    controller._check_cycle_timeout = lambda *args, **kwargs: None
-
-    for idx in range(10):
-        controller.process_native_state(
-            frame_meta=frame_meta,
-            native_state=None,
-            frame=None,
-            timestamp=400.0 + idx,
-            datetime_obj=datetime(2026, 3, 31, 14, 5, idx),
-        )
-
-    assert len(db.inserted_heat_cycles) == 1
-    inserted = db.inserted_heat_cycles[0]
-    assert inserted["heat_no"] == "HEAT_9001"
     assert inserted["pouring_start_time"] == ""
     assert inserted["pouring_end_time"] == ""

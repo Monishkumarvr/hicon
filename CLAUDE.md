@@ -1,9 +1,10 @@
 # CLAUDE.md — HiCon AI Vision System
 
 ## Project Overview
-HiCon is a 2-camera edge AI vision system for induction furnace monitoring on **Jetson Orin Nano 8GB**, built on **DeepStream 7.1**. No PPE detection — furnace operations only.
-- **Camera 1 (Process):** Tapping, pouring, deslagging, spectrometry — single RTSP decode shared by all detectors
-- **Camera 2 (Pyrometer):** Rod insertion detection via YOLO26
+HiCon is a 3-camera edge AI vision system for induction furnace monitoring on **Jetson Orin Nano 8GB**, built on **DeepStream 7.1**. No PPE detection — furnace operations only.
+- **Camera 0 (Process):** Tapping, pouring, deslagging, spectrometry — single RTSP decode shared by all detectors
+- **Camera 1 (Pyrometer):** Rod insertion detection via YOLO26
+- **Camera 2 (Pouring2):** Second pouring detection angle
 - **Pipeline:** DeepStream 7.1 GStreamer (single Python process, single decode per stream)
 - **Cloud:** AGNI API (HMAC-SHA256 authenticated HTTPS POST)
 - **Design doc:** See `HiCon_Systems_Design.md` for full architecture and data flows
@@ -329,56 +330,43 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 - Full pipeline watchdog: no frames > 10 min → systemd restart
 - Recording: post-OSD tee branch managed by `RecordingManager` for inference video capture
 
-## CP Plus Segment Buffer (Streams 0 & 2 — drop isolation)
+## Camera Hardware (Updated 2026-03-20)
 
-**Problem:** CP Plus (Dahua OEM) firmware gracefully closes TCP RTSP sessions every ~4-5 min
-(code=0). No transport config or keepalive prevents it. Standalone `ffmpeg ... /dev/null` test
-survived 27+ min zero drops; `-f segment` (disk writes) triggers the firmware timeout.
+**Current cameras:** 3× **Hikvision DS-2CD2043G2-LI2U** (4MP ColorVu bullet, ISAPI)
 
-**Solution (deployed on both CP Plus streams):** Dual-ffmpeg segment buffer spool.
-```
-camera (TCP) → ffmpeg reader (-f {codec} pipe:1) ─[1MB pipe]─ ffmpeg segmenter (-f segment)
-                                                                         ↓
-                                                    /dev/shm/hicon/stream{N}-buffer/segments/
-                                                                         ↓ (helper paces at bitrate)
-                                                              FIFO → fdsrc → {codec}parse → decoder
-```
-- Reader: zero disk I/O (matches `/dev/null` test). `-stimeout 10s` exits promptly on FIN-WAIT-1.
-- Segmenter: isolated from camera TCP session; assigns timestamps via `-r {fps}` (immune to
-  RTSP timestamp discontinuities — MPEGTS was tried but failed after TCP events).
-- 1MB inter-ffmpeg pipe (`F_SETPIPE_SZ`) absorbs brief segmenter stalls.
-- Helper (`pipeline/segment_buffer_helper.py`) feeds FIFO at natural bitrate; `state.json`
-  signals `buffering`/`rebuffering` mode to suppress FPS watchdog during recovery.
-- GStreamer: static chain `fdsrc → segbufq(leaky) → {h264/h265}parse(config-interval=-1) → decoder`
+| Stream | IP | Role | Firmware | Serial | MAC |
+|--------|-----|------|----------|--------|-----|
+| 0 | 192.168.27.226 | Process camera | V5.7.18 (build 240826) | ...FR7128559 | bc:29:78:53:24:78 |
+| 1 | 192.168.27.253 | Pyrometer camera | V5.7.18 (build 240826) | ...FR7129271 | bc:29:78:53:27:40 |
+| 2 | 192.168.28.119 | Pouring2 camera | V5.7.19 (build ???) | ...FW8319581 | bc:29:78:85:8a:85 |
 
-| Stream | Camera | Codec | Segment files | Buffer | Safe window |
-|--------|--------|-------|---------------|--------|-------------|
-| 0 | CP Plus 192.168.28.155 `subtype=1` | H.264 | `seg_%06d.h264` | 120s / 60 segs | ~78s |
-| 2 | CP Plus 192.168.28.162 `subtype=1` | **H.265** | `seg_%06d.h265` | 120s / 60 segs | ~78s |
+- **Credentials:** `admin` / `india@789` (URL-encoded: `india%40789`)
+- **RTSP URL (sub-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/102`
+- **RTSP URL (main-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/101`
+- **Sub-stream:** H.265 (HEVC), Main profile, **1280×720** @ 25fps (used by pipeline)
+- **Main-stream:** H.265 (HEVC), Main profile, 2688×1520 @ 25fps
+- **Note:** Dahua-style `/video/live?channel=1&subtype=1` returns main stream (2688×1520) — Hikvision ignores `subtype` param
+- **ONVIF:** Disabled in camera settings (returns 404)
+- **ISAPI:** Available on HTTP :80 (streams 0, 1) and HTTPS :443 (stream 2)
+- **Audio:** Disabled in camera settings
 
-**Key parameters (both streams):**
-- `HICON_USE_SEGMENT_BUFFER_{N}=true`, `HICON_SEGMENT_BUFFER_DELAY_SEC_{N}=120`
-- `HICON_SEGMENT_BUFFER_RETENTION_SEC_{N}=180`, `HICON_SEGMENT_BUFFER_SEGMENT_SEC_{N}=2`
-- Low watermark = `target // 4` = 15 segments; startup grace = `delay_sec + 30` = 150s
+**Previous cameras (replaced 2026-03-20):** 3× CP Plus (Dahua OEM):
+- 192.168.28.155: CP-UNC-TC41L5C-VMD-LQ (fw 2.860.00AT001.0.R)
+- 192.168.28.152: CP-UNC-TA41L3C-D-LQ (fw 2.860.00AT002.0.R)
+- 192.168.28.162: CP-UNC-TC41L5C-VMD-LQ (fw 2.860.00AT001.0.R)
+- CP Plus cameras had firmware bug: TCP RTSP sessions killed every ~3-5 min
+- Segment buffer workaround was built but is now **disabled** (not needed with Hikvision cameras)
 
-**Critical bugs fixed (segment_buffer_helper.py):**
-- **14fps burst**: large FIFO → instant write → HW decoder burst → ~14fps. Fixed: rate-limited
-  writes in `_write_segment()` at `file_size/segment_seconds` bytes/sec in 64KB chunks.
-- **Deadline base**: use `write_start` not write-end so 2s write doesn't add to 2s feed interval.
-- **FIFO pipe size**: `F_SETPIPE_SZ` fallback 1MB→512KB→256KB (Jetson system max = 1MB).
-- **DTS log flood**: `-loglevel error` (was `warning` → non-monotonous DTS spam).
-- **FIFO race**: `gst_builder.py` deletes leftover FIFO before spawning helper.
-- **tsdemux deadlock**: raw elementary stream; no MPEGTS demux needed.
-- **Codec hardcoded**: helper used `-f h264` unconditionally; now codec-aware (`hevc`/`h264`).
+**NVR:** CP Plus NVR at 192.168.28.6 (password `NVR@321#`) — tested and **rejected** for relay
+(March 19: 12-min soak showed NVR relay is worse than direct camera connection)
 
-**Critical bugs fixed (bus_handler.py / hicon_pipeline.py):**
-- **Missing pipeline_config keys**: `use_segment_buffer_2` and companion keys were never added
-  to the `pipeline_config` dict — `DeepStreamPipelineBuilder` defaulted to rtspsrc for Stream 2.
-- **Startup grace too short**: was `delay_sec + 10`; camera recovery can add 30-50s → changed
-  to `delay_sec + 30` = 150s; added `stream_startup_grace_overrides` dict to `BusHandler`.
-- **No watchdog suppression for Stream 2**: Stream 0 reads `state.json` to suppress the 0fps
-  watchdog during rebuffering. Added generic `_segment_buffer_watchdog_suppressed(stream_id)`
-  and wired `stream_segment_buffer_state_paths[2]` from `hicon_pipeline.py`.
+**RTSP drop root cause (confirmed March 19):** Drops were caused by **DeepStream pipeline
+backpressure**, not camera firmware. Simultaneous soak test proved: standalone ffmpeg→/dev/null
+held connection indefinitely while DeepStream pipeline dropped on the same stream in the same window.
+Fix: `drop-on-latency=True`, `latency=4000ms`, `premuxq=128 leaky=2`, `num-extra-surfaces=16`.
+
+**Segment buffer code** (legacy, disabled): Still in codebase at `pipeline/segment_buffer_helper.py`
+and `gst_builder.py` segment buffer paths. Available if future cameras exhibit similar firmware drops.
 
 **Investigation doc:** `ai_vision/docs/rtsp_stream0_investigation.md`
 
@@ -389,3 +377,18 @@ camera (TCP) → ffmpeg reader (-f {codec} pipe:1) ─[1MB pipe]─ ffmpeg segme
 - Retry: up to 5× on failure, buffer in SQLite (`synced=0`)
 - Cycle: 30-second background sync thread
 - Cleanup: 7-day retention, auto-delete on INSERT
+
+## Network & Camera Operations
+- **Limit login attempts to 3 per device** before stopping — CP Plus and Hikvision NVR lockouts cause 30+ min delays
+- Always validate one known-good stream first before bulk-testing credentials
+- If auth fails twice, stop and ask the user — never brute-force RTSP URLs or credentials
+
+## Code Quality
+- Before creating skill files (`.claude/skills/*/SKILL.md`) or config YAML, read existing working examples first to confirm supported attributes
+- Reference `.claude/skills/document-codebase/SKILL.md` for valid frontmatter schema
+- Do NOT invent frontmatter keys — unsupported attributes silently break skills with no error message
+
+## Analysis & Debugging
+- When proposing threshold-based detection logic (pour clustering, brightness ratios, FPS watchdog), always state explicitly whether the threshold applies **per individual event** or **to an aggregate total**
+- Walk through 2–3 concrete data examples before writing any detection code
+- e.g. "trigger fires when individual mould pour duration > X" vs "trigger fires when total session pour duration > X" produce very different mould counts

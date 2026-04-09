@@ -1,0 +1,34 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=/models/pouring/pouring-hicon-hikvision-v1-1280-1774727-2026-03-28-19-47-12-557/best_pouring_hicon_hikvision_v1_557.onnx
+model-engine-file=/models/pouring/pouring-hicon-hikvision-v1-1280-1774727-2026-03-28-19-47-12-557/best_pouring_hicon_hikvision_v1_557_fp16_1280_b1_dynamic.engine
+labelfile-path=/workspace/configs/labels/labels_pouring.txt
+batch-size=1
+network-mode=2
+num-detected-classes=2
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+symmetric-padding=1
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/workspace/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+engine-create-func-name=NvDsInferYoloCudaEngineGet
+output-tensor-meta=0
+
+[class-attrs-all]
+nms-iou-threshold=0.5
+pre-cluster-threshold=0.25
+topk=300
+
+[class-attrs-0]
+# ladle_mouth: higher confidence threshold
+pre-cluster-threshold=0.4
+
+[class-attrs-1]
+# trolley: confidence threshold
+pre-cluster-threshold=0.25

@@ -1,7 +1,9 @@
 [Unit]
 Description=HiCon AI Vision Pipeline (DeepStream 7.1)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target hicon-mediamtx.service
+Wants=network-online.target hicon-mediamtx.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,17 +15,18 @@ WorkingDirectory=/home/hicon/hicon/ai_vision
 Environment=PATH=/usr/local/cuda-12.6/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local/cuda-12.6/lib64
 Environment=GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
-Environment=GST_DEBUG=2
+Environment=GST_DEBUG=1
 
 ExecStart=/usr/bin/python3 hicon_pipeline.py
 
 # Graceful shutdown (pipeline handles SIGTERM)
 KillSignal=SIGTERM
+KillMode=control-group
 TimeoutStopSec=15
 
-# Restart on failure with 10s delay
+# Restart on failure with 2s delay
 Restart=on-failure
-RestartSec=10
+RestartSec=2
 
 # Logging to journald (pipeline also logs to logs/pipeline.log)
 StandardOutput=journal

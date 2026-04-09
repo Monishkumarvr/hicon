@@ -1505,3 +1505,379 @@ Inference active immediately after priming (NEW HEAT CYCLE fired within 1s of fi
 | Low watermark | `target // 4` = 15 segments |
 | Startup grace | 150s (`delay_sec + 30`) |
 | Watchdog policy | `warn` + state.json suppression during rebuffering |
+
+---
+
+## March 16–19, 2026: nvurisrcbin Migration, NVR Investigation, and Backpressure Proof
+
+### March 16: Migration from Segment Buffer to nvurisrcbin
+
+**Goal**
+Simplify the pipeline by removing the dual-ffmpeg segment buffer architecture and using DeepStream's
+built-in `nvurisrcbin` element, which has native RTSP reconnection support.
+
+**Change**
+- All 3 streams switched to `nvurisrcbin` (built-in RTSP auto-reconnect, 2s reconnect interval).
+- Segment buffer code retained but disabled (`HICON_USE_SEGMENT_BUFFER_0/2=false`).
+- Stream 0: `reconnect-interval=10`, `protocol=auto`, `latency=4000`, `num-extra-surfaces=12`.
+- Streams 1&2: `reconnect-interval=2`, `protocol=tcp`, `latency=2000`, `num-extra-surfaces=8`.
+- `warn_safety_cap_sec=300` when nvurisrcbin active (was 90 for segment buffer).
+- **CRITICAL**: `async-process=False` on mux must NEVER be used with nvurisrcbin — blocks reconnection permanently.
+
+**Observed Result**
+- Pipeline runs with all 3 streams active. nvurisrcbin auto-reconnects after each CP Plus drop.
+- Recovery takes 10–65s depending on stream. Zero pipeline restarts needed.
+- Drops still occur every ~5 minutes (CP Plus firmware unchanged).
+
+**Finding**
+nvurisrcbin provides acceptable "tolerate and recover" behavior without the complexity of segment buffers
+or MediaMTX proxies. The trade-off is brief inference gaps (~10-65s) every 5 minutes vs the segment
+buffer's fully transparent recovery. Acceptable for the current deployment given the reduction in
+moving parts (no ffmpeg subprocesses, no /dev/shm spool, no helper process).
+
+---
+
+### March 19: Camera Hardware Identification via ONVIF
+
+**Goal**
+Identify exact camera models and firmware versions for all 3 CP Plus cameras and the NVR.
+
+**Method**
+ONVIF `GetDeviceInformation` SOAP request to each camera's HTTP port 80 (no authentication required
+for this endpoint on CP Plus).
+
+**Results**
+
+| Device | IP | Model | Firmware | Serial |
+|--------|-----|-------|----------|--------|
+| Stream 0 (Process) | 192.168.28.155 | CP-UNC-TC41L5C-VMD-LQ | 2.860.00AT001.0.R | P49B5F2HBFVWK386 |
+| Stream 1 (Pyrometer) | 192.168.28.152 | CP-UNC-TA41L3C-D-LQ | 2.860.00AT002.0.R | OKI36U73AQ00SAOS |
+| Stream 2 | 192.168.28.162 | CP-UNC-TC41L5C-VMD-LQ | 2.860.00AT001.0.R | HHR46PNVQR1HTZ68 |
+| NVR | 192.168.28.6 | *(HTTPS-only ONVIF, couldn't pull)* | — | — |
+
+- Streams 0 & 2: same model (TC41L5C-VMD-LQ, 4MP bullet, 5mm lens, same firmware).
+- Stream 1: different model (TA41L3C-D-LQ, 4MP turret/dome, 3.6mm lens, slightly newer firmware).
+- All cameras confirmed as CP Plus (Dahua OEM), 4MP sensors.
+- HTTP port 80: web UI accessible. No Dahua CGI endpoints (`/cgi-bin/magicBox.cgi` → 404).
+- No RPC2 endpoints either. Only ONVIF SOAP and the proprietary web UI.
+
+---
+
+### March 19: NVR Channel Mapping Investigation
+
+**Goal**
+Access the CP Plus NVR (192.168.28.6) web UI to understand channel-to-camera mapping and evaluate
+NVR-relay RTSP as a stability solution.
+
+**Method**
+SSH SOCKS proxy (`ssh -D 9090`) through the Jetson, then Chrome with `--proxy-server=socks5://localhost:9090`
+to access `https://192.168.28.6` directly.
+
+**Findings**
+- NVR web UI: `CPPLUS NVR - Web View`, login `admin` / `NVR@321#`.
+- NVR has 4 Hikvision NVRs registered on its "ADD IP CAM" page (not cameras):
+  - Ch1: 192.168.28.7 (DS-8664NI-I8), Ch2: 192.168.27.3 (DS-7P32NI-K4),
+    Ch3: 192.168.28.8 (DS-7764NI-M4), Ch4: 192.168.27.1 (DS-7P32NI-K4).
+- Additionally has Ch8-10: other CP Plus cameras on 192.168.28.x (CP-UNC-TA41... and CP-UNC-DA41...).
+- The 3 HiCon cameras are on a separate "Added Device" list:
+
+| NVR Channel | IP | Port | Protocol | Status | Camera |
+|-------------|-----|------|----------|--------|--------|
+| 1 | 192.168.28.152 | 25001 | CPPLUS | Red (offline) | Pyrometer |
+| 2 | 192.168.28.155 | 25001 | CPPLUS | Red (wrong password) | Process |
+| 3 | 192.168.28.162 | 80 | ONVIF | Green (online) | Stream 2 |
+
+- Ch1 and Ch2 use CP Plus proprietary protocol (port 25001), Ch3 uses ONVIF (port 80).
+- Ch1/Ch2 showed "Wrong username or password" — credentials need to be fixed in NVR settings.
+- NVR RTSP URL format: `rtsp://admin:NVR@321#@192.168.28.6:554/cam/realmonitor?channel={N}&subtype=1`
+
+---
+
+### March 19: NVR Live RTSP Soak Test Under DeepStream Load
+
+**Goal**
+Test whether routing streams through the NVR eliminates the CP Plus firmware drops. Theory: the NVR
+records to HDD continuously without drops, so its RTSP re-stream might also be stable.
+
+**Configuration**
+- Streams 0 & 1 disabled. Only Stream 2 active, pointed at NVR Ch3:
+  `rtsp://admin:NVR%40321%23@192.168.28.6:554/cam/realmonitor?channel=3&subtype=1`
+- Pipeline running with nvurisrcbin, full inference active.
+
+**Observed Result — 55 minutes of monitoring**
+- **Drops every ~5 minutes, identical pattern to direct camera connection:**
+  ```
+  14:45:51 → 14:50:50 (+4:59)
+  14:50:50 → 14:55:49 (+4:59)
+  14:55:49 → 15:00:49 (+5:00)
+  15:00:49 → 15:05:48 (+4:59)
+  15:05:48 → 15:10:48 (+5:00)
+  15:10:48 → 15:15:46 (+4:58)
+  15:15:46 → 15:20:46 (+5:00)
+  15:20:46 → 15:25:45 (+4:59)
+  15:25:45 → 15:30:45 (+5:00)
+  15:30:45 → 15:35:44 (+4:59)
+  ```
+- Each drop: 5–60s at 0fps, then recovery to 25fps via nvurisrcbin auto-reconnect.
+- 204 total 0fps/reconnect log events in 55 minutes.
+
+**Finding**
+**NVR live RTSP does NOT solve the drop problem.** The NVR is just proxying the camera stream —
+when the camera kills the TCP session to the NVR, the NVR also drops the downstream RTSP to the
+Jetson. The NVR adds no buffering or stability to the live RTSP path.
+
+---
+
+### March 19: Simultaneous Soak — Proof That Drops Are Backpressure, Not Firmware
+
+**Goal**
+Run a standalone ffmpeg test (`/dev/null` sink) and the DeepStream pipeline **simultaneously**,
+both consuming the same NVR RTSP stream, to determine whether the drops are caused by the camera
+firmware or by pipeline backpressure.
+
+**Test**
+```
+# Ran simultaneously for 6 minutes:
+Standalone:  ffmpeg -rtsp_transport tcp -i rtsp://...NVR.../channel=3&subtype=1 -f null /dev/null
+Pipeline:    hicon-vision.service (nvurisrcbin → nvinfer → tracker → osd → sink)
+```
+
+**Result**
+
+| Client | Drops in 6 min | Notes |
+|--------|---------------|-------|
+| **Standalone ffmpeg → /dev/null** | **0** | Ran clean for full 6 minutes, terminated by timeout |
+| **DeepStream pipeline** | **1** | Drop at 15:45:43, 0fps for ~40s, recovered at 15:46:29 |
+
+Both clients were pulling the **same NVR RTSP stream** at the same time. The NVR did not kill the
+session globally — only the pipeline's connection dropped.
+
+**Finding**
+**THIS IS THE SMOKING GUN.** The drops are caused by **pipeline backpressure**, not CP Plus firmware.
+
+When the DeepStream pipeline stalls momentarily (GPU inference scheduling, GStreamer element blocking),
+frames queue up and backpressure propagates to `nvurisrcbin`'s internal `rtspsrc`. The TCP socket
+receive buffer fills up. The RTSP server (NVR or camera) sees the client isn't consuming data, the
+TCP window shrinks to zero, and after a timeout the server closes that specific connection.
+
+The standalone ffmpeg with `/dev/null` sink consumes frames instantly — zero backpressure. The TCP
+socket never fills up. The server keeps the connection alive indefinitely.
+
+**This reframes the entire investigation.** The CP Plus firmware timeout (~5 min) is real, but it
+is **triggered by backpressure from the consumer**, not by an unconditional timer. A consumer that
+reads fast enough (like ffmpeg → /dev/null) never triggers the timeout. The DeepStream pipeline's
+occasional processing stalls are enough to trigger it.
+
+**Implication:** The fix should focus on **decoupling the RTSP reader from the pipeline processing**
+with sufficient buffering between them, rather than replacing cameras or using NVR proxies. The
+segment buffer architecture (March 12) already solved this by fully decoupling the reader (ffmpeg)
+from the consumer (GStreamer pipeline). Larger GStreamer queues between `nvurisrcbin` and `streammux`
+might also work without the full segment buffer complexity.
+
+---
+
+### March 19: Camera 192.168.28.152 Firmware Upgrade Test
+
+**Goal**
+Test pyrometer camera (192.168.28.152) after firmware upgrade by site team.
+
+**Observed Result**
+- Camera reachable (ping OK, HTTP port 80 OK, ONVIF responds).
+- ONVIF GetDeviceInformation: still reports firmware `2.860.00AT002.0.R` (same as before).
+- **RTSP port 554 open but non-functional**: ffprobe returns `ECONNRESET` (connection reset) on
+  OPTIONS request. Both `/cam/realmonitor` and `/video/live` paths fail with "Invalid data found".
+- TCP and UDP transport both fail.
+- ONVIF-initiated reboot (`SystemReboot`): camera rebooted successfully (60s downtime), but RTSP
+  service remained non-functional after reboot.
+- Camera then went fully offline (not pinging) — consistent with intermittent power/network issues
+  seen throughout investigation.
+
+**Finding**
+The firmware version string is unchanged, so either the upgrade didn't take effect or it was a
+configuration change rather than a firmware flash. The RTSP service appears broken — port 554 accepts
+TCP connections but immediately resets them. The camera's HTTP web UI and ONVIF work fine.
+
+**Next Step**
+Camera needs physical inspection. Possible causes: RTSP service disabled in camera settings after
+firmware upgrade, or firmware upgrade corrupted the RTSP module. Access the camera's web UI
+(via SSH SOCKS proxy at `http://192.168.28.152`) to check if RTSP is enabled in the network settings.
+
+---
+
+### March 19: API 422 Fix — Pouring Sync
+
+**Bug**
+`pouring_end_time` set to empty string (`""`) for incomplete pouring sessions. API rejects:
+`"Value error, Timestamp must be in YYYY-MM-DD HH:MM:SS format"`.
+
+Same pattern as the March 18 melting/tapping fix where `tapping_start_time: null` was rejected.
+
+**Fix**
+- Added `pouring_skipped_sync_ids` set in `sync_manager.py`.
+- Skip pouring records with missing `pouring_start_time` or `pouring_end_time` from API payload.
+- Include skipped IDs in `pouring_complete` set so they don't block melting sync intersection.
+- Pattern matches the existing `melting_skipped_sync_ids` fix.
+
+---
+
+### Updated Comparison Table (All Configurations Tested)
+
+| Configuration | Drops in 10 min | Recovery time | Drop interval | Notes |
+|---|---|---|---|---|
+| rtspsrc direct TCP (March 6) | continuous stall | pipeline restart | ~2–5 min | |
+| nvurisrcbin direct TCP (March 7) | ~3–4 | 10–20s | ~3–5 min | |
+| ffmpeg bridge via NVR TCP (March 9) | many | 15–20s | 25–33s | NVR overloaded |
+| ffmpeg bridge direct TCP (March 11) | 14 | 15–20s | ~3.5 min | |
+| MediaMTX UDP proxy (March 11) | 1–2 | 15–25s | ~5–9 min | |
+| **Segment buffer 60s spool (March 12)** | **0** | **0s (transparent)** | **∞** | **Best — fully decoupled** |
+| nvurisrcbin direct TCP (March 16) | ~2 | 10–65s | ~5 min | Simpler, tolerates drops |
+| **NVR relay via nvurisrcbin (March 19)** | **~2** | **5–60s** | **~5 min** | **NVR does NOT help** |
+| Standalone ffmpeg → /dev/null (March 19) | **0** | — | **∞** | **Proves backpressure is root cause** |
+
+### Updated Root Cause Analysis
+
+The March 10 finding ("CP Plus firmware has ~3-5 min RTSP session timeout baked into firmware") is
+now refined:
+
+**The CP Plus firmware has a TCP receive-window timeout, not an unconditional session timer.** When a
+client stops consuming RTSP data fast enough (TCP window shrinks toward zero due to downstream
+backpressure), the camera firmware closes the connection after a timeout (~3-5 minutes of degraded
+consumption, or shorter under heavy backpressure). A client that reads at line rate (like ffmpeg
+to /dev/null) can maintain the connection indefinitely.
+
+This means:
+1. **Camera replacement is NOT required** — the firmware behavior is triggered by the consumer, not
+   by an internal timer.
+2. **The segment buffer remains the optimal solution** — it fully decouples the RTSP reader (ffmpeg,
+   which reads at line rate) from the pipeline consumer (GStreamer, which has variable processing time).
+3. **Larger GStreamer queues** between nvurisrcbin and processing elements might reduce drop frequency
+   by absorbing brief stalls, but cannot eliminate drops entirely because prolonged inference stalls
+   will still trigger the firmware timeout.
+4. **The NVR adds no value** for drop mitigation — it just proxies the same stream with the same
+   backpressure sensitivity.
+
+---
+
+## March 19, 2026 (continued): NVR Full Soak Test and Camera Replacement
+
+### NVR 12-Minute Soak Test (All Streams via NVR)
+
+**Goal**
+Test whether routing Streams 1 and 2 through the NVR (instead of direct camera) provides stability.
+
+**Configuration**
+- Stream 1: NVR Ch1 → `rtsp://admin:NVR@321#@192.168.28.6:554/cam/realmonitor?channel=1&subtype=1`
+- Stream 2: NVR Ch3 → `rtsp://admin:NVR@321#@192.168.28.6:554/cam/realmonitor?channel=3&subtype=1`
+- Pipeline settings: `drop-on-latency=True`, `num-extra-surfaces=16`, `premuxq=64`
+
+**Result**
+
+| Minute | Stream 1 FPS | Stream 2 FPS | Drops |
+|--------|-------------|-------------|-------|
+| 1 | 0.0 | 25.0 | 5 |
+| 2 | 0.0 | 0.0 | 14 |
+| 3 | 0.0 | 25.0 | 13 |
+| 4 | 0.0 | 25.2 | 13 |
+| 5 | 0.0 | 25.0 | 13 |
+| 6 | 0.0 | 24.8 | 16 |
+| 7 | 0.0 | 0.0 | 27 |
+| 8–12 | 0.0 | 0.0 | 13–27 |
+
+**Finding**
+**NVR route is definitively worse than direct camera.** Stream 1 never achieved a single frame in 12
+minutes. Stream 2 died at minute 7 and never recovered. nvurisrcbin's auto-reconnect failed to
+re-establish NVR RTSP sessions, while direct camera connections consistently recovered in 10-65s.
+
+**Decision**
+NVR relay route permanently abandoned. Direct camera + nvurisrcbin is the production configuration.
+
+---
+
+### Camera 192.168.28.152 Post-Firmware-Upgrade Test
+
+**Context**
+Site team upgraded firmware on pyrometer camera (192.168.28.152). Camera rebooted.
+
+**Result**
+- ONVIF `GetDeviceInformation` still reports firmware `2.860.00AT002.0.R` (unchanged string).
+- **RTSP now works** via `/video/live?channel=1&subtype=1` path — was returning `ECONNRESET` before reboot.
+- Stream: H.265 (HEVC), Main profile, 640×480, 25fps.
+- `/cam/realmonitor` path still times out (consistent with other CP Plus cameras).
+
+**Finding**
+The firmware upgrade (or the reboot itself) restored RTSP functionality. The camera was previously
+stuck in a state where port 554 accepted TCP connections but immediately reset them.
+
+---
+
+## March 20, 2026: New Camera Deployment
+
+### New Camera Installation
+
+Three new **Hikvision DS-2CD2043G2-LI2U** (4MP ColorVu bullet) cameras deployed to replace
+the old CP Plus (Dahua OEM) cameras. Identified via ISAPI (`/ISAPI/System/deviceInfo`).
+
+| Stream | Old Camera | New IP | New Camera | Firmware | Serial (suffix) |
+|--------|-----------|--------|------------|----------|-----------------|
+| 0 | 192.168.28.155 (CP-UNC-TC41L5C-VMD-LQ) | **192.168.27.226** | DS-2CD2043G2-LI2U | V5.7.18 | FR7128559 |
+| 1 | 192.168.28.152 (CP-UNC-TA41L3C-D-LQ) | **192.168.27.253** | DS-2CD2043G2-LI2U | V5.7.18 | FR7129271 |
+| 2 | 192.168.28.162 (CP-UNC-TC41L5C-VMD-LQ) | **192.168.28.119** | DS-2CD2043G2-LI2U | V5.7.19 | FW8319581 |
+
+**Credentials:** `admin` / `india@789` (lowercase, URL-encoded: `india%40789`)
+**RTSP URL:** `rtsp://admin:india%40789@{IP}:554/video/live?channel=1&subtype=1`
+
+**Camera specs (all 3 identical model):**
+- Model: Hikvision DS-2CD2043G2-LI2U (4MP ColorVu bullet with hybrid light)
+- Codec: H.265 (HEVC), Main profile
+- Resolution: **2688×1520** (4MP full resolution on both main and sub-stream)
+- Frame rate: 25fps
+- MAC OUI: `bc:29:78` (Hikvision)
+- ONVIF: **disabled** in camera settings (404 on `/onvif/device_service`)
+- ISAPI: available on HTTP :80 (streams 0, 1) / HTTPS :443 (stream 2)
+- RTSP OPTIONS: returns 200 without authentication (different from CP Plus which required auth)
+
+**Note:** Sub-stream (`subtype=1`) returns the same 2688×1520 as main stream — not configured to
+lower resolution. Should be set to ~720p via camera web UI to reduce HW decoder load on Jetson.
+
+**Initial pipeline test (2026-03-20 14:19):** All 3 streams running at 25fps. Stream 0 shows
+occasional FPS dips (14→32fps burst pattern) likely due to full 4MP HEVC decode load. No RTSP
+disconnections observed in first 35+ minutes — already better than old CP Plus cameras.
+
+---
+
+### Backpressure Buffer Improvements Applied
+
+Based on the March 19 simultaneous soak proof that drops are caused by pipeline backpressure,
+the following GStreamer buffer tuning was applied to `gst_builder.py`:
+
+| Parameter | Before | After | Rationale |
+|-----------|--------|-------|-----------|
+| `premuxq` max-size-buffers | 64 | **128** | ~5s at 25fps, absorbs longer inference stalls |
+| `premuxq` max-size-time | 0 (unlimited) | **5,000,000,000** (5s) | Time-based safety net |
+| `postmuxq0` max-size-buffers | 16 | **64** | Match upstream queue depth |
+| `latency` (nvurisrcbin) | 2000ms | **4000ms** | Larger jitter buffer prevents early packet drops |
+| `drop-on-latency` | True | True (unchanged) | Drops late packets instead of accumulating |
+| `num-extra-surfaces` | 16 | 16 (unchanged) | Sufficient decoder output surfaces |
+
+**Expected effect:** Larger buffers absorb momentary inference stalls for up to ~5 seconds.
+The TCP socket continues draining during this buffer period, so the camera/NVR server never sees
+a zero-window condition. If stalls exceed 5 seconds, the leaky queue drops old frames (losing
+~5s of video) instead of blocking the TCP socket (which would lose ~60s of reconnection time).
+
+---
+
+### Updated Comparison Table (All Configurations Tested)
+
+| Configuration | Drops in 10 min | Recovery time | Drop interval | Notes |
+|---|---|---|---|---|
+| rtspsrc direct TCP (March 6) | continuous stall | pipeline restart | ~2–5 min | |
+| nvurisrcbin direct TCP (March 7) | ~3–4 | 10–20s | ~3–5 min | |
+| ffmpeg bridge via NVR TCP (March 9) | many | 15–20s | 25–33s | NVR overloaded |
+| ffmpeg bridge direct TCP (March 11) | 14 | 15–20s | ~3.5 min | |
+| MediaMTX UDP proxy (March 11) | 1–2 | 15–25s | ~5–9 min | |
+| **Segment buffer 60s spool (March 12)** | **0** | **0s (transparent)** | **∞** | **Best — fully decoupled** |
+| nvurisrcbin direct TCP (March 16) | ~2 | 10–65s | ~5 min | Simpler, tolerates drops |
+| NVR relay via nvurisrcbin (March 19) | ~2 | 5–60s | ~5 min | NVR does NOT help |
+| **NVR relay all-stream soak (March 19)** | **never recovered** | **∞** | **immediate** | **NVR definitively worse** |
+| Standalone ffmpeg → /dev/null (March 19) | **0** | — | **∞** | Proves backpressure is root cause |
+| nvurisrcbin + buffer tuning (March 20) | **TBD** | TBD | TBD | premuxq=128, latency=4000ms |

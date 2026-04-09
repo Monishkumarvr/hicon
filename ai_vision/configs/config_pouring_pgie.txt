@@ -2,8 +2,8 @@
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
-onnx-file=../models/onnx/best_pouring_hicon_v1_930.onnx
-model-engine-file=../models/onnx/best_pouring_hicon_v1_930.onnx_b1_gpu0_fp16.engine
+onnx-file=../models/onnx/best_pouring_hicon_hikvision_v1_557.onnx
+model-engine-file=../models/onnx/best_pouring_hicon_hikvision_v1_557.onnx_b1_gpu0_fp16.engine
 labelfile-path=labels_pouring.txt
 batch-size=1
 network-mode=2
@@ -15,10 +15,16 @@ network-type=0
 cluster-mode=2
 maintain-aspect-ratio=1
 symmetric-padding=1
-parse-bbox-func-name=NvDsInferParseYolo
+parse-bbox-func-name=NvDsInferParseYoloCuda
 custom-lib-path=../custom_parsers/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 
 [class-attrs-all]
-nms-iou-threshold=0.45
+nms-iou-threshold=0.5
 pre-cluster-threshold=0.25
 topk=300
+
+[class-attrs-0]
+pre-cluster-threshold=0.10
+
+[class-attrs-1]
+pre-cluster-threshold=0.25

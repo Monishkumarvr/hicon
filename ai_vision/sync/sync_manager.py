@@ -25,8 +25,8 @@ def format_timestamp_for_api(iso_timestamp: str) -> str:
     Returns:
         API format timestamp (e.g., "2025-12-26 14:06:01") or None if input is None
     """
-    # Handle None/null timestamps (e.g., ongoing pouring events without end_time)
-    if iso_timestamp is None:
+    # Handle None/null/empty timestamps (e.g., ongoing pouring events without end_time)
+    if not iso_timestamp:
         return None
 
     try:
@@ -203,8 +203,11 @@ class SyncManager:
                 logger.debug(f"  Skipping pouring sync for {cycle['sync_id']}: incomplete session (start={pouring_start}, end={pouring_end})")
             else:
                 # Pouring payload (new API format)
+                # Use sync_id + '-p' so AGNI treats /agni and /pouring as distinct records.
+                # AGNI deduplicates on sync_id globally — sending the same ID to both endpoints
+                # causes the second one to be rejected as "Duplicate", silently dropping data.
                 pouring_items.append({
-                    'sync_id': cycle['sync_id'],
+                    'sync_id': cycle['sync_id'] + '-p',
                     'customer_id': cycle['customer_id'],
                     'date': cycle['date'],
                     'heat_no': cycle.get('heat_no') or "",
@@ -228,7 +231,7 @@ class SyncManager:
             cycle_start_iso = cycle.get('cycle_start_time')
             cycle_end_iso = cycle.get('cycle_end_time')
             melting_items.append({
-                'sync_id': cycle['sync_id'],
+                'sync_id': cycle['sync_id'] + '-a',
                 'customer_id': cycle['customer_id'],
                 'date': cycle['date'],
                 'camera_id': cycle['camera_id'],
@@ -245,19 +248,22 @@ class SyncManager:
                 'deslagging': bool(len(deslag_events) > 0),
             })
 
-        # Send to API
-        pouring_result = self.api.send_pouring_data(pouring_items) if pouring_items else {'results': []}
+        # Send to API — melting first, then pouring.
+        # /pouring uses sync_id + '-p' (see above) so AGNI treats them as distinct records.
         melting_result = self.api.send_melting_data(melting_items) if melting_items else {'results': []}
+        pouring_result = self.api.send_pouring_data(pouring_items) if pouring_items else {'results': []}
 
         # Extract successful sync_ids from results array
         pouring_results = pouring_result.get('results', [])
         pouring_success = [
-            r['sync_id'] for r in pouring_results
+            # Strip '-p' suffix to get back the original cycle sync_id for the intersection below.
+            r['sync_id'].removesuffix('-p') for r in pouring_results
             if r.get('success', False) or r.get('error') == 'Duplicate'
         ]
         melting_results = melting_result.get('results', [])
         melting_success = [
-            r['sync_id'] for r in melting_results
+            # Strip '-a' suffix to get back the original cycle sync_id for the intersection below.
+            r['sync_id'].removesuffix('-a') for r in melting_results
             if r.get('success', False) or r.get('error') == 'Duplicate'
         ]
 

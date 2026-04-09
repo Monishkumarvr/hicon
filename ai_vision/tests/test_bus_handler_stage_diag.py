@@ -6,6 +6,7 @@ import pytest
 
 gi = pytest.importorskip("gi")
 gi.require_version("Gst", "1.0")
+from gi.repository import Gst
 
 from pipeline.bus_handler import BusHandler
 
@@ -24,7 +25,11 @@ class FakePipeline:
 
 
 class FakeLoop:
+    def __init__(self):
+        self.quit_called = False
+
     def quit(self):
+        self.quit_called = True
         return None
 
 
@@ -92,7 +97,7 @@ def test_fps_logger_emits_stream0_stage_ages(monkeypatch, caplog):
     assert "nvvidconv_src_age=" in caplog.text
     assert "caps_src_age=" in caplog.text
     assert "premuxq_src_age=" in caplog.text
-    assert "[S0-STAGES] mux_src_age=" in caplog.text
+    assert "mux_src_age=" in caplog.text
     assert "postmuxq_src_age=" in caplog.text
     assert "pgie_sink_age=" in caplog.text
     assert "pgie_src_age=" in caplog.text
@@ -181,3 +186,59 @@ def test_fps_logger_keeps_stream0_watchdog_active_while_segment_buffer_playing(m
 
     assert scheduled["callback"]() is True
     assert "[FPS-WATCHDOG] Stream 0 at 0fps for 5s" in caplog.text
+
+
+class FakeSrc:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+class FakeMessage:
+    def __init__(self, message_type, src_name):
+        self.type = message_type
+        self.src = FakeSrc(src_name)
+
+    def parse_error(self):
+        raise AssertionError("parse_error should not be called for EOS")
+
+
+def test_eos_from_restartable_source_schedules_stream_restart(monkeypatch):
+    scheduled = []
+
+    def fake_timeout_add_seconds(_interval, callback):
+        callback()
+        return 1
+
+    def fake_restart(stream_id, reason):
+        scheduled.append((stream_id, reason))
+        return True
+
+    monkeypatch.setattr("pipeline.bus_handler.GLib.timeout_add_seconds", fake_timeout_add_seconds)
+
+    loop = FakeLoop()
+    handler = BusHandler(
+        FakePipeline(),
+        loop,
+        stream_restart_cb=fake_restart,
+        restartable_stream_ids={0},
+        rtsp_restart_backoff_sec=0,
+    )
+
+    handler._on_bus_message(None, FakeMessage(Gst.MessageType.EOS, "source0"))
+
+    assert scheduled == [(0, "EOS from source0")]
+    assert handler.fatal_exit is False
+    assert loop.quit_called is False
+
+
+def test_eos_from_non_restartable_stream_remains_fatal():
+    loop = FakeLoop()
+    handler = BusHandler(FakePipeline(), loop)
+
+    handler._on_bus_message(None, FakeMessage(Gst.MessageType.EOS, "pipeline0"))
+
+    assert handler.fatal_exit is True
+    assert loop.quit_called is True
