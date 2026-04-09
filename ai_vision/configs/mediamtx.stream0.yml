@@ -15,6 +15,10 @@ writeTimeout: 30s
 
 paths:
   stream0:
-    source: rtsp://placeholder
+    source: publisher
     rtspTransport: udp
     sourceOnDemand: no
+  stream0_overlay:
+    source: publisher
+    runOnReady:
+    runOnReadyRestart: no

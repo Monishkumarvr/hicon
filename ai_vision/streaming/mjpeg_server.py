@@ -21,10 +21,12 @@ import cv2
 import time
 import threading
 import logging
+from datetime import datetime
 from flask import Flask, Response, render_template_string
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_MJPEG_AGE_LOG_INTERVAL_S = 10.0
 
 
 class MJPEGServer:
@@ -35,7 +37,14 @@ class MJPEGServer:
     accessible via HTTP (no plugins required, works in any browser).
     """
 
-    def __init__(self, host='0.0.0.0', port=8080, jpeg_quality=85, max_fps=30):
+    def __init__(
+        self,
+        host='0.0.0.0',
+        port=8080,
+        jpeg_quality=85,
+        max_fps=30,
+        timestamp_overlay=False,
+    ):
         """
         Initialize MJPEG server.
 
@@ -44,15 +53,18 @@ class MJPEGServer:
             port: HTTP port
             jpeg_quality: JPEG compression quality (0-100)
             max_fps: Maximum FPS for stream (throttles to save bandwidth)
+            timestamp_overlay: Whether to draw source timestamp / age on frames
         """
         self.host = host
         self.port = port
         self.jpeg_quality = jpeg_quality
         self.frame_delay = 1.0 / max_fps
+        self.timestamp_overlay = bool(timestamp_overlay)
 
         # Frame storage per stream
         self.frames = {}  # stream_id → (frame_bgr, timestamp)
         self.locks = {}   # stream_id → threading.Lock
+        self._age_log_last_time = {}
 
         # Flask app
         self.app = Flask(__name__)
@@ -74,6 +86,7 @@ class MJPEGServer:
         if stream_id not in self.frames:
             self.frames[stream_id] = (None, 0.0)
             self.locks[stream_id] = threading.Lock()
+            self._age_log_last_time[stream_id] = 0.0
             logger.info(f"Registered stream {stream_id}")
 
     def update_frame(self, stream_id, frame_bgr):
@@ -89,6 +102,87 @@ class MJPEGServer:
 
         with self.locks[stream_id]:
             self.frames[stream_id] = (frame_bgr.copy(), time.time())
+
+    def get_latest_frame_age(self, stream_id):
+        """Return age in seconds for the newest cached frame of a stream."""
+        _frame, _timestamp, frame_age = self._get_frame_snapshot(stream_id)
+        return frame_age
+
+    def _get_frame_snapshot(self, stream_id):
+        """Return the latest cached frame, source timestamp, and age."""
+        if stream_id not in self.locks:
+            return None, 0.0, None
+
+        with self.locks[stream_id]:
+            frame, timestamp = self.frames.get(stream_id, (None, 0.0))
+
+        if frame is None:
+            return None, timestamp, None
+
+        frame_age = max(0.0, time.time() - timestamp) if timestamp else None
+        return frame, timestamp, frame_age
+
+    def _maybe_log_frame_age(self, stream_id, frame_age, frame_timestamp):
+        """Emit occasional debug logs for preview latency diagnostics."""
+        if frame_age is None or not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        now = time.monotonic()
+        last_logged = self._age_log_last_time.get(stream_id, 0.0)
+        if (now - last_logged) < _MJPEG_AGE_LOG_INTERVAL_S:
+            return
+
+        self._age_log_last_time[stream_id] = now
+        ts_text = (
+            datetime.fromtimestamp(frame_timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            if frame_timestamp else "n/a"
+        )
+        logger.debug(
+            "MJPEG stream %s latest frame age=%.3fs source_ts=%s",
+            stream_id,
+            frame_age,
+            ts_text,
+        )
+
+    def _render_frame(self, frame_bgr, frame_timestamp, frame_age):
+        """Return the frame to encode, optionally decorated for live diagnostics."""
+        if not self.timestamp_overlay:
+            return frame_bgr
+
+        rendered = frame_bgr.copy()
+        ts_text = (
+            datetime.fromtimestamp(frame_timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            if frame_timestamp else "n/a"
+        )
+        age_text = f"{frame_age:.2f}s" if frame_age is not None else "n/a"
+        lines = [
+            f"SRC {ts_text}",
+            f"AGE {age_text}",
+        ]
+        y = 28
+        for line in lines:
+            cv2.putText(
+                rendered,
+                line,
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                rendered,
+                line,
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 28
+        return rendered
 
     def _generate_mjpeg(self, stream_id):
         """Generator yielding MJPEG frames for a stream."""
@@ -106,16 +200,18 @@ class MJPEGServer:
                 time.sleep(0.1)
                 continue
 
-            with self.locks[stream_id]:
-                frame, timestamp = self.frames.get(stream_id, (None, 0.0))
+            frame, timestamp, frame_age = self._get_frame_snapshot(stream_id)
 
             if frame is None:
                 # No frame yet, send placeholder
                 time.sleep(0.1)
                 continue
 
+            self._maybe_log_frame_age(stream_id, frame_age, timestamp)
+            render_frame = self._render_frame(frame, timestamp, frame_age)
+
             # Encode JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame,
+            ret, jpeg = cv2.imencode('.jpg', render_frame,
                                      [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ret:
                 logger.error(f"Failed to encode JPEG for stream {stream_id}")
@@ -133,8 +229,15 @@ class MJPEGServer:
         if stream_id not in self.frames:
             return f"Stream {stream_id} not available", 404
 
-        return Response(self._generate_mjpeg(stream_id),
-                        mimetype='multipart/x-mixed-replace; boundary=frame')
+        response = Response(
+            self._generate_mjpeg(stream_id),
+            mimetype='multipart/x-mixed-replace; boundary=frame',
+        )
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        response.headers['X-Accel-Buffering'] = 'no'
+        return response
 
     def _index_route(self):
         """Flask route for / (index page with all streams)."""

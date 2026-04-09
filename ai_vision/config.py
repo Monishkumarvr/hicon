@@ -165,9 +165,22 @@ STREAM_0_TRACKER_HEIGHT = int(os.getenv('HICON_STREAM_0_TRACKER_HEIGHT', '384'))
 
 # Annotated inference video (DS-native: tee + nvosd + RecordingManager)
 ENABLE_INFERENCE_VIDEO = os.getenv('HICON_ENABLE_INFERENCE_VIDEO', 'false').lower() == 'true'
+ENABLE_INFERENCE_VIDEO_STREAM_0 = os.getenv(
+    'HICON_ENABLE_INFERENCE_VIDEO_STREAM_0', str(ENABLE_INFERENCE_VIDEO)
+).lower() == 'true'
+ENABLE_INFERENCE_VIDEO_STREAM_1 = os.getenv(
+    'HICON_ENABLE_INFERENCE_VIDEO_STREAM_1', str(ENABLE_INFERENCE_VIDEO)
+).lower() == 'true'
+ENABLE_INFERENCE_VIDEO_STREAM_2 = os.getenv(
+    'HICON_ENABLE_INFERENCE_VIDEO_STREAM_2', str(ENABLE_INFERENCE_VIDEO)
+).lower() == 'true'
 INFERENCE_VIDEO_FPS = float(os.getenv('HICON_INFERENCE_VIDEO_FPS', '10'))
 INFERENCE_VIDEO_WIDTH = int(os.getenv('HICON_INFERENCE_VIDEO_WIDTH', '640'))
 INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))
+ENABLE_STREAM0_LOCAL_RELAY = os.getenv(
+    'HICON_ENABLE_STREAM0_LOCAL_RELAY', 'false'
+).lower() == 'true'
+STREAM0_REMOTE_RELAY_URL = os.getenv('HICON_STREAM0_REMOTE_RELAY_URL', '').strip()
 
 # Recording schedule: 'always' for 24/7, or time windows like '06:00-08:00,18:00-20:00'
 # Format: comma-separated HH:MM-HH:MM pairs (24h clock, local time)
@@ -371,6 +384,10 @@ LIVE_STREAM_HOST = os.getenv('HICON_LIVE_STREAM_HOST', '0.0.0.0')
 LIVE_STREAM_PORT = int(os.getenv('HICON_LIVE_STREAM_PORT', '8080'))
 LIVE_STREAM_QUALITY = int(os.getenv('HICON_LIVE_STREAM_QUALITY', '85'))  # JPEG quality 0-100
 LIVE_STREAM_FPS = int(os.getenv('HICON_LIVE_STREAM_FPS', '15'))  # Max FPS for stream
+LIVE_STREAM_TIMESTAMP_OVERLAY = os.getenv(
+    'HICON_LIVE_STREAM_TIMESTAMP_OVERLAY',
+    'false',
+).lower() == 'true'
 
 # Per-stream live streaming control (default: follow ENABLE_LIVE_STREAM)
 ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'true'
@@ -506,9 +523,16 @@ def get_config_summary():
         'log_mould_displacement': LOG_MOULD_DISPLACEMENT,
         'mould_disp_log_interval_s': MOULD_DISP_LOG_INTERVAL_S,
         'enable_inference_video': ENABLE_INFERENCE_VIDEO,
+        'enable_inference_video_stream_0': ENABLE_INFERENCE_VIDEO_STREAM_0,
+        'enable_inference_video_stream_1': ENABLE_INFERENCE_VIDEO_STREAM_1,
+        'enable_inference_video_stream_2': ENABLE_INFERENCE_VIDEO_STREAM_2,
+        'enable_live_stream': ENABLE_LIVE_STREAM,
+        'live_stream_timestamp_overlay': LIVE_STREAM_TIMESTAMP_OVERLAY,
         'inference_video_fps': INFERENCE_VIDEO_FPS,
         'inference_video_width': INFERENCE_VIDEO_WIDTH,
         'inference_video_height': INFERENCE_VIDEO_HEIGHT,
+        'enable_stream0_local_relay': ENABLE_STREAM0_LOCAL_RELAY,
+        'stream0_remote_relay_url': STREAM0_REMOTE_RELAY_URL,
         'inference_video_schedule': INFERENCE_VIDEO_SCHEDULE,
         'inference_video_max_duration_s': INFERENCE_VIDEO_MAX_DURATION_S,
         'inference_video_retention_days': INFERENCE_VIDEO_RETENTION_DAYS,

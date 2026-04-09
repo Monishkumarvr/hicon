@@ -23,6 +23,8 @@ ExecStart=/usr/bin/python3 hicon_pipeline.py
 KillSignal=SIGTERM
 KillMode=control-group
 TimeoutStopSec=15
+MemoryAccounting=yes
+MemoryHigh=3G
 
 # Restart on failure with 2s delay
 Restart=on-failure

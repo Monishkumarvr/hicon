@@ -191,6 +191,52 @@ def test_create_all_elements_decoupled_analysis_mode_builds_current_analysis_bra
     assert "decoupled analysis mode" in caplog.text
 
 
+def test_stream0_local_relay_enables_annotated_tee_without_recording(monkeypatch):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_0="rtsp://example/stream0",
+        config_pouring="/tmp/config_pouring.txt",
+        tracker_lib="/tmp/libtracker.so",
+        tracker_config="/tmp/tracker.yml",
+        stream_0_decoupled_analysis_mode=True,
+        enable_inference_video=False,
+        enable_live_stream_0=False,
+        enable_stream0_local_relay=True,
+    )
+    builder.pipeline = FakePipeline()
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+
+    assert builder._create_all_elements() is True
+    assert "post_osd_conv_0" in builder.elements
+    assert "post_osd_caps_0" in builder.elements
+    assert "tee_0" in builder.elements
+    assert "queue_display_0" in builder.elements
+
+
+def test_stream1_per_stream_recording_flag_skips_recording_topology(monkeypatch):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_1="rtsp://example/stream1",
+        config_pyrometer="/tmp/config_pyrometer.txt",
+        enable_inference_video=True,
+        enable_inference_video_stream_1=False,
+    )
+    builder.pipeline = FakePipeline()
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+
+    assert builder._create_all_elements() is True
+    assert "post_osd_conv_1" not in builder.elements
+    assert "post_osd_caps_1" not in builder.elements
+    assert "tee_1" not in builder.elements
+    assert "queue_display_1" not in builder.elements
+
+
 def test_get_restartable_stream_ids_only_returns_native_rtsp_streams():
     builder = _make_builder(
         rtsp_stream_0="rtsp://example/stream0",

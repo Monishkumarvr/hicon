@@ -3,7 +3,15 @@ import logging
 import sys
 
 
-def _reload_config(monkeypatch, **env):
+def _reload_config(monkeypatch, *, load_env_file=True, **env):
+    if not load_env_file:
+        import dotenv
+
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
+        env.setdefault("HICON_API_URL", "http://example.invalid")
+        env.setdefault("HICON_CUSTOMER_ID", "test-customer")
+        env.setdefault("HICON_ENABLE_SYNC", "false")
+
     for key, value in env.items():
         if value is None:
             monkeypatch.delenv(key, raising=False)
@@ -86,3 +94,66 @@ def test_config_reads_stream0_segment_buffer_flags(monkeypatch):
     assert config.SEGMENT_BUFFER_SEGMENT_SEC_0 == 3
     assert config.SEGMENT_BUFFER_DELAY_SEC_0 == 45
     assert config.SEGMENT_BUFFER_RETENTION_SEC_0 == 90
+
+
+def test_config_reads_stream0_local_relay_flags(monkeypatch):
+    config = _reload_config(
+        monkeypatch,
+        HICON_ENABLE_STREAM0_LOCAL_RELAY="true",
+        HICON_STREAM0_REMOTE_RELAY_URL="rtsp://example.com/live/stream0",
+    )
+
+    assert config.ENABLE_STREAM0_LOCAL_RELAY is True
+    assert config.STREAM0_REMOTE_RELAY_URL == "rtsp://example.com/live/stream0"
+
+
+def test_config_defaults_stream0_remote_relay_url_to_empty(monkeypatch):
+    config = _reload_config(
+        monkeypatch,
+        HICON_ENABLE_STREAM0_LOCAL_RELAY="false",
+        HICON_STREAM0_REMOTE_RELAY_URL=None,
+    )
+
+    assert config.ENABLE_STREAM0_LOCAL_RELAY is False
+    assert config.STREAM0_REMOTE_RELAY_URL == ""
+
+
+def test_config_inference_video_stream_flags_follow_global_by_default(monkeypatch):
+    config = _reload_config(
+        monkeypatch,
+        load_env_file=False,
+        HICON_ENABLE_INFERENCE_VIDEO="true",
+        HICON_ENABLE_INFERENCE_VIDEO_STREAM_0=None,
+        HICON_ENABLE_INFERENCE_VIDEO_STREAM_1=None,
+        HICON_ENABLE_INFERENCE_VIDEO_STREAM_2=None,
+    )
+
+    assert config.ENABLE_INFERENCE_VIDEO is True
+    assert config.ENABLE_INFERENCE_VIDEO_STREAM_0 is True
+    assert config.ENABLE_INFERENCE_VIDEO_STREAM_1 is True
+    assert config.ENABLE_INFERENCE_VIDEO_STREAM_2 is True
+
+
+def test_config_inference_video_stream_flags_override_global(monkeypatch):
+    config = _reload_config(
+        monkeypatch,
+        HICON_ENABLE_INFERENCE_VIDEO="true",
+        HICON_ENABLE_INFERENCE_VIDEO_STREAM_0="true",
+        HICON_ENABLE_INFERENCE_VIDEO_STREAM_1="false",
+        HICON_ENABLE_INFERENCE_VIDEO_STREAM_2="false",
+    )
+
+    assert config.ENABLE_INFERENCE_VIDEO is True
+    assert config.ENABLE_INFERENCE_VIDEO_STREAM_0 is True
+    assert config.ENABLE_INFERENCE_VIDEO_STREAM_1 is False
+    assert config.ENABLE_INFERENCE_VIDEO_STREAM_2 is False
+
+
+def test_config_reads_live_stream_timestamp_overlay_flag(monkeypatch):
+    config = _reload_config(
+        monkeypatch,
+        load_env_file=False,
+        HICON_LIVE_STREAM_TIMESTAMP_OVERLAY="true",
+    )
+
+    assert config.LIVE_STREAM_TIMESTAMP_OVERLAY is True

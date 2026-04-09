@@ -32,6 +32,7 @@ from db_manager import HiConDatabase, AsyncDBWriter
 from pipeline.gst_builder import DeepStreamPipelineBuilder
 from pipeline.bus_handler import BusHandler
 from pipeline.recording import RecordingManager
+from pipeline.stream0_local_relay import Stream0LocalRelayManager
 from processors.brightness_processor import BrightnessProcessor
 from processors.melting_analysis_controller import MeltingAnalysisController
 from processors.melting_meta_reader import MeltingMetaReader
@@ -74,12 +75,75 @@ pyrometer_processor = None
 bus_handler = None
 sync_manager = None
 recording_manager = None
+stream0_local_relay_manager = None
 mjpeg_server = None
 async_db_writer = None
 screenshot_writer = None
 _live_stream_last_extract = {}
 _live_stream_warmup_deadline = 0.0
 _RECORDING_STARTUP_WARMUP_SEC = 5
+
+
+def _read_int_file(path: Path):
+    try:
+        return int(path.read_text().strip())
+    except Exception:
+        return None
+
+
+def _resolve_self_cgroup_memory():
+    try:
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0":
+                rel_path = parts[2].strip().lstrip("/")
+                cgroup_root = Path("/sys/fs/cgroup")
+                memory_path = cgroup_root / rel_path / "memory.current" if rel_path else cgroup_root / "memory.current"
+                return parts[2].strip() or "/", _read_int_file(memory_path)
+    except Exception:
+        pass
+    return None, None
+
+
+def _read_meminfo_snapshot():
+    meminfo = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields = value.strip().split()
+            if fields:
+                meminfo[key] = int(fields[0]) * 1024
+    except Exception:
+        return None, None
+
+    mem_available = meminfo.get("MemAvailable")
+    swap_total = meminfo.get("SwapTotal")
+    swap_free = meminfo.get("SwapFree")
+    swap_used = None
+    if swap_total is not None and swap_free is not None:
+        swap_used = max(0, swap_total - swap_free)
+    return mem_available, swap_used
+
+
+def _format_bytes(value):
+    if value is None:
+        return "n/a"
+    return f"{value / (1024 * 1024):.1f}MiB"
+
+
+def _log_memory_snapshot(reason: str):
+    cgroup_path, cgroup_memory = _resolve_self_cgroup_memory()
+    mem_available, swap_used = _read_meminfo_snapshot()
+    logger.info(
+        "[MEMORY] reason=%s cgroup_path=%s cgroup_current=%s mem_available=%s swap_used=%s",
+        reason,
+        cgroup_path or "n/a",
+        _format_bytes(cgroup_memory),
+        _format_bytes(mem_available),
+        _format_bytes(swap_used),
+    )
 
 
 class _ProbeTimestampResolver:
@@ -991,7 +1055,7 @@ def main():
     global heat_cycle_manager_2
     global brightness_processor, pyrometer_processor
     global melting_controller, melting_meta_reader
-    global bus_handler, sync_manager, recording_manager, mjpeg_server
+    global bus_handler, sync_manager, recording_manager, stream0_local_relay_manager, mjpeg_server
     global async_db_writer, screenshot_writer
 
     logger.info("=" * 60)
@@ -1228,6 +1292,12 @@ def main():
         'stream_0_tracker_width': config.STREAM_0_TRACKER_WIDTH,
         'stream_0_tracker_height': config.STREAM_0_TRACKER_HEIGHT,
         'enable_inference_video': config.ENABLE_INFERENCE_VIDEO,
+        'enable_inference_video_stream_0': config.ENABLE_INFERENCE_VIDEO_STREAM_0,
+        'enable_inference_video_stream_1': config.ENABLE_INFERENCE_VIDEO_STREAM_1,
+        'enable_inference_video_stream_2': config.ENABLE_INFERENCE_VIDEO_STREAM_2,
+        'enable_live_stream_0': bool(config.ENABLE_LIVE_STREAM and config.ENABLE_LIVE_STREAM_0),
+        'live_stream_timestamp_overlay': config.LIVE_STREAM_TIMESTAMP_OVERLAY,
+        'enable_stream0_local_relay': config.ENABLE_STREAM0_LOCAL_RELAY,
         'use_nvurisrcbin_0': config.USE_NVURISRCBIN_0,
         'use_nvurisrcbin_1': config.USE_NVURISRCBIN_1,
         'use_nvurisrcbin_2': config.USE_NVURISRCBIN_2,
@@ -1311,7 +1381,8 @@ def main():
             host=config.LIVE_STREAM_HOST,
             port=config.LIVE_STREAM_PORT,
             jpeg_quality=config.LIVE_STREAM_QUALITY,
-            max_fps=config.LIVE_STREAM_FPS
+            max_fps=config.LIVE_STREAM_FPS,
+            timestamp_overlay=config.LIVE_STREAM_TIMESTAMP_OVERLAY,
         )
         # Only register streams that have pipeline elements (i.e. are enabled and linked)
         for _sid, _key in [(0, 'nvosd_0'), (1, 'nvosd_1'), (2, 'nvosd_2')]:
@@ -1324,7 +1395,7 @@ def main():
 
     # Optional DS-native inference recording branch (post-OSD annotations)
     recording_manager = None
-    if config.ENABLE_INFERENCE_VIDEO:
+    if config.ENABLE_INFERENCE_VIDEO_STREAM_0:
         tee_0 = elements.get('tee_0')
         if tee_0:
             recording_manager = RecordingManager(
@@ -1343,10 +1414,12 @@ def main():
                 logger.error("Stream 0: failed to configure inference recording branch")
                 recording_manager = None
         else:
-            logger.warning("Inference video enabled but tee_0 is missing; recording disabled")
+            logger.warning("Stream 0 inference recording enabled but tee_0 is missing; recording disabled")
+    elif config.ENABLE_INFERENCE_VIDEO:
+        logger.info("Stream 0 inference recording disabled by HICON_ENABLE_INFERENCE_VIDEO_STREAM_0=false")
 
     recording_manager_1 = None
-    if config.ENABLE_INFERENCE_VIDEO:
+    if config.ENABLE_INFERENCE_VIDEO_STREAM_1:
         tee_1 = elements.get('tee_1')
         if tee_1:
             recording_manager_1 = RecordingManager(
@@ -1365,10 +1438,12 @@ def main():
                 logger.error("Stream 1: failed to configure inference recording branch")
                 recording_manager_1 = None
         else:
-            logger.warning("Inference video enabled but tee_1 missing; stream 1 recording disabled")
+            logger.warning("Stream 1 inference recording enabled but tee_1 missing; stream 1 recording disabled")
+    elif config.ENABLE_INFERENCE_VIDEO:
+        logger.info("Stream 1 inference recording disabled by HICON_ENABLE_INFERENCE_VIDEO_STREAM_1=false")
 
     recording_manager_2 = None
-    if config.ENABLE_INFERENCE_VIDEO:
+    if config.ENABLE_INFERENCE_VIDEO_STREAM_2:
         tee_2 = elements.get('tee_2')
         if tee_2:
             recording_manager_2 = RecordingManager(
@@ -1387,7 +1462,30 @@ def main():
                 logger.error("Stream 2: failed to configure inference recording branch")
                 recording_manager_2 = None
         else:
-            logger.warning("Inference video enabled but tee_2 missing; stream 2 recording disabled")
+            logger.warning("Stream 2 inference recording enabled but tee_2 missing; stream 2 recording disabled")
+    elif config.ENABLE_INFERENCE_VIDEO:
+        logger.info("Stream 2 inference recording disabled by HICON_ENABLE_INFERENCE_VIDEO_STREAM_2=false")
+
+    stream0_local_relay_manager = None
+    if config.ENABLE_STREAM0_LOCAL_RELAY:
+        tee_0 = elements.get('tee_0')
+        if tee_0:
+            stream0_local_relay_manager = Stream0LocalRelayManager(
+                stream_id=0,
+                target_fps=config.INFERENCE_VIDEO_FPS,
+                target_width=config.INFERENCE_VIDEO_WIDTH,
+                target_height=config.INFERENCE_VIDEO_HEIGHT,
+            )
+            if stream0_local_relay_manager.setup_relay_branch(pipeline, tee_0):
+                logger.info(
+                    "Stream 0: local MediaMTX relay branch configured at %s",
+                    stream0_local_relay_manager.publish_uri,
+                )
+            else:
+                logger.error("Stream 0: failed to configure local MediaMTX relay branch")
+                stream0_local_relay_manager = None
+        else:
+            logger.warning("Stream 0 local relay enabled but tee_0 is missing; relay disabled")
 
     # Attach pad probes
     # Stream 0: OSD sink pad probe (pouring + brightness)
@@ -1695,6 +1793,7 @@ def main():
     logger.info("Pipeline PLAYING — waiting for streams...")
     global _live_stream_warmup_deadline
     _live_stream_warmup_deadline = time.monotonic() + _RECORDING_STARTUP_WARMUP_SEC
+    _log_memory_snapshot("startup")
 
     def _start_recording_branches_after_warmup():
         if recording_manager:
@@ -1705,7 +1804,7 @@ def main():
             recording_manager_2.start_recording(event_prefix="inference_stream2")
         return False
 
-    if config.ENABLE_INFERENCE_VIDEO:
+    if any((recording_manager, recording_manager_1, recording_manager_2)):
         logger.info(
             "Deferring inference recording start for %ss warm-up",
             _RECORDING_STARTUP_WARMUP_SEC,
@@ -1722,6 +1821,12 @@ def main():
             bus_handler.update_frame_time(_sid)
     bus_handler.start_watchdog(interval_sec=60)
     bus_handler.start_fps_logger()
+    if config.ENABLE_DEBUG_PROBES:
+        def _log_debug_memory_snapshot():
+            _log_memory_snapshot("periodic")
+            return True
+
+        GLib.timeout_add_seconds(60, _log_debug_memory_snapshot)
 
     # Log config summary
     summary = config.get_config_summary()
@@ -1754,6 +1859,11 @@ def main():
                 recording_manager_1.stop_recording()
             except Exception as e:
                 logger.error(f"Error stopping recording manager 1: {e}", exc_info=True)
+        if recording_manager_2:
+            try:
+                recording_manager_2.stop_recording()
+            except Exception as e:
+                logger.error(f"Error stopping recording manager 2: {e}", exc_info=True)
         if pouring_processor:
             try:
                 pouring_processor.close()

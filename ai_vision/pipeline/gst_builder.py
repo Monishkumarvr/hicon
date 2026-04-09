@@ -51,6 +51,17 @@ class DeepStreamPipelineBuilder:
         self.pipeline = None
         self.elements = {}
         self.enable_inference_video = bool(config.get('enable_inference_video', False))
+        self.enable_inference_video_stream_0 = bool(
+            config.get('enable_inference_video_stream_0', self.enable_inference_video)
+        )
+        self.enable_inference_video_stream_1 = bool(
+            config.get('enable_inference_video_stream_1', self.enable_inference_video)
+        )
+        self.enable_inference_video_stream_2 = bool(
+            config.get('enable_inference_video_stream_2', self.enable_inference_video)
+        )
+        self.enable_live_stream_0 = bool(config.get('enable_live_stream_0', False))
+        self.enable_stream0_local_relay = bool(config.get('enable_stream0_local_relay', False))
         self.stream0_bypass_pgie = bool(config.get('stream_0_bypass_pgie', False))
         self.stream0_bypass_tracker = bool(config.get('stream_0_bypass_tracker', False))
         self.stream0_decode_only_mode = bool(config.get('stream_0_decode_only_mode', False))
@@ -127,6 +138,11 @@ class DeepStreamPipelineBuilder:
         if self.stream0_bypass_pgie and not self.stream0_bypass_tracker:
             logger.info("Stream 0: pgie bypass requested; tracker bypass forced on as well")
             self.stream0_bypass_tracker = True
+        self.stream0_annotated_tee_enabled = bool(
+            self.enable_inference_video_stream_0
+            or self.enable_live_stream_0
+            or self.enable_stream0_local_relay
+        )
 
     def _is_native_rtsp_stream(self, stream_id):
         """True when the stream uses rtspsrc or nvurisrcbin directly."""
@@ -1130,8 +1146,8 @@ class DeepStreamPipelineBuilder:
                 elif self.stream0_bypass_tracker:
                     logger.warning("Stream 0 (CP Plus): bypassing tracker_0 for diagnostic run")
 
-                # Optional DS-native recording split point (post-OSD annotated frames)
-                if self.enable_inference_video:
+                # Optional annotated-output split point (post-OSD frames with overlays)
+                if self.stream0_annotated_tee_enabled:
                     # Normalize OSD output caps before tee to avoid downstream caps quirks.
                     self.elements['post_osd_conv_0'] = Gst.ElementFactory.make("nvvideoconvert", "post-osd-conv-0")
                     self.elements['post_osd_caps_0'] = Gst.ElementFactory.make("capsfilter", "post-osd-caps-0")
@@ -1175,7 +1191,7 @@ class DeepStreamPipelineBuilder:
                 self.elements['nvosd_1'].set_property('process-mode', _NVDSOSD_MODE_CPU)
 
             # Optional DS-native recording split point for stream 1
-            if self.enable_inference_video:
+            if self.enable_inference_video_stream_1:
                 self.elements['post_osd_conv_1'] = Gst.ElementFactory.make("nvvideoconvert", "post-osd-conv-1")
                 self.elements['post_osd_caps_1'] = Gst.ElementFactory.make("capsfilter", "post-osd-caps-1")
                 if self.elements['post_osd_caps_1']:
@@ -1245,7 +1261,7 @@ class DeepStreamPipelineBuilder:
                 self.elements['nvosd_2'].set_property('process-mode', _NVDSOSD_MODE_CPU)
 
             # Optional DS-native recording split point for stream 2
-            if self.enable_inference_video:
+            if self.enable_inference_video_stream_2:
                 self.elements['post_osd_conv_2'] = Gst.ElementFactory.make("nvvideoconvert", "post-osd-conv-2")
                 self.elements['post_osd_caps_2'] = Gst.ElementFactory.make("capsfilter", "post-osd-caps-2")
                 if self.elements['post_osd_caps_2']:
@@ -1512,8 +1528,8 @@ class DeepStreamPipelineBuilder:
                             "linked from tee_stream0_analysis"
                         )
 
-                if self.enable_inference_video:
-                    # Split annotated stream: display path + recording path (added later by RecordingManager)
+                if self.stream0_annotated_tee_enabled:
+                    # Split annotated stream: display path + optional recording/relay branches
                     if not self.elements['nvosd_0'].link(self.elements['post_osd_conv_0']):
                         logger.error("Failed to link nvosd_0 -> post_osd_conv_0")
                         return False
@@ -1558,7 +1574,7 @@ class DeepStreamPipelineBuilder:
                     logger.error(f"Failed to link {src_name} -> {dst_name}")
                     return False
 
-            if self.enable_inference_video:
+            if self.enable_inference_video_stream_1:
                 if not self.elements['nvosd_1'].link(self.elements['post_osd_conv_1']):
                     logger.error("Failed to link nvosd_1 -> post_osd_conv_1")
                     return False
@@ -1602,7 +1618,7 @@ class DeepStreamPipelineBuilder:
                 ('nvvidconv_osd_2', 'caps_osd_2'),
                 ('caps_osd_2', 'nvosd_2'),
             ])
-            if self.enable_inference_video and 'tee_2' in self.elements and self.elements.get('tee_2'):
+            if self.enable_inference_video_stream_2 and 'tee_2' in self.elements and self.elements.get('tee_2'):
                 chain_2.extend([
                     ('nvosd_2', 'post_osd_conv_2'),
                     ('post_osd_conv_2', 'post_osd_caps_2'),
@@ -1615,7 +1631,7 @@ class DeepStreamPipelineBuilder:
                     logger.error(f"Failed to link {src_name} -> {dst_name}")
                     return False
             # Link tee_2 display branch if recording is active
-            if self.enable_inference_video and 'tee_2' in self.elements and self.elements.get('tee_2'):
+            if self.enable_inference_video_stream_2 and 'tee_2' in self.elements and self.elements.get('tee_2'):
                 if not self._link_tee_src_to_element('tee_2', 'queue_display_2'):
                     return False
                 if not self.elements['queue_display_2'].link(self.elements['sink_2']):
