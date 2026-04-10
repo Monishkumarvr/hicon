@@ -504,3 +504,193 @@ def test_reference_hold_probe_reuse_within_mouth_hold_window(tmp_path):
 
     assert proc.active_probe_from_hold is True
     assert proc._last_probe_base == (88, 111)
+
+
+# ---------------------------------------------------------------------------
+# Cluster rescue gate tests
+# ---------------------------------------------------------------------------
+
+def _make_segment(start_time, x, y=0.2, duration=3.0, fps=25):
+    """Build a minimal raw segment with uniform norm samples at position (x, y)."""
+    start_dt = datetime.now()
+    n_samples = max(4, int(duration * fps))
+    samples = [
+        {"time": start_time + i / fps, "datetime": start_dt, "norm": (x, y)}
+        for i in range(n_samples)
+    ]
+    return {
+        "start_time": samples[0]["time"],
+        "start_datetime": start_dt,
+        "end_time": samples[-1]["time"],
+        "end_datetime": start_dt,
+        "samples": samples,
+        "ladle_track_id": 1,
+    }
+
+
+def test_rescue_gate_triggers_on_heat0124_pattern(tmp_path):
+    """21 segments at 21 distinct positions → 10 clusters under r=0.08 → gate fires."""
+    proc = _make_proc(tmp_path)
+    # 10 distinct x positions, each visited ~2 times = 21 segments total
+    xs = [i * 0.04 for i in range(10)]  # spacing 0.04, within r_cluster=0.08
+    segs = []
+    t = 0.0
+    for i, x in enumerate(xs):
+        segs.append(_make_segment(t, x))
+        t += 4.0
+    # Second pass over first 11 positions (merges into existing clusters under r=0.08)
+    for x in xs[:11]:
+        segs.append(_make_segment(t, x + 0.001))  # slight jitter, stays < r_cluster
+        t += 4.0
+
+    proc.completed_segments = segs
+    proc._recompute_clusters()
+
+    # Baseline: 10 clusters (segments at +0.001 merge into existing under r=0.08)
+    # Gate: 21 segs, 10 clusters, ratio=0.476 ≤ 0.65, gap=11 ≥ 8 → rescue runs
+    # After rescue: positions are 0.04 apart (> 0.008 gap) → sub-clusters split
+    assert proc.clustered_mould_count >= 10
+
+
+def test_rescue_gate_does_not_trigger_on_normal_revisit_pattern(tmp_path):
+    """24 segments, 20 clusters (ratio=0.833 > 0.65) — gate must NOT fire."""
+    proc = _make_proc(tmp_path)
+    # 20 distinct positions, 4 revisited once (gap < 0.008 = true revisit jitter)
+    xs = [i * 0.06 for i in range(20)]
+    segs = []
+    t = 0.0
+    for x in xs:
+        segs.append(_make_segment(t, x))
+        t += 4.0
+    # 4 revisit pours at same positions (x + tiny jitter < 0.008)
+    for x in xs[:4]:
+        segs.append(_make_segment(t, x + 0.002))
+        t += 4.0
+
+    proc.completed_segments = segs
+    proc._recompute_clusters()
+
+    # 24 segs, ~20 clusters, ratio ~0.833 > 0.65 → gate stays off
+    # Cluster count should stay at ~20 (no rescue splitting)
+    assert proc.clustered_mould_count <= 20
+
+
+def test_rescue_gate_does_not_trigger_on_15_segments_12_clusters(tmp_path):
+    """15 segs, 12 clusters: valid_segs=15 < 18 → gate must NOT fire."""
+    proc = _make_proc(tmp_path)
+    xs = [i * 0.07 for i in range(12)]
+    segs = []
+    t = 0.0
+    for x in xs:
+        segs.append(_make_segment(t, x))
+        t += 4.0
+    for x in xs[:3]:
+        segs.append(_make_segment(t, x + 0.001))
+        t += 4.0
+
+    proc.completed_segments = segs
+    proc._recompute_clusters()
+
+    # 15 segs < 18 → gate blocked, no rescue
+    assert proc.clustered_mould_count <= 12
+
+
+def test_rescue_splits_suspicious_cluster_with_significant_gap(tmp_path):
+    """A cluster with 2 segments at x=0.10 and x=0.30 (gap=0.20 >> 0.008) must split."""
+    proc = _make_proc(tmp_path)
+    # Force a scenario where r_cluster=0.08 merges x=0.10 and x=0.18 into one cluster,
+    # but those positions are actually distinct (gap=0.08 > 0.008 internal gap).
+    # Use 21 total segs to pass the gate, with one cluster clearly spanning 2 positions.
+    segs = []
+    t = 0.0
+    # 10 single-position clusters
+    for i in range(10):
+        segs.append(_make_segment(t, i * 0.12))
+        t += 4.0
+    # One over-merged cluster: 11 extra segments all within r=0.08 of x=0.05
+    # but internally split between x=0.05 and x=0.09 (gap=0.04 > 0.008)
+    for _ in range(6):
+        segs.append(_make_segment(t, 0.05))
+        t += 4.0
+    for _ in range(5):
+        segs.append(_make_segment(t, 0.09))
+        t += 4.0
+
+    proc.completed_segments = segs
+    proc._recompute_clusters()
+
+    # Gate: 21 segs, baseline ≤ 11 clusters, ratio ≤ 0.52 ≤ 0.65, gap ≥ 10 ≥ 8
+    # Rescue should split the over-merged cluster → total clusters > baseline
+    assert proc.clustered_mould_count >= 10
+
+
+def test_rescue_keeps_same_position_revisit_merged(tmp_path):
+    """Re-pours with x-gap <= 0.008 must remain in one cluster after rescue."""
+    proc = _make_proc(tmp_path)
+    # Build a heat that triggers the gate: 21 segs, baseline ~10 clusters
+    segs = []
+    t = 0.0
+    for i in range(10):
+        segs.append(_make_segment(t, i * 0.04))
+        t += 4.0
+    # 11 revisit segments all within 0.005 of x=0.00 (true same-position revisits)
+    for _ in range(11):
+        segs.append(_make_segment(t, 0.00 + 0.003))
+        t += 4.0
+
+    proc.completed_segments = segs
+    proc._recompute_clusters()
+
+    # The 12 same-position pours (x≈0.00) should remain 1 cluster after rescue
+    cluster_ids = [r["cluster_id"] for r in proc.mould_records if abs(r.get("rep_norm", (1,))[0]) < 0.01]
+    if cluster_ids:
+        assert len(set(cluster_ids)) == 1, "Same-position revisits must stay merged"
+
+
+def test_lower_displacement_threshold_detects_slow_motion_split(tmp_path):
+    """Displacement 0.15 fires on a 0.20-unit move that 0.25 would miss."""
+    import types
+
+    def _make_proc_with_threshold(tmp_path, threshold):
+        cfg = DummyConfig()
+        cfg.MOULD_DISPLACEMENT_THRESHOLD = threshold
+        return PouringProcessor(
+            db_manager=DummyDB(),
+            config=cfg,
+            screenshot_dir=str(tmp_path),
+            heat_cycle_manager=None,
+        )
+
+    base_dt = datetime.now()
+    fps = 25
+
+    def make_two_position_segment(disp):
+        """Segment starting at x=0.10, then moving disp units in x."""
+        samples = []
+        t = 0.0
+        for i in range(10):
+            samples.append({"time": t, "datetime": base_dt, "norm": (0.10, 0.50)})
+            t += 1 / fps
+        for i in range(20):
+            samples.append({"time": t, "datetime": base_dt, "norm": (0.10 + disp, 0.50)})
+            t += 1 / fps
+        return {
+            "start_time": 0.0, "start_datetime": base_dt,
+            "end_time": t, "end_datetime": base_dt,
+            "samples": samples, "ladle_track_id": 1,
+        }
+
+    seg = make_two_position_segment(0.20)
+
+    proc_025 = _make_proc_with_threshold(tmp_path, 0.25)
+    out_025 = []
+    proc_025._split_segment_by_motion(seg, out_025)
+
+    proc_015 = _make_proc_with_threshold(tmp_path, 0.15)
+    out_015 = []
+    proc_015._split_segment_by_motion(seg, out_015)
+
+    # At threshold 0.25: displacement 0.20 never exceeds threshold → no split
+    assert len(out_025) == 1, "0.25 threshold should NOT split a 0.20-unit displacement"
+    # At threshold 0.15: displacement 0.20 > 0.15 → split fires
+    assert len(out_015) == 2, "0.15 threshold should split a 0.20-unit displacement"

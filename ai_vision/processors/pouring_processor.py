@@ -1260,9 +1260,10 @@ class PouringProcessor:
 
         out.append(segment)
 
-    def _assign_to_cluster(self, point, clusters):
+    def _assign_to_cluster(self, point, clusters, r_override=None):
         latest_cid = max((cluster["cid"] for cluster in clusters), default=0)
         min_allowed_cid = max(1, latest_cid - self.cluster_backtrack_guard)
+        effective_r = r_override if r_override is not None else self.r_cluster
 
         best_idx = -1
         best_dist = float("inf")
@@ -1274,9 +1275,10 @@ class PouringProcessor:
             if dist < best_dist:
                 best_dist = dist
                 best_idx = idx
-        return best_idx if best_dist <= self.r_cluster else -1
+        return best_idx if best_dist <= effective_r else -1
 
-    def _merge_clusters(self, clusters):
+    def _merge_clusters(self, clusters, r_override=None):
+        effective_r = r_override if r_override is not None else self.r_merge
         out = []
         used = [False] * len(clusters)
         next_cid = 1
@@ -1292,7 +1294,7 @@ class PouringProcessor:
                     (cluster["centroid"][0] - clusters[j]["centroid"][0]) ** 2 +
                     (cluster["centroid"][1] - clusters[j]["centroid"][1]) ** 2
                 )
-                if dist <= self.r_merge:
+                if dist <= effective_r:
                     used[j] = True
                     group.append(clusters[j])
 
@@ -1313,10 +1315,84 @@ class PouringProcessor:
             next_cid += 1
         return out
 
+    def _rescue_refine_clusters(self, baseline_clusters):
+        """
+        Re-cluster segments within suspicious baseline clusters using a
+        locally-computed tighter radius. Only splits clusters that contain
+        clearly distinct mould positions (significant internal x-gap > 0.008).
+        Returns a flat list of clusters with renumbered cids.
+        """
+        refined = []
+        for cluster in baseline_clusters:
+            segs = cluster["segments"]
+            if len(segs) < 2:
+                refined.append(cluster)
+                continue
+
+            # Collect valid x-values for this cluster's segments
+            x_vals = []
+            for seg in segs:
+                rep = self._segment_representative_point(seg)
+                if rep is not None:
+                    x_vals.append(rep[0])
+
+            if len(x_vals) < 2:
+                refined.append(cluster)
+                continue
+
+            x_sorted = sorted(x_vals)
+            gaps = [x_sorted[i + 1] - x_sorted[i] for i in range(len(x_sorted) - 1)]
+            significant = sorted(g for g in gaps if g > 0.008)
+
+            if not significant:
+                # All pours at essentially the same position — keep merged
+                refined.append(cluster)
+                continue
+
+            # Compute local radii from internal gap distribution (25th percentile)
+            typical_gap = significant[max(0, len(significant) // 4)]
+            local_r = min(self.r_cluster, max(0.005, typical_gap * 0.40))
+            local_r_merge = min(self.r_merge, max(0.003, local_r * 0.35))
+
+            # Re-cluster this cluster's segments with local radii
+            sub_clusters = []
+            sub_cid = 1
+            for seg in sorted(segs, key=lambda s: s["start_time"]):
+                rep = self._segment_representative_point(seg)
+                if rep is None:
+                    continue
+                idx = self._assign_to_cluster(rep, sub_clusters, r_override=local_r)
+                if idx == -1:
+                    sub_clusters.append({"cid": sub_cid, "centroid": rep, "segments": [seg]})
+                    sub_cid += 1
+                else:
+                    sub_clusters[idx]["segments"].append(seg)
+                    reps = [self._segment_representative_point(s) for s in sub_clusters[idx]["segments"]]
+                    reps = [rp for rp in reps if rp is not None]
+                    if reps:
+                        sub_clusters[idx]["centroid"] = (
+                            sum(p[0] for p in reps) / len(reps),
+                            sum(p[1] for p in reps) / len(reps),
+                        )
+
+            sub_merged = self._merge_clusters(sub_clusters, r_override=local_r_merge)
+            refined.extend(sub_merged)
+
+        # Renumber cids sequentially
+        for i, c in enumerate(refined, start=1):
+            c["cid"] = i
+        return refined
+
     def _build_clusters(self, segments):
         split_segments = []
         for segment in segments:
             self._split_segment_by_motion(segment, split_segments)
+
+        valid_segment_count = sum(
+            1 for seg in split_segments
+            if self._segment_duration(seg) >= self.pour_min_dur
+            and self._segment_representative_point(seg) is not None
+        )
 
         clusters = []
         next_cid = 1
@@ -1348,6 +1424,21 @@ class PouringProcessor:
                     )
 
         merged = self._merge_clusters(clusters)
+
+        # Rescue refinement: only for heavily over-collapsed heats
+        baseline_count = len(merged)
+        if (valid_segment_count >= 18
+                and baseline_count > 0
+                and baseline_count / valid_segment_count <= 0.65
+                and valid_segment_count - baseline_count >= 8):
+            merged = self._rescue_refine_clusters(merged)
+            logger.info(
+                "Cluster rescue: segs=%d baseline=%d refined=%d ratio=%.2f gap=%d",
+                valid_segment_count, baseline_count, len(merged),
+                baseline_count / valid_segment_count,
+                valid_segment_count - baseline_count,
+            )
+
         valid = []
         for cluster in merged:
             total_duration = sum(self._segment_duration(seg) for seg in cluster["segments"])
