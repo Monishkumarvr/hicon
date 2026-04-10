@@ -395,6 +395,7 @@ class BrightnessProcessor:
         """
         if not force and not self.enable_display_meta:
             return
+        display_meta = None
         try:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
@@ -529,9 +530,11 @@ class BrightnessProcessor:
                     _add_roi_rect(poly.tolist(), (0.0, 1.0, 1.0, 1.0))
 
                 display_meta.num_rects = rect_idx
-            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
         except Exception as exc:
             logger.error(f"[osd] Failed to attach brightness display meta: {exc}", exc_info=True)
+        finally:
+            if display_meta is not None:
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
     def _handle_event_start(self, event, frame_rgba, white_ratio=0.0):
         """Handle tapping start screenshot."""

@@ -1981,6 +1981,7 @@ class PouringProcessor:
     def _add_inference_display_meta(self, batch_meta, frame_meta, mouths, trolleys,
                                     target_trolley, timestamp, datetime_obj):
         """Attach 2-line technical status + clean per-mould panel overlay (nvosd)."""
+        display_meta = None
         try:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
@@ -2150,9 +2151,11 @@ class PouringProcessor:
                 rect_idx += 1
 
             display_meta.num_rects = rect_idx
-            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
         except Exception as exc:
             logger.error(f"[osd] Failed to attach inference display meta: {exc}", exc_info=True)
+        finally:
+            if display_meta is not None:
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
     def write_recording_overlay(self, batch_meta, frame_meta):
         """Write display overlay from latest cached detection state.

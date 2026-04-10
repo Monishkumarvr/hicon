@@ -423,6 +423,7 @@ class PyrometerProcessor:
             display_meta.num_lines = 0
             display_meta.num_rects = 0
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+            display_meta = None  # ownership transferred to frame_meta
 
             # Draw zone polygons (separate display_meta per zone for 16-line limit)
             for zs in self.zone_states.values():
@@ -431,6 +432,9 @@ class PyrometerProcessor:
 
         except Exception as exc:
             logger.error(f"[pyrometer] Failed to attach display meta: {exc}", exc_info=True)
+        finally:
+            if display_meta is not None:
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
     def _draw_zone_polygon(self, batch_meta, frame_meta, polygon, color, scale_up=1.0):
         """Draw a polygon outline using NvOSD line segments."""
@@ -438,38 +442,45 @@ class PyrometerProcessor:
         if n < 3:
             return
 
-        dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-        if not dm:
-            return
+        dm = None
+        try:
+            dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if not dm:
+                return
 
-        line_idx = 0
-        max_lines = 16  # NvOSD limit per display_meta
-        for i in range(n):
-            if line_idx >= max_lines:
-                dm.num_lines = line_idx
-                dm.num_labels = 0
-                dm.num_rects = 0
+            line_idx = 0
+            max_lines = 16  # NvOSD limit per display_meta
+            for i in range(n):
+                if line_idx >= max_lines:
+                    dm.num_lines = line_idx
+                    dm.num_labels = 0
+                    dm.num_rects = 0
+                    pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
+                    dm = None  # ownership transferred
+                    dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                    if not dm:
+                        return
+                    line_idx = 0
+
+                x1, y1 = polygon[i]
+                x2, y2 = polygon[(i + 1) % n]
+                line = dm.line_params[line_idx]
+                line.x1 = int(max(0, x1))
+                line.y1 = int(max(0, y1))
+                line.x2 = int(max(0, x2))
+                line.y2 = int(max(0, y2))
+                line.line_width = max(2, int(round(2 * scale_up)))
+                line.line_color.set(*color)
+                line_idx += 1
+
+            dm.num_lines = line_idx
+            dm.num_labels = 0
+            dm.num_rects = 0
+            pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
+            dm = None  # ownership transferred
+        finally:
+            if dm is not None:
                 pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
-                dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                if not dm:
-                    return
-                line_idx = 0
-
-            x1, y1 = polygon[i]
-            x2, y2 = polygon[(i + 1) % n]
-            line = dm.line_params[line_idx]
-            line.x1 = int(max(0, x1))
-            line.y1 = int(max(0, y1))
-            line.x2 = int(max(0, x2))
-            line.y2 = int(max(0, y2))
-            line.line_width = max(2, int(round(2 * scale_up)))
-            line.line_color.set(*color)
-            line_idx += 1
-
-        dm.num_lines = line_idx
-        dm.num_labels = 0
-        dm.num_rects = 0
-        pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
 
     @staticmethod
     def _point_in_polygon(point, polygon):

@@ -1881,3 +1881,104 @@ a zero-window condition. If stalls exceed 5 seconds, the leaky queue drops old f
 | **NVR relay all-stream soak (March 19)** | **never recovered** | **∞** | **immediate** | **NVR definitively worse** |
 | Standalone ffmpeg → /dev/null (March 19) | **0** | — | **∞** | Proves backpressure is root cause |
 | nvurisrcbin + buffer tuning (March 20) | **TBD** | TBD | TBD | premuxq=128, latency=4000ms |
+
+---
+
+## April 10, 2026: Stream 0 MediaMTX / ffmpeg Relay Closure
+
+### Goal
+
+Re-test whether a MediaMTX relay could eliminate the recurring Stream 0 dropouts by interposing a
+local RTSP hop between DeepStream and the Hikvision camera currently used for Stream 0
+(`192.168.28.119`, `Channels/101` main stream).
+
+### Findings
+
+1. **MediaMTX v1.16.3 does not support `sourceNotReadyPolicy`.**
+   - Confirmed from the installed binary on April 10, 2026.
+   - This version can run `runOnNotReady`, but it has no `sourceNotReadyPolicy: wait`-style setting
+     to keep existing readers attached while the upstream source disappears.
+   - That means MediaMTX cannot provide the exact "hold reader sessions through source loss"
+     behavior this test needed.
+
+2. **The ffmpeg publisher experiment did not solve Stream 0 continuity.**
+   - Test architecture:
+     - DeepStream Stream 0 reader: `rtsp://127.0.0.1:8554/stream0`
+     - MediaMTX path `stream0`: `source: publisher`
+     - External publisher: `ffmpeg` loop publishing camera RTSP into MediaMTX
+
+3. **`Channels/102` failed first.**
+   - `ffmpeg` emitted repeated timestamp warnings:
+     - packets arrived without timestamps
+     - non-monotonic DTS was rewritten
+   - MediaMTX initially showed the path online, but Stream 0 dropped to `0 fps` around
+     `2026-04-10 18:12`.
+   - After publisher timeout, MediaMTX repeatedly returned:
+     - `no stream is available on path 'stream0'`
+
+4. **`Channels/101` also failed.**
+   - After restart on the main stream, MediaMTX accepted a publisher at `2026-04-10 18:17:05`.
+   - The published path came up as **2 tracks (`H265`, `G711`)**, not the earlier single-track H.265
+     path.
+   - The Stream 0 reader churned repeatedly, reconnecting to MediaMTX every ~10-12 seconds, then the
+     publisher timed out again.
+   - MediaMTX again fell back to repeated:
+     - `no stream is available on path 'stream0'`
+
+5. **This experiment was worse than the supported baseline.**
+   - Baseline direct-camera mode still suffers the known Stream 0 drop behavior under this stack, but
+     it remains the least-bad supported path.
+   - The MediaMTX/ffmpeg relay introduced new failure modes:
+     - publisher-side timestamp issues
+     - reader churn against localhost MediaMTX
+     - complete path disappearance when the publisher timed out
+
+### Decision
+
+**Close the MediaMTX/ffmpeg relay investigation as not a fix on the April 10, 2026 stack.**
+
+The supported production baseline remains:
+- Stream 0 input: direct Hikvision main stream (`rtsp://.../Streaming/Channels/101`)
+- MediaMTX: retained only for `stream0_overlay` / local relay duties
+- `hicon-stream0-publisher.service`: disabled and removed from runtime startup
+
+Any future zero-drop investigation should be treated as a new branch of work and gated on one of:
+- upgrading beyond MediaMTX `v1.16.3`, or
+- camera firmware / hardware changes
+
+### Post-Rollback Verification
+
+After disabling the experimental `hicon-stream0-publisher.service`, removing its installed unit,
+reloading systemd, and restarting `hicon-mediamtx.service` plus `hicon-vision.service`:
+
+- MediaMTX came back in overlay-only mode:
+  - `MediaMTX stream0 source proxy disabled: HICON_CPPLUS_SOURCE_STREAM_0 is not set`
+- The restarted pipeline config again showed Stream 0 on the direct camera URL:
+  - `rtsp://admin:india%40789@192.168.28.119:554/Streaming/Channels/101`
+- A post-rollback soak from approximately `18:30` to `18:45` confirmed that the relay-specific
+  failure mode was gone:
+  - no `localhost:8554/stream0` input after restart
+  - no MediaMTX publisher churn
+  - no repeated `no stream is available on path 'stream0'` loop during the soak
+
+The remaining behavior matched the known direct-camera limitation instead:
+- Stream 0 stalled at `18:37:28` and recovered after **30s**
+- Stream 0 stalled again at `18:42:28` and recovered after **20s**
+
+This is the expected closure state for this issue:
+- rollback successful
+- relay experiment retired
+- remaining drops attributed to the camera-side / direct RTSP baseline, not to MediaMTX or ffmpeg
+
+### Ops Contract Update
+
+With Stream 0 back on the direct camera URL, `hicon-mediamtx.service` is no longer a production
+ingest dependency for `hicon-vision.service`.
+
+- `hicon-vision.service` should be allowed to start even if MediaMTX is stopped.
+- MediaMTX remains installed only as an auxiliary service for optional `stream0_overlay` /
+  local-relay workflows.
+- No conditional auto-start is added for those optional workflows.
+- If operators later enable `HICON_ENABLE_STREAM0_LOCAL_RELAY=true` or set
+  `HICON_STREAM0_REMOTE_RELAY_URL`, they must ensure `hicon-mediamtx.service` is started
+  separately before expecting overlay relay publishing to work.

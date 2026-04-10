@@ -210,6 +210,11 @@ class BusHandler:
         return src_name.startswith(_RTSP_SOURCE_PREFIX)
 
     @staticmethod
+    def _is_relay_sink(src_name: str) -> bool:
+        """Check if the error source is the optional local relay sink."""
+        return src_name.startswith("relay-")
+
+    @staticmethod
     def _stream_id_from_name(src_name: str) -> int:
         if src_name.startswith(_RTSP_SOURCE_PREFIX):
             suffix = src_name[len(_RTSP_SOURCE_PREFIX):]
@@ -351,8 +356,14 @@ class BusHandler:
                         self.fatal_exit = True
                         self.loop.quit()
                 # Otherwise: suppress, let rtspsrc handle reconnection
+            elif self._is_relay_sink(src_name):
+                # Relay sink errors are non-fatal — relay is optional, pipeline continues without it
+                logger.warning(
+                    "[RELAY] Local relay sink error (relay disabled until restart): %s",
+                    err.message,
+                )
             else:
-                # Non-RTSP error (nvinfer, decoder, mux, etc.) → fatal
+                # Non-RTSP, non-relay error (nvinfer, decoder, mux, etc.) → fatal
                 logger.error(f"[FATAL] Non-recoverable error from {src_name}")
                 self._ping_healthcheck("/fail")
                 self.fatal_exit = True

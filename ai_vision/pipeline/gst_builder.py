@@ -332,7 +332,7 @@ class DeepStreamPipelineBuilder:
         uribin.set_property('rtsp-reconnect-attempts', -1)  # unlimited
         uribin.set_property('gpu-id', 0)
         uribin.set_property('cudadec-memtype', 0)  # device memory (NVMM)
-        uribin.set_property('num-extra-surfaces', 8)
+        uribin.set_property('num-extra-surfaces', 16)
 
         latency_ms = int(self.config.get('rtsp_latency_ms', 4000) or 4000)
         uribin.set_property('latency', latency_ms)
@@ -362,7 +362,7 @@ class DeepStreamPipelineBuilder:
             f"Stream {sid}: nvurisrcbin created "
             f"(reconnect-interval={reconnect_s}s, reconnect-attempts=unlimited, "
             f"protocol={'tcp' if protocol == 'tcp' else 'multi'}, latency={latency_ms}ms, "
-            f"drop-on-latency=True, num-extra-surfaces=8, "
+            f"drop-on-latency=True, num-extra-surfaces=16, "
             f"premuxq={queue_name} leaky=2 max-buffers=128 max-time=5s)"
         )
         return True

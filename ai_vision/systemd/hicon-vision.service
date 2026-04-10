@@ -1,9 +1,7 @@
 [Unit]
 Description=HiCon AI Vision Pipeline (DeepStream 7.1)
-After=network-online.target hicon-mediamtx.service
-Wants=network-online.target hicon-mediamtx.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -17,9 +15,9 @@ Environment=LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local
 Environment=GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
 Environment=GST_DEBUG=1
 
-ExecStart=/usr/bin/python3 hicon_pipeline.py
+ExecStart=/bin/bash -lc 'set -o pipefail; python3 hicon_pipeline.py 2>&1 | grep --line-buffered -v "ErrorType="; exit ${PIPESTATUS[0]}'
 
-# Graceful shutdown
+# Graceful shutdown -- control-group sends SIGTERM to all processes in the pipe
 KillSignal=SIGTERM
 KillMode=control-group
 TimeoutStopSec=15

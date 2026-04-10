@@ -1,138 +1,63 @@
-# Plan: Attach short pours to adjacent valid pours instead of discarding
+# Safer Mould Count Fix — Baseline Cluster Rescue + Lower Split Threshold
 
-## Context
+## Summary
+- Keep the current baseline clustering as the default path.
+- Replace the global adaptive `r_cluster` idea with a rescue pass that only runs on heavily compressed, high-count heats like `HEAT_0124`.
+- Lower the default displacement threshold from `0.25` to `0.15` using the existing env var `HICON_MOULD_DISPLACEMENT`.
 
-When a pour ends with duration < `pour_min_dur` (2s), it is discarded completely:
-- `_active_segment` is cleared (never enters `completed_segments`)
-- `_build_clusters()` never sees it
-- Mould count is unaffected — real data is silently dropped
+## Implementation Changes
+- In [`pouring_processor.py`](/home/hicon/hicon/ai_vision/processors/pouring_processor.py), refactor `_build_clusters(...)` into two stages:
+  - baseline clustering with the current `self.r_cluster` and `self.r_merge`
+  - optional rescue refinement only when the baseline result looks pathologically over-collapsed
+- Use these heat-level rescue gates before any refinement:
+  - `valid_segment_count >= 18`
+  - `baseline_cluster_count / valid_segment_count <= 0.65`
+  - `valid_segment_count - baseline_cluster_count >= 8`
+- If the heat passes those gates, refine only suspicious baseline clusters, not the whole heat:
+  - inspect the cluster’s member representative `x` values
+  - ignore internal `x` gaps `<= 0.008` as same-position revisits
+  - only refine clusters with at least 2 member segments and at least 1 significant internal `x` gap
+  - compute `local_r = min(self.r_cluster, max(0.005, typical_gap * 0.40))`
+  - compute `local_r_merge = min(self.r_merge, max(0.003, local_r * 0.35))`
+  - re-cluster only that cluster’s segments with the local radii
+  - leave non-suspicious baseline clusters unchanged
+- Keep the existing Euclidean distance on representative `(x, y)` points for assignment and merge decisions. Do not globally shrink `self.r_cluster`.
+- After refinement, renumber cluster IDs sequentially and keep the existing `min_cluster_pour_s` filter.
+- Add one `INFO` log when rescue refinement runs, including:
+  - valid segment count
+  - baseline cluster count
+  - refined cluster count
+  - trigger metrics and chosen local radii
+- In [`config.py`](/home/hicon/hicon/ai_vision/config.py#L105), change the default to:
+  - `MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15'))`
+- Keep the env var name unchanged. Do not introduce `HICON_MOULD_DISPLACEMENT_THRESHOLD`.
 
-The correct behaviour: if a short pour starts within a short time gap after a previous valid pour ended (i.e. it's a continuation — brief brightness dip mid-fill), **extend the previous segment's end time** to cover it rather than throwing it away.
+## Test Plan
+- Add unit tests in [`test_pouring_transitions_and_screenshots.py`](/home/hicon/hicon/ai_vision/tests/test_pouring_transitions_and_screenshots.py) for:
+  - rescue gate triggers on a `21 segments -> 10 clusters` pattern
+  - rescue gate does not trigger on `15 -> 12`, `24 -> 20`, or similar recent revisit-heavy patterns
+  - a suspicious baseline cluster with internal `x` gaps `> 0.008` splits into multiple subclusters
+  - same-position revisit jitter stays merged
+  - a synthetic `HEAT_0124`-like heat improves versus baseline
+  - a synthetic `HEAT_0144`-like revisit heat stays unchanged because the heat-level gate blocks rescue
+  - lowering displacement to `0.15` detects a slow-motion split that `0.25` misses
+  - relock gating does not become noisy under the lower threshold
+- Keep existing suites green:
+  - `PYTHONPATH=ai_vision pytest -q ai_vision/tests/test_pouring_transitions_and_screenshots.py`
+  - `PYTHONPATH=ai_vision pytest -q ai_vision/tests/test_heat_cycle_manager.py`
 
-**Concrete example from HEAT_0103:**
-```
-13:14:43  pour START  → 13:14:46  pour END  2.3s  M10  (just above threshold)
-13:14:50  pour START  → 13:14:56  pour END  5.4s  M11  (valid)
-```
-The 4s gap between M10 end and M11 start is the ladle repositioning. If M10 was 1.8s it would be discarded, even though it's a real mould.
+## Live Validation
+- Remove the current verification rule that compares `CYCLE COMPLETE` to `[session] END`; that is not a valid acceptance check for revisit-heavy heats.
+- Accept rescue behavior only against labeled or manually verified mould counts.
+- Watch for the new rescue `INFO` log. It should appear on `HEAT_0124`-like compressed heats, and should stay absent on normal revisit-heavy heats.
+- Roll back Change 2 by setting `HICON_MOULD_DISPLACEMENT=0.25` in `.env` if relock or split behavior regresses.
 
----
+## Assumptions
+- The target remains one final record per physical mould, not per cavity or per pour segment.
+- Multi-cavity pours are rare enough that the safer bias is to preserve baseline revisit merging unless a heat looks strongly over-collapsed.
+- Historical raw motion tracks are not retained, so offline validation must rely on labeled outcomes plus synthetic regression fixtures rather than exact post-hoc replay.
 
-## Fix — `ai_vision/processors/pouring_processor.py`
-
-### Step 1 — Track last completed segment end time AND probe position
-
-In `__init__` after `self.last_pour_duration` (~line 173), add:
-```python
-self.last_completed_segment_end_time: Optional[float] = None
-self.last_completed_segment_rep_norm: Optional[tuple] = None  # normalized probe point of last valid pour
-```
-
-In `_reset_all_state()` add:
-```python
-self.last_completed_segment_end_time = None
-self.last_completed_segment_rep_norm = None
-```
-
-### Step 2 — Update both after each valid pour
-
-In `_end_pour()`, after line 1596 (`self.last_pour_duration = duration`), add:
-```python
-self.last_completed_segment_end_time = effective_end_ts
-# Store representative probe point for proximity check on next short pour
-if self.completed_segments:
-    self.last_completed_segment_rep_norm = self._segment_representative_point(self.completed_segments[-1])
-```
-
-### Step 3 — Validate by probe position before merging
-
-Replace the discard path (lines 1571–1594) with:
-
-```python
-if duration < self.pour_min_dur:
-    merged = False
-    merge_gap = config.POUR_MERGE_GAP_S
-    if (self.last_completed_segment_end_time is not None and
-            self.completed_segments and
-            (self.pour_start_time - self.last_completed_segment_end_time) <= merge_gap):
-        # Validate probe position — only merge if short pour is at same mould position
-        short_rep = self._segment_representative_point(self._active_segment) if self._active_segment else None
-        prev_rep = self.last_completed_segment_rep_norm
-        if short_rep is not None and prev_rep is not None:
-            dx = abs(short_rep[0] - prev_rep[0])
-            dy = abs(short_rep[1] - prev_rep[1])
-            position_close = (dx < config.R_CLUSTER and dy < config.R_CLUSTER)
-        else:
-            position_close = True  # no position data — give benefit of doubt
-
-        if position_close:
-            prev = self.completed_segments[-1]
-            prev['end_time'] = effective_end_ts
-            prev['end_datetime'] = effective_end_dt
-            if self._active_segment and self._active_segment.get('samples'):
-                prev.setdefault('samples', []).extend(self._active_segment['samples'])
-            self.last_completed_segment_end_time = effective_end_ts
-            merged = True
-            logger.info(
-                f"[pour] SHORT MERGED into prev segment - duration={duration:.1f}s, "
-                f"gap={self.pour_start_time - self.last_completed_segment_end_time + duration:.1f}s, "
-                f"probe_delta=({dx:.3f},{dy:.3f})"
-            )
-
-    if not merged:
-        logger.info(f"[pour] DISCARDED - duration={duration:.1f}s < {self.pour_min_dur}s minimum")
-        if self.pour_sync_id:
-            try:
-                self.db_manager.delete_pouring_event(self.pour_sync_id)
-            except Exception as e:
-                logger.warning(f"[pour] Failed to clean up discarded pour row: {e}")
-            self.pour_sync_id = None
-            self.pour_slno = None
-
-    self.pour_start_time = None
-    self.pour_start_datetime = None
-    self._active_segment = None
-    self.active_mould_id = None
-    self.active_mould_start_time = None
-    self.active_mould_start_datetime = None
-    self.active_mould_start_norm = None
-    self._materialize_mould_records(include_active=False)
-    self.displacement_hold_frames = None
-    self.split_hold_quadrant = None
-    self.split_rearm_required = False
-    self.split_rearm_below_since = None
-    self.split_rearm_axis = None
-    self._last_probe_is_pouring = None
-    return
-```
-
-### Step 4 — Add `POUR_MERGE_GAP_S` to `config.py`
-
-After `POUR_MIN_DURATION`:
-```python
-# Max gap (seconds) between a valid pour ending and a short pour starting
-# for the short pour to be merged rather than discarded. Only merges if
-# the probe point is within R_CLUSTER of the previous pour's position.
-POUR_MERGE_GAP_S = float(os.getenv('HICON_POUR_MERGE_GAP_S', '8.0'))
-```
-
----
-
-## Critical Files
-
-| File | Change |
-|---|---|
-| `ai_vision/processors/pouring_processor.py` `__init__` | Add `last_completed_segment_end_time` |
-| `ai_vision/processors/pouring_processor.py` `_reset_all_state()` | Reset `last_completed_segment_end_time` |
-| `ai_vision/processors/pouring_processor.py` `_end_pour()` line ~1596 | Update `last_completed_segment_end_time` on valid pour |
-| `ai_vision/processors/pouring_processor.py` `_end_pour()` lines 1571–1594 | Merge short pour into prev segment if within gap |
-| `ai_vision/config.py` | Add `POUR_MERGE_GAP_S = 8.0` |
-
----
-
-## Verification
-
-After restart, on next heat with short pours:
-- Log: `[pour] SHORT MERGED into prev segment - duration=1.8s, gap=3.2s` instead of DISCARDED
-- Mould count unchanged (no new splits) — extended segment stays same cluster
-- Total pour duration increases slightly (correct — those seconds were real pouring)
+New data from user:
+Ai data heat 0148  is 19 mould--Actual 44
+Ai data heat 0146  is 20 mould--Actual 48
+validate this plan
