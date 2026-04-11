@@ -205,6 +205,7 @@ class MeltingAnalysisController(BrightnessProcessor):
                 camera_id=self.camera_id,
                 location=self.location,
                 screenshot_path=screenshot_path,
+                zone_name=event.get("zone_name", ""),
             )
         except Exception as e:
             logger.error("Failed to insert %s event: %s", event_type, e)
@@ -218,6 +219,7 @@ class MeltingAnalysisController(BrightnessProcessor):
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=event.get("zone_name"),
                     )
                 elif event_type == "deslagging":
                     self.heat_cycle_manager.add_deslagging_event(
@@ -226,6 +228,7 @@ class MeltingAnalysisController(BrightnessProcessor):
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=event.get("zone_name"),
                     )
                 elif event_type == "spectro":
                     self.heat_cycle_manager.add_spectro_event(
@@ -234,6 +237,7 @@ class MeltingAnalysisController(BrightnessProcessor):
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=event.get("zone_name"),
                     )
             except Exception as e:
                 logger.error("Failed to push %s to heat cycle manager: %s", event_type, e)

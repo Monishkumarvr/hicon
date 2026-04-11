@@ -110,6 +110,8 @@ def test_melting_controller_emits_tapping_event_and_heat_cycle(tmp_path):
     event = db.events[0]
     assert event["event_type"] == "tapping"
     assert event["duration_sec"] == 4.5
+    assert event["zone_name"] == "tap-1"
     assert event["screenshot_path"]
     assert Path(event["screenshot_path"]).exists()
     assert heat_cycle.calls[0][0] == "tapping"
+    assert heat_cycle.calls[0][1]["zone_name"] == "tap-1"

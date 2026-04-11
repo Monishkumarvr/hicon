@@ -198,6 +198,150 @@ def test_tapping_only_cycle_finalizes_at_last_tapping_end(tmp_path):
     assert cycle.mould_wise_pouring_time == []
 
 
+def test_tapping_zone_sets_cycle_furnace_label(tmp_path):
+    db = _make_db(tmp_path)
+    manager = HeatCycleManager(
+        db,
+        ladle_absence_timeout=300.0,
+        tapping_only_timeout=300.0,
+    )
+
+    tap_start = datetime(2026, 3, 31, 11, 0, 0)
+    tap_end = tap_start + timedelta(seconds=15)
+
+    manager.add_tapping_event(
+        100.0,
+        tap_start,
+        115.0,
+        tap_end,
+        15.0,
+        zone_name="tap-2",
+    )
+
+    assert manager.active_cycle is not None
+    assert manager.active_cycle.furnace_label == "Furnace2"
+
+
+def test_backfill_preserves_zone_name_and_sets_cycle_furnace(tmp_path):
+    db = _make_db(tmp_path)
+    manager = HeatCycleManager(
+        db,
+        ladle_absence_timeout=300.0,
+        tapping_only_timeout=300.0,
+    )
+
+    pre_start = datetime(2026, 3, 31, 10, 55, 0)
+    pre_end = pre_start + timedelta(seconds=8)
+    db.insert_melting_event(
+        sync_id="deslag-1",
+        customer_id="C1",
+        event_type="deslagging",
+        start_time=pre_start.isoformat(),
+        end_time=pre_end.isoformat(),
+        duration_sec=8.0,
+        camera_id="Cam-0",
+        location="Loc",
+        zone_name="zone-1",
+    )
+
+    tap_start = datetime(2026, 3, 31, 11, 0, 0)
+    tap_end = tap_start + timedelta(seconds=15)
+    manager.add_tapping_event(
+        100.0,
+        tap_start,
+        115.0,
+        tap_end,
+        15.0,
+        zone_name="tap-1",
+    )
+
+    assert manager.active_cycle is not None
+    assert manager.active_cycle.furnace_label == "Furnace1"
+    assert len(manager.active_cycle.deslagging_events) == 1
+    assert manager.active_cycle.deslagging_events[0]["zone_name"] == "zone-1"
+
+
+def test_conflicting_furnace_events_do_not_flip_cycle_furnace(tmp_path):
+    db = _make_db(tmp_path)
+    manager = HeatCycleManager(
+        db,
+        ladle_absence_timeout=300.0,
+        tapping_only_timeout=300.0,
+    )
+
+    tap_start = datetime(2026, 3, 31, 11, 0, 0)
+    tap_end = tap_start + timedelta(seconds=15)
+    manager.add_tapping_event(
+        100.0,
+        tap_start,
+        115.0,
+        tap_end,
+        15.0,
+        zone_name="tap-1",
+    )
+
+    pyro_start = tap_end + timedelta(seconds=10)
+    pyro_end = pyro_start + timedelta(seconds=5)
+    manager.add_pyrometer_event(
+        125.0,
+        pyro_start,
+        130.0,
+        pyro_end,
+        5.0,
+        zone_name="furnace-2",
+    )
+
+    assert manager.active_cycle is not None
+    assert manager.active_cycle.furnace_label == "Furnace1"
+
+
+def test_cycle_furnace_updates_existing_pouring_locations(tmp_path):
+    db = _make_db(tmp_path)
+    manager = HeatCycleManager(
+        db,
+        ladle_absence_timeout=300.0,
+        tapping_only_timeout=300.0,
+        base_location="Loc",
+    )
+
+    cycle_start_dt = datetime(2026, 3, 31, 11, 0, 0)
+    manager.update_pouring_session_presence(11, 100.0, cycle_start_dt)
+    assert manager.active_cycle is not None
+
+    db.insert_pouring_event(
+        sync_id="pour-1",
+        customer_id="C1",
+        date="2026-03-31",
+        shift="DAY",
+        heat_no=manager.active_cycle.heat_no,
+        ladle_number="",
+        location="Loc",
+        camera_id="Cam-0",
+        pouring_start_time=cycle_start_dt.isoformat(),
+    )
+
+    pyro_start = cycle_start_dt + timedelta(seconds=30)
+    pyro_end = pyro_start + timedelta(seconds=5)
+    manager.add_pyrometer_event(
+        130.0,
+        pyro_start,
+        135.0,
+        pyro_end,
+        5.0,
+        zone_name="furnace-1",
+    )
+
+    conn = db._get_connection()
+    row = conn.execute(
+        "SELECT location FROM pouring_events WHERE sync_id = ?",
+        ("pour-1",),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row[0] == "Loc Furnace1"
+
+
 def test_non_creator_events_do_not_create_cycle(tmp_path):
     db = _make_db(tmp_path)
     manager = HeatCycleManager(db, ladle_absence_timeout=300.0)
@@ -276,17 +420,22 @@ def test_melting_controller_emits_tapping_event_and_updates_heat_cycle(tmp_path)
     assert len(db.inserted_melting_events) == 1
     assert db.inserted_melting_events[0]["event_type"] == "tapping"
     assert db.inserted_melting_events[0]["duration_sec"] == 4.5
+    assert db.inserted_melting_events[0]["zone_name"] == "tap-1"
     assert db.inserted_melting_events[0]["screenshot_path"]
     assert len(heat_cycle_manager.calls) == 1
+    assert heat_cycle_manager.calls[0]["zone_name"] == "tap-1"
 
 
 def test_pouring_processor_inserts_heat_cycle_with_empty_ladle_number(tmp_path):
     db = DummyDB()
+    furnace_helper = SimpleNamespace(
+        location_with_furnace=lambda base, furnace: f"{base} {furnace}".strip()
+    )
     processor = PouringProcessor(
         db_manager=db,
         config=DummyConfig(),
         screenshot_dir=str(tmp_path),
-        heat_cycle_manager=None,
+        heat_cycle_manager=furnace_helper,
     )
 
     cycle = SimpleNamespace(
@@ -304,6 +453,7 @@ def test_pouring_processor_inserts_heat_cycle_with_empty_ladle_number(tmp_path):
         deslagging_events=[],
         spectro_events=[],
         pyrometer_events=[],
+        furnace_label="Furnace1",
     )
 
     processor._insert_heat_cycle_to_db(cycle)
@@ -312,5 +462,6 @@ def test_pouring_processor_inserts_heat_cycle_with_empty_ladle_number(tmp_path):
     inserted = db.inserted_heat_cycles[0]
     assert inserted["ladle_number"] == ""
     assert inserted["cycle_end_time"]
+    assert inserted["location"] == "Loc Furnace1"
     assert inserted["pouring_start_time"] == ""
     assert inserted["pouring_end_time"] == ""

@@ -1633,8 +1633,14 @@ class PouringProcessor:
             hour = datetime_obj.hour
             shift = "DAY" if 6 <= hour < 18 else "NIGHT"
             heat_no = ""
+            pour_location = self.location
             if self.heat_cycle_manager and self.heat_cycle_manager.active_cycle:
-                heat_no = self.heat_cycle_manager.active_cycle.heat_no
+                active_cycle = self.heat_cycle_manager.active_cycle
+                heat_no = active_cycle.heat_no
+                pour_location = self.heat_cycle_manager.location_with_furnace(
+                    self.location,
+                    getattr(active_cycle, "furnace_label", ""),
+                )
             self.pour_slno = self.db_manager.insert_pouring_event(
                 sync_id=self.pour_sync_id,
                 customer_id=self.customer_id,
@@ -1642,7 +1648,7 @@ class PouringProcessor:
                 shift=shift,
                 heat_no=heat_no,
                 ladle_number="",
-                location=self.location,
+                location=pour_location,
                 camera_id=self.camera_id,
                 pouring_start_time=datetime_obj.isoformat(),
             )
@@ -1987,6 +1993,12 @@ class PouringProcessor:
         date_str = cycle.cycle_start_datetime.strftime("%Y-%m-%d")
         hour = cycle.cycle_start_datetime.hour
         shift = "DAY" if 6 <= hour < 18 else "NIGHT"
+        cycle_location = self.location
+        if self.heat_cycle_manager:
+            cycle_location = self.heat_cycle_manager.location_with_furnace(
+                self.location,
+                getattr(cycle, "furnace_label", ""),
+            )
 
         try:
             self.db_manager.insert_heat_cycle(
@@ -1996,7 +2008,7 @@ class PouringProcessor:
                 shift=shift,
                 heat_no=cycle.heat_no,
                 ladle_number="",
-                location=self.location,
+                location=cycle_location,
                 camera_id=self.camera_id,
                 cycle_start_time=cycle.cycle_start_datetime.isoformat(),
                 cycle_end_time=cycle.cycle_end_datetime.isoformat() if cycle.cycle_end_datetime else datetime.now().isoformat(),

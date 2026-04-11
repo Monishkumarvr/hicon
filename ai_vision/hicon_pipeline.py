@@ -1113,6 +1113,7 @@ def main():
         db_manager=db,
         ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
         tapping_only_timeout=config.TAPPING_ONLY_CYCLE_TIMEOUT_S,
+        base_location=config.LOCATION,
     )
 
     # Create independent HeatCycleManager for Stream 2 (physically separate camera)
@@ -1120,6 +1121,7 @@ def main():
         db_manager=db,
         ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
         tapping_only_timeout=config.TAPPING_ONLY_CYCLE_TIMEOUT_S,
+        base_location=config.LOCATION,
     )
 
     # Initialize processors

@@ -41,6 +41,7 @@ class HeatCycle:
     ladle_track_ids: List[int]  # Track IDs seen during this cycle (legacy/debug)
     cycle_start_time: float
     cycle_start_datetime: datetime
+    furnace_label: Optional[str] = None
 
     # Pouring aggregation
     mould_pourings: List[MouldPouringRecord] = field(default_factory=list)
@@ -93,7 +94,8 @@ class HeatCycleManager:
     """
     
     def __init__(self, db_manager, ladle_absence_timeout: float = 300.0,
-                 tapping_only_timeout: float = 900.0):
+                 tapping_only_timeout: float = 900.0,
+                 base_location: str = ""):
         """
         Initialize heat cycle manager.
 
@@ -106,6 +108,7 @@ class HeatCycleManager:
         self.db_manager = db_manager
         self.ladle_absence_timeout = ladle_absence_timeout
         self.tapping_only_timeout = tapping_only_timeout
+        self.base_location = base_location
         
         # Single active cycle (time-based, not per-ladle ID)
         self.active_cycle: Optional[HeatCycle] = None
@@ -175,6 +178,62 @@ class HeatCycleManager:
         self.heat_counter += 1
         return f"HEAT_{self.heat_counter:04d}"
 
+    @staticmethod
+    def infer_furnace_label(zone_name: str) -> str:
+        """Map a zone name like tap-1 or furnace-2 to Furnace1/Furnace2."""
+        if not zone_name:
+            return ""
+        digits = ""
+        for ch in reversed(str(zone_name).strip()):
+            if ch.isdigit():
+                digits = ch + digits
+            elif digits:
+                break
+        return f"Furnace{digits}" if digits else ""
+
+    @staticmethod
+    def location_with_furnace(base_location: str, furnace_label: str) -> str:
+        """Append furnace label to the base location once."""
+        location = (base_location or "").strip()
+        if not furnace_label:
+            return location
+        if furnace_label.lower() in location.lower():
+            return location
+        return f"{location} {furnace_label}".strip()
+
+    def _ensure_cycle_furnace(self, cycle: 'HeatCycle', zone_name: str, source: str) -> None:
+        furnace_label = self.infer_furnace_label(zone_name)
+        if not furnace_label:
+            return
+        if not cycle.furnace_label:
+            cycle.furnace_label = furnace_label
+            logger.info("  %s: Furnace associated as %s via %s", cycle.heat_no, furnace_label, source)
+            self._sync_cycle_pouring_locations(cycle)
+            return
+        if cycle.furnace_label != furnace_label:
+            logger.warning(
+                "  %s: conflicting furnace association (%s via %s, already %s) - keeping existing",
+                cycle.heat_no,
+                furnace_label,
+                source,
+                cycle.furnace_label,
+            )
+
+    def _sync_cycle_pouring_locations(self, cycle: 'HeatCycle') -> None:
+        """Propagate furnace-tagged location to pouring rows for the same heat."""
+        if not self.base_location or not cycle.heat_no or not cycle.furnace_label:
+            return
+        update_fn = getattr(self.db_manager, "update_pouring_location_by_heat_no", None)
+        if update_fn is None:
+            return
+        try:
+            update_fn(
+                heat_no=cycle.heat_no,
+                location=self.location_with_furnace(self.base_location, cycle.furnace_label),
+            )
+        except Exception as exc:
+            logger.warning("Failed to update pouring locations for %s: %s", cycle.heat_no, exc)
+
     def _get_cycle_start_seed(
         self,
         event_time: float,
@@ -214,7 +273,7 @@ class HeatCycleManager:
             conn = self.db_manager._get_connection()
             c = conn.cursor()
             c.execute(
-                """SELECT event_type, start_time, end_time, duration_sec
+                """SELECT event_type, start_time, end_time, duration_sec, zone_name
                    FROM melting_events
                    WHERE event_type IN ('deslagging', 'spectro', 'pyrometer')
                      AND end_time > ? AND end_time <= ?
@@ -229,8 +288,10 @@ class HeatCycleManager:
 
         counts = {"deslagging": 0, "spectro": 0, "pyrometer": 0}
         for row in rows:
-            ev_type, start_iso, end_iso, dur = row
+            ev_type, start_iso, end_iso, dur, zone_name = row
             event = {"start": start_iso, "end": end_iso, "duration_sec": dur}
+            if zone_name:
+                event["zone_name"] = zone_name
             if ev_type == "deslagging":
                 cycle.deslagging_events.append(event)
                 counts["deslagging"] += 1
@@ -240,6 +301,8 @@ class HeatCycleManager:
             elif ev_type == "pyrometer":
                 cycle.pyrometer_events.append(event)
                 counts["pyrometer"] += 1
+            if zone_name:
+                self._ensure_cycle_furnace(cycle, zone_name, f"backfill:{ev_type}")
 
         if any(counts.values()):
             logger.info(
@@ -275,6 +338,7 @@ class HeatCycleManager:
             'ladle_track_ids': cycle.ladle_track_ids,
             'cycle_start_time': cycle.cycle_start_time,
             'cycle_start_datetime': self._dt_iso(cycle.cycle_start_datetime),
+            'furnace_label': cycle.furnace_label,
             'has_pouring_session': cycle.has_pouring_session,
             'last_pouring_presence_time': cycle.last_pouring_presence_time,
             'last_pouring_presence_datetime': self._dt_iso(cycle.last_pouring_presence_datetime),
@@ -332,6 +396,7 @@ class HeatCycleManager:
             ladle_track_ids=d.get('ladle_track_ids', []),
             cycle_start_time=d['cycle_start_time'],
             cycle_start_datetime=_dt(d.get('cycle_start_datetime')),
+            furnace_label=d.get('furnace_label'),
             mould_pourings=mould_pourings,
             cycle_active=True,
             has_pouring_session=d.get('has_pouring_session', False),
@@ -491,7 +556,8 @@ class HeatCycleManager:
             )
 
     def add_tapping_event(self, start_wall: float, start_dt: datetime,
-                          end_wall: float, end_dt: datetime, duration: float) -> None:
+                          end_wall: float, end_dt: datetime, duration: float,
+                          zone_name: str = None) -> None:
         """
         Add a tapping event to the active heat cycle.
         Updates tapping_start_time (min of starts) and tapping_end_time (max of ends).
@@ -501,11 +567,15 @@ class HeatCycleManager:
             self._backfill_pre_tapping_events(self.active_cycle, start_dt)
 
         cycle = self.active_cycle
+        if zone_name:
+            self._ensure_cycle_furnace(cycle, zone_name, "tapping")
         event = {
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
             "duration_sec": duration,
         }
+        if zone_name:
+            event["zone_name"] = zone_name
         cycle.tapping_events.append(event)
 
         # Update aggregate: first start, last end
@@ -518,49 +588,62 @@ class HeatCycleManager:
         cycle.last_tapping_end_time = end_wall
         cycle.last_tapping_end_datetime = end_dt
 
+        zone_label = f" [{zone_name}]" if zone_name else ""
         logger.info(
-            f"  {cycle.heat_no}: Added tapping event ({len(cycle.tapping_events)} total), "
-            f"duration={duration:.1f}s"
+            f"  {cycle.heat_no}: Added tapping event{zone_label} "
+            f"({len(cycle.tapping_events)} total), duration={duration:.1f}s"
         )
         self._maybe_checkpoint()
 
     def add_deslagging_event(self, start_wall: float, start_dt: datetime,
-                             end_wall: float, end_dt: datetime, duration: float) -> None:
+                             end_wall: float, end_dt: datetime, duration: float,
+                             zone_name: str = None) -> None:
         """Add a deslagging event to the active heat cycle."""
         if self.active_cycle is None:
             logger.warning("Cannot add deslagging event: no active cycle")
             return
 
         cycle = self.active_cycle
+        if zone_name:
+            self._ensure_cycle_furnace(cycle, zone_name, "deslagging")
         event = {
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
             "duration_sec": duration,
         }
+        if zone_name:
+            event["zone_name"] = zone_name
         cycle.deslagging_events.append(event)
+        zone_label = f" [{zone_name}]" if zone_name else ""
         logger.info(
-            f"  {cycle.heat_no}: Added deslagging event ({len(cycle.deslagging_events)} total), "
-            f"duration={duration:.1f}s"
+            f"  {cycle.heat_no}: Added deslagging event{zone_label} "
+            f"({len(cycle.deslagging_events)} total), duration={duration:.1f}s"
         )
         self._maybe_checkpoint()
 
     def add_spectro_event(self, start_wall: float, start_dt: datetime,
-                          end_wall: float, end_dt: datetime, duration: float) -> None:
+                          end_wall: float, end_dt: datetime, duration: float,
+                          zone_name: str = None) -> None:
         """Add a spectro event to the active heat cycle."""
         if self.active_cycle is None:
             logger.warning("Cannot add spectro event: no active cycle")
             return
 
         cycle = self.active_cycle
+        if zone_name:
+            self._ensure_cycle_furnace(cycle, zone_name, "spectro")
         event = {
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
             "duration_sec": duration,
         }
+        if zone_name:
+            event["zone_name"] = zone_name
         cycle.spectro_events.append(event)
+        zone_label = f" [{zone_name}]" if zone_name else ""
         logger.info(
-            f"  {cycle.heat_no}: Added spectro event ({len(cycle.spectro_events)} total), "
-            f"duration={duration:.1f}s"
+            f"  {cycle.heat_no}: Added spectro event{zone_label} "
+            f"({len(cycle.spectro_events)} total), duration={duration:.1f}s"
         )
         self._maybe_checkpoint()
 
@@ -573,6 +656,8 @@ class HeatCycleManager:
             return
 
         cycle = self.active_cycle
+        if zone_name:
+            self._ensure_cycle_furnace(cycle, zone_name, "pyrometer")
         event = {
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),

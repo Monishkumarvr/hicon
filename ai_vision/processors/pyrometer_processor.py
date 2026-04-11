@@ -282,6 +282,7 @@ class PyrometerProcessor:
                 camera_id=self.camera_id,
                 location=self.location,
                 screenshot_path=screenshot_path or "",
+                zone_name=zone_name,
             )
         except Exception as e:
             logger.error(f"Failed to insert pyrometer event: {e}")

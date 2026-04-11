@@ -30,6 +30,7 @@ class HiConDatabase:
         self._init_schema()
         self.migrate_add_sync_tracking()
         self.migrate_add_heat_cycle_melting_columns()
+        self.migrate_add_melting_zone_column()
         logger.info(f"Database initialized: {self.db_path}")
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -174,6 +175,20 @@ class HiConDatabase:
         conn.commit()
         conn.close()
 
+    def migrate_add_melting_zone_column(self):
+        """Add zone_name column to melting_events if it doesn't exist."""
+        conn = self._get_connection()
+        c = conn.cursor()
+
+        try:
+            c.execute("ALTER TABLE melting_events ADD COLUMN zone_name TEXT")
+            logger.info("Added zone_name column to melting_events")
+        except sqlite3.OperationalError:
+            logger.debug("zone_name column already exists in melting_events")
+
+        conn.commit()
+        conn.close()
+
     def migrate_add_heat_cycle_melting_columns(self):
         """Add tapping/deslagging/spectro/pyrometer columns to heat_cycles if they don't exist."""
         conn = self._get_connection()
@@ -241,7 +256,7 @@ class HiConDatabase:
     def insert_melting_event(self, sync_id: str, customer_id: str, event_type: str,
                              start_time: str, end_time: str, duration_sec: float,
                              camera_id: str, location: str,
-                             screenshot_path: str = "") -> str:
+                             screenshot_path: str = "", zone_name: str = "") -> str:
         """
         Insert melting event record.
 
@@ -255,6 +270,7 @@ class HiConDatabase:
             camera_id: Camera identifier
             location: Location description
             screenshot_path: Path to screenshot file
+            zone_name: Detection zone name (e.g. tap-1, zone-2, furnace-1)
 
         Returns:
             Auto-generated serial number
@@ -268,11 +284,11 @@ class HiConDatabase:
 
             c.execute('''INSERT INTO melting_events
                 (sync_id, customer_id, slno, date, event_type, start_time, end_time,
-                 duration_sec, camera_id, location, screenshot_path, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 duration_sec, camera_id, location, screenshot_path, zone_name, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (sync_id, customer_id, slno, date, event_type, start_time, end_time,
                  duration_sec, camera_id, location, screenshot_path,
-                 datetime.now().isoformat()))
+                 zone_name, datetime.now().isoformat()))
             conn.commit()
             logger.debug(f"Inserted melting event: {event_type} {sync_id} (slno: {slno})")
             return slno
@@ -292,7 +308,7 @@ class HiConDatabase:
 
         c.execute('''SELECT sync_id, customer_id, slno, date, event_type,
                      start_time, end_time, duration_sec, camera_id, location,
-                     screenshot_path
+                     screenshot_path, zone_name
                      FROM melting_events
                      WHERE synced = 0
                      ORDER BY created_at ASC
@@ -436,6 +452,23 @@ class HiConDatabase:
         conn.commit()
         conn.close()
         logger.debug(f"✓ Updated pouring event end: {sync_id}")
+
+    def update_pouring_location_by_heat_no(self, heat_no: str, location: str) -> None:
+        """Update pouring-event location for all rows belonging to a heat."""
+        if not heat_no or not location:
+            return
+
+        conn = self._get_connection()
+        c = conn.cursor()
+        c.execute(
+            '''UPDATE pouring_events
+               SET location = ?
+               WHERE heat_no = ?''',
+            (location, heat_no),
+        )
+        conn.commit()
+        conn.close()
+        logger.debug(f"✓ Updated pouring event locations for {heat_no} -> {location}")
 
     def delete_pouring_event(self, sync_id: str) -> None:
         """Delete a pouring event row (cleans up discarded sub-minimum pours)."""

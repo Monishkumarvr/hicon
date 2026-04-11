@@ -6,6 +6,7 @@ import time
 import json
 import logging
 import base64
+import re
 from pathlib import Path
 from typing import Dict, List
 from datetime import datetime, timedelta
@@ -89,6 +90,54 @@ class SyncManager:
         }
         
         logger.info(f"✓ SyncManager initialized - Interval: {sync_interval}s, Batch: {batch_size}")
+
+    @staticmethod
+    def _parse_json_list(raw_value):
+        if not raw_value:
+            return []
+        try:
+            parsed = json.loads(raw_value)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    @staticmethod
+    def _infer_furnace_label(zone_name: str) -> str:
+        if not zone_name:
+            return ""
+        match = re.search(r'(\d+)$', str(zone_name).strip())
+        if not match:
+            return ""
+        return f"Furnace{match.group(1)}"
+
+    @staticmethod
+    def _event_time_bounds(events: List[Dict]) -> tuple[str, str]:
+        starts = [event.get('start') for event in events if event.get('start')]
+        ends = [event.get('end') for event in events if event.get('end')]
+        return (min(starts) if starts else None, max(ends) if ends else None)
+
+    def _resolve_cycle_furnace(self, cycle: Dict) -> str:
+        location = cycle.get('location', '')
+        lower_location = location.lower()
+        for furnace_label in ("Furnace1", "Furnace2"):
+            if furnace_label.lower() in lower_location:
+                return furnace_label
+
+        deslag_events = self._parse_json_list(cycle.get('deslagging_events'))
+        spectro_events = self._parse_json_list(cycle.get('spectro_events'))
+        pyro_events = self._parse_json_list(cycle.get('pyrometer_events'))
+        tapping_events = self._parse_json_list(cycle.get('tapping_events'))
+        for event_type, events in (
+            ('tapping', tapping_events),
+            ('deslagging', deslag_events),
+            ('spectro', spectro_events),
+            ('pyrometer', pyro_events),
+        ):
+            for event in events:
+                furnace_label = self._infer_furnace_label(event.get('zone_name', ''))
+                if furnace_label:
+                    return furnace_label
+        return self.furnace_id or ""
     
     def should_sync(self, current_time: float) -> bool:
         """Check if sync should run"""
@@ -166,6 +215,7 @@ class SyncManager:
         melting_items = []
         pouring_skipped_sync_ids = set()  # Cycles excluded from pouring (incomplete session)
         cycle_by_sync = {}
+        pouring_variant_to_cycle = {}
         for cycle in cycles:
             cycle_by_sync[cycle['sync_id']] = cycle
             # Parse JSON mould_wise_pouring_time array
@@ -184,15 +234,6 @@ class SyncManager:
                     logger.warning(f"Failed to parse mould_wise_pouring_time for {cycle['heat_no']}: {e}")
                     mould_wise_timing = []
 
-            def _parse_json_list(raw_value):
-                if not raw_value:
-                    return []
-                try:
-                    parsed = json.loads(raw_value)
-                    return parsed if isinstance(parsed, list) else []
-                except (json.JSONDecodeError, TypeError):
-                    return []
-
             mould_count = len(mould_wise_timing) if mould_wise_timing else 0
 
             # Skip pouring sync for incomplete sessions — API requires valid timestamps.
@@ -206,8 +247,9 @@ class SyncManager:
                 # Use sync_id + '-p' so AGNI treats /agni and /pouring as distinct records.
                 # AGNI deduplicates on sync_id globally — sending the same ID to both endpoints
                 # causes the second one to be rejected as "Duplicate", silently dropping data.
+                pouring_sync_id = cycle['sync_id'] + '-p'
                 pouring_items.append({
-                    'sync_id': cycle['sync_id'] + '-p',
+                    'sync_id': pouring_sync_id,
                     'customer_id': cycle['customer_id'],
                     'date': cycle['date'],
                     'heat_no': cycle.get('heat_no') or "",
@@ -219,15 +261,13 @@ class SyncManager:
                     'total_pouring_time': str(cycle.get('total_pouring_time', '0')),  # Seconds as string
                     'mould_wise_pouring_time': mould_wise_timing,  # Array of {mould_id, start, end, duration}
                 })
+                pouring_variant_to_cycle[pouring_sync_id] = cycle['sync_id']
 
-            # Melting payload (new API format)
-            tapping_start = format_timestamp_for_api(cycle.get('tapping_start_time'))
-            tapping_end = format_timestamp_for_api(cycle.get('tapping_end_time'))
-
-            deslag_events = _parse_json_list(cycle.get('deslagging_events'))
-            spectro_events = _parse_json_list(cycle.get('spectro_events'))
-            pyro_events = _parse_json_list(cycle.get('pyrometer_events'))
-
+            tapping_events = self._parse_json_list(cycle.get('tapping_events'))
+            deslag_events = self._parse_json_list(cycle.get('deslagging_events'))
+            spectro_events = self._parse_json_list(cycle.get('spectro_events'))
+            pyro_events = self._parse_json_list(cycle.get('pyrometer_events'))
+            tapping_start_iso, tapping_end_iso = self._event_time_bounds(tapping_events)
             cycle_start_iso = cycle.get('cycle_start_time')
             cycle_end_iso = cycle.get('cycle_end_time')
             melting_items.append({
@@ -238,13 +278,13 @@ class SyncManager:
                 'location': cycle['location'],
                 'pyrometer': bool(len(pyro_events) > 0),
                 'spectro': bool(len(spectro_events) > 0),
-                'furnace': self.furnace_id or "",
+                'furnace': self._resolve_cycle_furnace(cycle),
                 'heat_no': cycle.get('heat_no') or "",
                 'heat_start_time': format_timestamp_for_api(cycle_start_iso),
                 'heat_end_time': format_timestamp_for_api(cycle_end_iso),
                 'heat_duration': self._format_duration_hhmmss(cycle_start_iso, cycle_end_iso),
-                'tapping_start_time': tapping_start,
-                'tapping_end_time': tapping_end,
+                'tapping_start_time': format_timestamp_for_api(tapping_start_iso),
+                'tapping_end_time': format_timestamp_for_api(tapping_end_iso),
                 'deslagging': bool(len(deslag_events) > 0),
             })
 
@@ -255,21 +295,24 @@ class SyncManager:
 
         # Extract successful sync_ids from results array
         pouring_results = pouring_result.get('results', [])
-        pouring_success = [
-            # Strip '-p' suffix to get back the original cycle sync_id for the intersection below.
-            r['sync_id'].removesuffix('-p') for r in pouring_results
+        pouring_success = {
+            pouring_variant_to_cycle.get(r['sync_id'], r['sync_id'].removesuffix('-p'))
+            for r in pouring_results
             if r.get('success', False) or r.get('error') == 'Duplicate'
-        ]
+        }
         melting_results = melting_result.get('results', [])
-        melting_success = [
-            # Strip '-a' suffix to get back the original cycle sync_id for the intersection below.
-            r['sync_id'].removesuffix('-a') for r in melting_results
+        melting_success = {
+            r['sync_id'].removesuffix('-a')
+            for r in melting_results
             if r.get('success', False) or r.get('error') == 'Duplicate'
-        ]
+        }
 
         # Log any failures for debugging
         failed_ids = [
-            (r['sync_id'], r.get('error', 'Unknown error'))
+            (
+                pouring_variant_to_cycle.get(r['sync_id'], r['sync_id'].removesuffix('-p')),
+                r.get('error', 'Unknown error'),
+            )
             for r in pouring_results
             if not r.get('success', False) and r.get('error') != 'Duplicate'
         ]
@@ -283,7 +326,10 @@ class SyncManager:
                 self.db.update_heat_cycle_sync_status(sync_id, error_msg)
 
         failed_melting_ids = [
-            (r['sync_id'], r.get('error', 'Unknown error'))
+            (
+                r['sync_id'].removesuffix('-a'),
+                r.get('error', 'Unknown error'),
+            )
             for r in melting_results
             if not r.get('success', False) and r.get('error') != 'Duplicate'
         ]

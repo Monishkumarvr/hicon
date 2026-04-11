@@ -740,6 +740,7 @@ class CudaBrightnessProcessor:
                 camera_id=self.camera_id,
                 location=self.location,
                 screenshot_path=screenshot_path,
+                zone_name=zone_name,
             )
         except Exception as e:
             logger.error(f"Failed to insert {event_type} event: {e}")
@@ -759,6 +760,7 @@ class CudaBrightnessProcessor:
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=zone_name,
                     )
             except Exception as e:
                 logger.error(f"Failed to push {event_type} to heat cycle manager: {e}")

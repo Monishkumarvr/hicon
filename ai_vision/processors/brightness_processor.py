@@ -572,6 +572,7 @@ class BrightnessProcessor:
                 camera_id=self.camera_id,
                 location=self.location,
                 screenshot_path=screenshot_path,
+                zone_name=event.get("zone_name", ""),
             )
         except Exception as e:
             logger.error(f"Failed to insert {event_type} event: {e}")
@@ -586,6 +587,7 @@ class BrightnessProcessor:
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=event.get("zone_name"),
                     )
                 elif event_type == "deslagging":
                     self.heat_cycle_manager.add_deslagging_event(
@@ -594,6 +596,7 @@ class BrightnessProcessor:
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=event.get("zone_name"),
                     )
                 elif event_type == "spectro":
                     self.heat_cycle_manager.add_spectro_event(
@@ -602,6 +605,7 @@ class BrightnessProcessor:
                         end_wall=event["end_wall"],
                         end_dt=event["end_datetime"],
                         duration=event["duration_sec"],
+                        zone_name=event.get("zone_name"),
                     )
             except Exception as e:
                 logger.error(f"Failed to push {event_type} to heat cycle manager: {e}")
