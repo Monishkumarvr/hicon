@@ -66,11 +66,14 @@ logger = logging.getLogger('hicon')
 # Globals (set during init)
 # ---------------------------------------------------------------------------
 pouring_processor = None
-pouring_processor_2 = None       # Stream 2: second pouring camera (pouring-only, no brightness)
-heat_cycle_manager_2 = None      # Stream 2: independent heat cycle state
+pouring_processor_2 = None       # Optional Stream 2 pouring processor
+heat_cycle_manager_2 = None      # Backward-compatible alias for the shared heat cycle manager
 brightness_processor = None
+brightness_processor_2 = None
 melting_controller = None
 melting_meta_reader = None
+melting_controller_2 = None
+melting_meta_reader_2 = None
 pyrometer_processor = None
 bus_handler = None
 sync_manager = None
@@ -183,17 +186,92 @@ def _bbox_from_points(points):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _serialize_melting_plugin_config(zones_config):
-    """Serialize Stream 0 melting config into a GLib key-file string."""
+def _stream_zone_config(zones_config, stream_id):
+    """Return a legacy-compatible zone config for one stream."""
+    stream_key = f"stream_{stream_id}"
+    stream_zones = zones_config.get("streams", {}).get(stream_key)
+    if not stream_zones:
+        stream_zones = zones_config.get("streams", {}).get(f"stream{stream_id}")
+    if not stream_zones:
+        return zones_config
+
+    scoped = {"metadata": zones_config.get("metadata", {})}
+    for section_name in ("tapping", "deslagging", "spectro"):
+        scoped[section_name] = stream_zones.get(section_name, {"zones": {}})
+    return scoped
+
+
+def _source_size_for_section(section, metadata):
+    size = section.get("annotation_size") or section.get("source_size")
+    if size and len(size) == 2:
+        return float(size[0]), float(size[1])
+    return (
+        float(metadata.get("source_width", metadata.get("ref_width", 1920))),
+        float(metadata.get("source_height", metadata.get("ref_height", 1080))),
+    )
+
+
+def _scale_points(points, source_w, source_h, target_w, target_h):
+    sx = float(target_w) / float(source_w) if source_w else 1.0
+    sy = float(target_h) / float(source_h) if source_h else 1.0
+    return [[float(x) * sx, float(y) * sy] for x, y in points]
+
+
+def _scale_zone_config(zone_config, target_w, target_h):
+    """Scale one detector zone config from its annotation space into mux space."""
+    if not zone_config:
+        return {}
+    metadata = zone_config.get("metadata", {})
+    scaled = {}
+    for key, value in zone_config.items():
+        if key == "zones":
+            continue
+        scaled[key] = value
+    source_w, source_h = _source_size_for_section(zone_config, metadata)
+    scaled["annotation_size"] = [int(target_w), int(target_h)]
+    scaled_zones = {}
+    for zone_name, zone in zone_config.get("zones", {}).items():
+        if not zone.get("enabled", True):
+            continue
+        zone_copy = dict(zone)
+        zone_copy["roi_points"] = _scale_points(
+            zone.get("roi_points", []),
+            source_w,
+            source_h,
+            target_w,
+            target_h,
+        )
+        scaled_zones[zone_name] = zone_copy
+    scaled["zones"] = scaled_zones
+    return scaled
+
+
+def _scale_detector_config(zones_config, target_w, target_h):
+    metadata = zones_config.get("metadata", {})
+    scaled = {"metadata": {"ref_width": int(target_w), "ref_height": int(target_h)}}
+    for section_name in ("tapping", "deslagging", "spectro", "pyrometer"):
+        section = zones_config.get(section_name)
+        if not section:
+            continue
+        section_with_meta = dict(section)
+        section_with_meta["metadata"] = metadata
+        scaled[section_name] = _scale_zone_config(section_with_meta, target_w, target_h)
+    return scaled
+
+
+def _serialize_melting_plugin_config(zones_config, *, target_width=1280, target_height=720):
+    """Serialize a stream's melting config into a GLib key-file string."""
     parser = configparser.ConfigParser()
     parser.optionxform = str
     parser["global"] = {
         "fps": str(float(getattr(config, "STREAM_FPS", 25.0))),
     }
+    metadata = zones_config.get("metadata", {})
 
     for section_name in ("tapping", "deslagging", "spectro"):
         section = zones_config.get(section_name, {})
         zones = section.get("zones", {})
+        source_w, source_h = _source_size_for_section(section, metadata)
         section_values = {}
         if section_name == "tapping":
             section_values.update({
@@ -213,10 +291,13 @@ def _serialize_melting_plugin_config(zones_config):
 
         zone_names = []
         for zone_idx, (zone_name, zone_cfg) in enumerate(zones.items()):
+            if not zone_cfg.get("enabled", True):
+                continue
             points = zone_cfg.get("roi_points", [])
             if not points:
                 continue
-            x1, y1, x2, y2 = _bbox_from_points(points)
+            scaled_points = _scale_points(points, source_w, source_h, target_width, target_height)
+            x1, y1, x2, y2 = _bbox_from_points(scaled_points)
             zone_names.append(zone_name)
             section_values[f"zone_name.{zone_idx}"] = zone_name
             section_values[f"bbox.{zone_idx}"] = f"{x1},{y1},{x2},{y2}"
@@ -275,7 +356,7 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 except Exception as e:
                     logger.error(f"Melting meta reader error: {e}", exc_info=True)
 
-            run_python_pouring = pouring_processor is not None
+            run_python_pouring = pouring_processor is not None and update_main_path
             run_hybrid_melting = melting_controller is not None and native_melting_state is not None
 
         # CUDA brightness operates directly on GPU NvBufSurface — no CPU copy needed.
@@ -284,7 +365,11 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 brightness_processor is not None
                 and hasattr(brightness_processor, "process_frame_cuda")
             )
-            cpu_brightness = brightness_processor is not None and not cuda_brightness
+            cpu_brightness = (
+                brightness_processor is not None
+                and not cuda_brightness
+                and not run_hybrid_melting
+            )
             melting_needs_frame = (
                 run_hybrid_melting
                 and config.ENABLE_FRAME_PROCESSING
@@ -338,7 +423,7 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                     except Exception as e:
                         logger.error(f"Hybrid melting controller error: {e}", exc_info=True)
 
-                if run_hybrid_melting and cpu_brightness:
+                if run_hybrid_melting and brightness_processor is not None:
                     try:
                         native_tapping_active = False
                         native_tapping_ratio = 0.0
@@ -374,15 +459,10 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 elif cpu_brightness and frame is not None:
                     try:
                         brightness_processor.process_frame_with_array(frame, frame_meta)
-                        if (
-                            config.ENABLE_INFERENCE_VIDEO
-                            and batch_meta is not None
-                            and getattr(brightness_processor, "enable_display_meta", True)
-                        ):
-                            brightness_processor.add_inference_display_meta(
-                                batch_meta=batch_meta,
-                                frame_meta=frame_meta,
-                            )
+                        # display_meta intentionally NOT written here — overlays are
+                        # drawn via CPU/OpenCV in post_osd_probe_stream0_for_streaming.
+                        # Writing NvDsDisplayMeta in the analysis branch shares batch_meta
+                        # with the main path, causing nvosd GPU accumulation → crash.
                     except Exception as e:
                         logger.error(f"Brightness processor error: {e}", exc_info=True)
             finally:
@@ -447,29 +527,11 @@ def osd_sink_pad_probe_stream0_display_meta(pad, info):
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
 
+    # Overlays are now drawn via CPU/OpenCV in post_osd_probe_stream0_for_streaming.
+    # nvosd receives no display_meta and acts as a pure pass-through — eliminating
+    # the CUDA GPU state accumulation that caused ~70-min crashes.
     if bus_handler:
         bus_handler.update_frame_time(0)
-
-    try:
-        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
-        if not batch_meta:
-            return Gst.PadProbeReturn.OK
-        l_frame = batch_meta.frame_meta_list
-        while l_frame is not None:
-            try:
-                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-                if brightness_processor is not None:
-                    brightness_processor.add_inference_display_meta(
-                        batch_meta, frame_meta, force=True
-                    )
-                if pouring_processor is not None:
-                    pouring_processor.write_recording_overlay(batch_meta, frame_meta)
-            except Exception:
-                pass
-            l_frame = l_frame.next
-    except Exception:
-        pass
-
     return Gst.PadProbeReturn.OK
 
 
@@ -751,15 +813,21 @@ def post_osd_probe_stream0_for_streaming(pad, info):
         except StopIteration:
             break
 
-        # Extract annotated frame (post-OSD, WITH overlays)
+        # Extract frame and draw CPU overlays (replaces nvosd GPU rendering)
         try:
             import numpy as np
             import cv2
             n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
             frame_rgba = np.array(n_frame, copy=True, order='C')
-            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
-            mjpeg_server.update_frame(stream_id=0, frame_bgr=frame_bgr)
             pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+            if brightness_processor is not None:
+                brightness_processor.draw_cpu_overlay(frame_bgr)
+            elif melting_controller is not None:
+                melting_controller.draw_cpu_overlay(frame_bgr)
+            if pouring_processor is not None:
+                pouring_processor.draw_cpu_overlay(frame_bgr)
+            mjpeg_server.update_frame(stream_id=0, frame_bgr=frame_bgr)
         except Exception as e:
             logger.error(f"Post-OSD frame extraction error: {e}", exc_info=True)
 
@@ -896,6 +964,58 @@ def post_osd_probe_stream1_for_streaming(pad, info):
     return Gst.PadProbeReturn.OK
 
 
+def post_osd_probe_stream2_for_streaming(pad, info):
+    """
+    Probe on Stream 2 post-OSD path for live streaming.
+    Extracts frames for MJPEG and draws CPU melting overlays when native display
+    meta is disabled.
+    """
+    if not mjpeg_server:
+        return Gst.PadProbeReturn.OK
+
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    if not _should_extract_live_frame(2):
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if not batch_meta:
+        return Gst.PadProbeReturn.OK
+
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        try:
+            import numpy as np
+            import cv2
+            n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            frame_rgba = np.array(n_frame, copy=True, order='C')
+            pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+            if brightness_processor_2 is not None:
+                brightness_processor_2.draw_cpu_overlay(frame_bgr)
+            elif melting_controller_2 is not None:
+                melting_controller_2.draw_cpu_overlay(frame_bgr)
+            if pouring_processor_2 is not None:
+                pouring_processor_2.draw_cpu_overlay(frame_bgr)
+            mjpeg_server.update_frame(stream_id=2, frame_bgr=frame_bgr)
+        except Exception as e:
+            logger.error(f"Stream 2 post-OSD frame extraction error: {e}", exc_info=True)
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK
+
+
 def pgie_src_pad_probe_stream2_diag(pad, info):
     """Low-rate diagnostic probe on Stream 2 pgie source to separate infer vs tracker issues."""
     gst_buffer = info.get_buffer()
@@ -962,10 +1082,9 @@ def pgie_src_pad_probe_stream2_diag(pad, info):
 
 def osd_sink_pad_probe_stream2(pad, info):
     """
-    Probe on nvosd_2 sink pad (Stream 2 — Second Pouring Camera).
-    When the C++ plugin is enabled, Python consumes the native session/probe
-    state and reuses the mature business logic on CPU. Otherwise it falls back
-    to the Python-only pouring processor.
+    Probe on nvosd_2 sink pad.
+    Stream 2 now carries Furnace 1 tapping/deslagging plus shared spectro; optional
+    pouring remains available behind HICON_ENABLE_STREAM_2_POURING_PROCESSOR.
     """
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -988,15 +1107,34 @@ def osd_sink_pad_probe_stream2(pad, info):
             if bus_handler:
                 bus_handler.update_frame_time(2)
 
+            native_melting_state = None
+            if melting_meta_reader_2 is not None:
+                try:
+                    native_melting_state = melting_meta_reader_2.decode_frame_meta(frame_meta)
+                except Exception as e:
+                    logger.error(f"Stream 2 melting meta reader error: {e}", exc_info=True)
+
             frame_timestamp, frame_datetime = _resolve_frame_timestamp(gst_buffer, frame_meta, 2)
 
+            run_hybrid_melting = (
+                melting_controller_2 is not None and native_melting_state is not None
+            )
+            run_cpu_melting = brightness_processor_2 is not None
+            melting_needs_frame = (
+                run_hybrid_melting
+                and config.ENABLE_FRAME_PROCESSING
+                and melting_controller_2.needs_frame(native_melting_state)
+            )
             frame = None
-            if config.ENABLE_FRAME_PROCESSING and run_python_pouring:
+            if config.ENABLE_FRAME_PROCESSING and (run_python_pouring or run_cpu_melting or melting_needs_frame):
                 try:
                     obj_count = int(getattr(frame_meta, "num_obj_meta", 0) or 0)
                 except Exception:
                     obj_count = 0
-                if pouring_processor_2.needs_frame(obj_count):
+                needs_pouring_frame = (
+                    run_python_pouring and pouring_processor_2.needs_frame(obj_count)
+                )
+                if needs_pouring_frame or run_cpu_melting or melting_needs_frame:
                     try:
                         import numpy as np
                         n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -1016,6 +1154,23 @@ def osd_sink_pad_probe_stream2(pad, info):
                         )
                     except Exception as e:
                         logger.error(f"Stream 2 pouring processor error: {e}", exc_info=True)
+                if run_hybrid_melting:
+                    try:
+                        melting_controller_2.process_native_state(
+                            native_state=native_melting_state,
+                            frame_meta=frame_meta,
+                            frame=frame if melting_needs_frame else None,
+                            batch_meta=batch_meta,
+                            timestamp=frame_timestamp,
+                            datetime_obj=frame_datetime,
+                        )
+                    except Exception as e:
+                        logger.error(f"Stream 2 hybrid melting controller error: {e}", exc_info=True)
+                elif run_cpu_melting and frame is not None:
+                    try:
+                        brightness_processor_2.process_frame_with_array(frame, frame_meta)
+                    except Exception as e:
+                        logger.error(f"Stream 2 CPU melting processor error: {e}", exc_info=True)
             finally:
                 if frame is not None:
                     try:
@@ -1053,8 +1208,9 @@ def sync_thread_func(stop_event):
 def main():
     global pouring_processor, pouring_processor_2
     global heat_cycle_manager_2
-    global brightness_processor, pyrometer_processor
+    global brightness_processor, brightness_processor_2, pyrometer_processor
     global melting_controller, melting_meta_reader
+    global melting_controller_2, melting_meta_reader_2
     global bus_handler, sync_manager, recording_manager, stream0_local_relay_manager, mjpeg_server
     global async_db_writer, screenshot_writer
 
@@ -1106,7 +1262,24 @@ def main():
     zones_path = str(config.CONFIG_DIR / 'zones.json')
     zones_config = load_zones_config(zones_path)
     logger.info(f"Loaded zones config from {zones_path}")
-    melting_plugin_config_ini = _serialize_melting_plugin_config(zones_config)
+    stream0_zones_config = _stream_zone_config(zones_config, 0)
+    stream2_zones_config = _stream_zone_config(zones_config, 2)
+    stream1_detector_config = _scale_detector_config(
+        {"metadata": zones_config.get("metadata", {}),
+         "pyrometer": zones_config.get("pyrometer", {})},
+        int(getattr(config, "STREAM_1_MUX_WIDTH", 1280)),
+        int(getattr(config, "STREAM_1_MUX_HEIGHT", 720)),
+    )
+    melting_plugin_config_ini = _serialize_melting_plugin_config(
+        stream0_zones_config,
+        target_width=int(getattr(config, "STREAM_0_MUX_WIDTH", 1280)),
+        target_height=int(getattr(config, "STREAM_0_MUX_HEIGHT", 720)),
+    )
+    melting_plugin_config_ini_2 = _serialize_melting_plugin_config(
+        stream2_zones_config,
+        target_width=int(getattr(config, "STREAM_2_MUX_WIDTH", 1280)),
+        target_height=int(getattr(config, "STREAM_2_MUX_HEIGHT", 720)),
+    )
 
     # Create shared HeatCycleManager for Stream 0 (owned by pipeline, shared by processors)
     heat_cycle_manager = HeatCycleManager(
@@ -1116,13 +1289,8 @@ def main():
         base_location=config.LOCATION,
     )
 
-    # Create independent HeatCycleManager for Stream 2 (physically separate camera)
-    heat_cycle_manager_2 = HeatCycleManager(
-        db_manager=db,
-        ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
-        tapping_only_timeout=config.TAPPING_ONLY_CYCLE_TIMEOUT_S,
-        base_location=config.LOCATION,
-    )
+    # Stream 2 melting events aggregate into the same active heat cycle as Stream 0 pouring.
+    heat_cycle_manager_2 = heat_cycle_manager
 
     # Initialize processors
     # Enable display_meta when recording is active so overlay state is computed on the
@@ -1149,7 +1317,7 @@ def main():
         if use_cuda_brightness:
             melting_meta_reader = MeltingMetaReader(stream_label="stream0", heartbeat_every=25)
             melting_controller = MeltingAnalysisController(
-                zones_config=zones_config,
+                zones_config=stream0_zones_config,
                 db_manager=async_db_writer,
                 config=config,
                 screenshot_dir=str(config.SCREENSHOT_DIR),
@@ -1157,25 +1325,14 @@ def main():
                 enable_display_meta=stream0_enable_display_meta,
                 screenshot_writer=screenshot_writer,
             )
-            brightness_processor = BrightnessProcessor(
-                zones_config=zones_config,
-                db_manager=async_db_writer,
-                config=config,
-                screenshot_dir=str(config.SCREENSHOT_DIR),
-                heat_cycle_manager=heat_cycle_manager,
-                enable_display_meta=stream0_enable_display_meta,
-                enable_tapping=False,
-                enable_deslagging=True,
-                enable_spectro=True,
-                screenshot_writer=screenshot_writer,
-            )
+            brightness_processor = melting_controller
             logger.info(
                 "Stream 0: Safe CUDA tapping path initialized "
-                "(native tapping + CPU deslagging/spectro fallback)"
+                "(native tapping/deslagging/spectro)"
             )
         else:
             brightness_processor = BrightnessProcessor(
-                zones_config=zones_config,
+                zones_config=stream0_zones_config,
                 db_manager=async_db_writer,
                 config=config,
                 screenshot_dir=str(config.SCREENSHOT_DIR),
@@ -1193,7 +1350,7 @@ def main():
         logger.warning("Stream 0: Brightness processor disabled for diagnostics")
 
     pyrometer_processor = PyrometerProcessor(
-        zone_config=zones_config.get('pyrometer', {}),
+        zone_config=stream1_detector_config.get('pyrometer', {}),
         db_manager=async_db_writer,
         config=config,
         screenshot_dir=str(config.SCREENSHOT_DIR),
@@ -1221,21 +1378,60 @@ def main():
         pouring_processor = None
         logger.warning("Stream 0: Pouring processor disabled for diagnostics")
 
-    # Stream 2 pouring processor (second pouring camera)
-    try:
-        from processors.pouring_processor import PouringProcessor
-        pouring_processor_2 = PouringProcessor(
-            db_manager=async_db_writer,
-            config=config,
-            screenshot_dir=str(config.SCREENSHOT_DIR),
-            heat_cycle_manager=heat_cycle_manager_2,
-            camera_id_override=config.CAMERA_ID_STREAM_2,
-            screenshot_writer=screenshot_writer,
-        )
-        logger.info("Stream 2: Pouring processor initialized")
-    except Exception as e:
-        logger.warning(f"Stream 2: Pouring processor not available: {e}")
+    if config.ENABLE_BRIGHTNESS_STREAM_2:
+        if use_cuda_brightness:
+            melting_meta_reader_2 = MeltingMetaReader(stream_label="stream2", heartbeat_every=25)
+            melting_controller_2 = MeltingAnalysisController(
+                zones_config=stream2_zones_config,
+                db_manager=async_db_writer,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                enable_display_meta=False,
+                screenshot_writer=screenshot_writer,
+                camera_id_override=config.CAMERA_ID_STREAM_2,
+            )
+            brightness_processor_2 = None
+            logger.info("Stream 2: Native CUDA melting initialized (tapping/deslagging/spectro)")
+        else:
+            melting_meta_reader_2 = None
+            melting_controller_2 = None
+            brightness_processor_2 = BrightnessProcessor(
+                zones_config=stream2_zones_config,
+                db_manager=async_db_writer,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                enable_display_meta=False,
+                screenshot_writer=screenshot_writer,
+                camera_id_override=config.CAMERA_ID_STREAM_2,
+            )
+            logger.info("Stream 2: CPU melting fallback initialized")
+    else:
+        melting_meta_reader_2 = None
+        melting_controller_2 = None
+        brightness_processor_2 = None
+        logger.warning("Stream 2: Melting processor disabled")
+
+    # Optional Stream 2 pouring processor (disabled by default in the 3-stream routing).
+    if config.ENABLE_STREAM_2_POURING_PROCESSOR:
+        try:
+            from processors.pouring_processor import PouringProcessor
+            pouring_processor_2 = PouringProcessor(
+                db_manager=async_db_writer,
+                config=config,
+                screenshot_dir=str(config.SCREENSHOT_DIR),
+                heat_cycle_manager=heat_cycle_manager,
+                camera_id_override=config.CAMERA_ID_STREAM_2,
+                screenshot_writer=screenshot_writer,
+            )
+            logger.info("Stream 2: Pouring processor initialized")
+        except Exception as e:
+            logger.warning(f"Stream 2: Pouring processor not available: {e}")
+            pouring_processor_2 = None
+    else:
         pouring_processor_2 = None
+        logger.info("Stream 2: Pouring processor disabled by routing")
 
     # Initialize sync manager
     if config.ENABLE_SYNC and config.HMAC_SECRET:
@@ -1291,13 +1487,21 @@ def main():
         'stream_0_analysis_probe_enabled': config.STREAM_0_ANALYSIS_PROBE_ENABLED,
         'stream_0_mux_width': config.STREAM_0_MUX_WIDTH,
         'stream_0_mux_height': config.STREAM_0_MUX_HEIGHT,
+        'stream_1_mux_width': config.STREAM_1_MUX_WIDTH,
+        'stream_1_mux_height': config.STREAM_1_MUX_HEIGHT,
+        'stream_2_mux_width': config.STREAM_2_MUX_WIDTH,
+        'stream_2_mux_height': config.STREAM_2_MUX_HEIGHT,
         'stream_0_tracker_width': config.STREAM_0_TRACKER_WIDTH,
         'stream_0_tracker_height': config.STREAM_0_TRACKER_HEIGHT,
+        'enable_stream_2_pouring_processor': config.ENABLE_STREAM_2_POURING_PROCESSOR,
+        'enable_brightness_stream_2': config.ENABLE_BRIGHTNESS_STREAM_2,
         'enable_inference_video': config.ENABLE_INFERENCE_VIDEO,
         'enable_inference_video_stream_0': config.ENABLE_INFERENCE_VIDEO_STREAM_0,
         'enable_inference_video_stream_1': config.ENABLE_INFERENCE_VIDEO_STREAM_1,
         'enable_inference_video_stream_2': config.ENABLE_INFERENCE_VIDEO_STREAM_2,
         'enable_live_stream_0': bool(config.ENABLE_LIVE_STREAM and config.ENABLE_LIVE_STREAM_0),
+        'enable_live_stream_1': bool(config.ENABLE_LIVE_STREAM and config.ENABLE_LIVE_STREAM_1),
+        'enable_live_stream_2': bool(config.ENABLE_LIVE_STREAM and config.ENABLE_LIVE_STREAM_2),
         'live_stream_timestamp_overlay': config.LIVE_STREAM_TIMESTAMP_OVERLAY,
         'enable_stream0_local_relay': config.ENABLE_STREAM0_LOCAL_RELAY,
         'use_nvurisrcbin_0': config.USE_NVURISRCBIN_0,
@@ -1321,6 +1525,7 @@ def main():
         'udp_loopback_port_2': config.UDP_LOOPBACK_PORT_2,
         'use_safe_cuda_brightness': use_safe_cuda_brightness,
         'stream_0_melting_config_ini': melting_plugin_config_ini,
+        'stream_2_melting_config_ini': melting_plugin_config_ini_2,
     }
 
     # Build pipeline (keep builder reference for ffmpeg cleanup on shutdown)
@@ -1386,9 +1591,14 @@ def main():
             max_fps=config.LIVE_STREAM_FPS,
             timestamp_overlay=config.LIVE_STREAM_TIMESTAMP_OVERLAY,
         )
-        # Only register streams that have pipeline elements (i.e. are enabled and linked)
-        for _sid, _key in [(0, 'nvosd_0'), (1, 'nvosd_1'), (2, 'nvosd_2')]:
-            if _key in elements and elements[_key]:
+        # Only register streams that have pipeline elements and are enabled for live preview.
+        live_stream_keys = [
+            (0, 'nvosd_0', config.ENABLE_LIVE_STREAM_0),
+            (1, 'nvosd_1', config.ENABLE_LIVE_STREAM_1),
+            (2, 'nvosd_2', config.ENABLE_LIVE_STREAM_2),
+        ]
+        for _sid, _key, _enabled in live_stream_keys:
+            if _enabled and _key in elements and elements[_key]:
                 mjpeg_server.register_stream(_sid)
         mjpeg_server.start()
         logger.info(f"✓ Live streaming enabled: http://{config.LIVE_STREAM_HOST}:{config.LIVE_STREAM_PORT}/")
@@ -1727,6 +1937,18 @@ def main():
     elif mjpeg_server and not config.ENABLE_LIVE_STREAM_1:
         logger.info("Stream 1: Live streaming disabled (ENABLE_LIVE_STREAM_1=false)")
 
+    # Stream 2: Post-OSD probe for live streaming (melting overlays + optional pouring)
+    if mjpeg_server and config.ENABLE_LIVE_STREAM_2 and 'sink_2' in elements and elements['sink_2']:
+        sink2_sinkpad = elements['sink_2'].get_static_pad("sink")
+        if sink2_sinkpad:
+            sink2_sinkpad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                post_osd_probe_stream2_for_streaming,
+            )
+            logger.info("Stream 2: Post-OSD probe attached for live streaming (WITH overlays)")
+    elif mjpeg_server and not config.ENABLE_LIVE_STREAM_2:
+        logger.info("Stream 2: Live streaming disabled (ENABLE_LIVE_STREAM_2=false)")
+
     # Stream 0: PGIE src diagnostic probe (counts raw inference objects before tracker/plugin)
     if 'pgie_pouring' in elements and elements['pgie_pouring'] and not config.ENABLE_DEBUG_PROBES:
         pgie0_srcpad = elements['pgie_pouring'].get_static_pad("src")
@@ -1755,7 +1977,7 @@ def main():
             )
             logger.info("Stream 2: PGIE src diagnostic probe attached")
 
-    # Stream 2: OSD sink pad probe (second pouring camera — pouring only, no brightness)
+    # Stream 2: OSD sink pad probe (Furnace 1 melting + optional pouring)
     if 'nvosd_2' in elements and elements['nvosd_2']:
         osd2_sinkpad = elements['nvosd_2'].get_static_pad("sink")
         if osd2_sinkpad:
@@ -1763,7 +1985,7 @@ def main():
                 Gst.PadProbeType.BUFFER,
                 osd_sink_pad_probe_stream2,
             )
-            logger.info("Stream 2: OSD sink pad probe attached (pouring)")
+            logger.info("Stream 2: OSD sink pad probe attached (melting + optional pouring)")
 
     # Start sync thread
     sync_stop_event = threading.Event()
