@@ -29,9 +29,12 @@ class MeltingAnalysisController(BrightnessProcessor):
     Consume native melting meta and reuse the existing Python event chain.
     """
 
+    SPECTRO_REJECT_BEFORE_DESLAGGING_S = 3.0
+    SPECTRO_REJECT_AFTER_DESLAGGING_S = 5.0
+
     def __init__(self, zones_config, db_manager, config, screenshot_dir,
                  heat_cycle_manager=None, enable_display_meta=True,
-                 screenshot_writer=None):
+                 screenshot_writer=None, camera_id_override=None):
         super().__init__(
             zones_config=zones_config,
             db_manager=db_manager,
@@ -40,6 +43,7 @@ class MeltingAnalysisController(BrightnessProcessor):
             heat_cycle_manager=heat_cycle_manager,
             enable_display_meta=enable_display_meta,
             screenshot_writer=screenshot_writer,
+            camera_id_override=camera_id_override,
         )
         self._zone_orders = {
             "tapping": self._ordered_zone_names(self._tapping_config),
@@ -56,6 +60,9 @@ class MeltingAnalysisController(BrightnessProcessor):
             "deslagging": {},
             "spectro": {},
         }
+        self._tapping_started = False
+        self._deslagging_started = False
+        self._last_deslagging_start_wall = None
         logger.info("MeltingAnalysisController initialized (native CUDA meta -> Python events)")
 
     @staticmethod
@@ -110,10 +117,58 @@ class MeltingAnalysisController(BrightnessProcessor):
         transitions = []
         for event_type, zone_name, zone_state in self._iter_zone_states(native_state):
             current_active = bool(zone_state and zone_state.valid and zone_state.active)
+            if self._is_event_type_disabled(event_type):
+                current_active = False
             previous_active = self._native_active[event_type].get(zone_name, False)
             if current_active != previous_active:
                 transitions.append((event_type, zone_name, zone_state, current_active))
         return transitions
+
+    def _is_event_type_disabled(self, event_type):
+        return self._tapping_started and event_type in ("deslagging", "spectro")
+
+    def _active_cycle_furnace_label(self):
+        if not self.heat_cycle_manager:
+            return None
+        active_cycle = getattr(self.heat_cycle_manager, "active_cycle", None)
+        return getattr(active_cycle, "furnace_label", None) if active_cycle else None
+
+    @staticmethod
+    def _has_trailing_furnace_digit(zone_name):
+        if not zone_name:
+            return False
+        text = str(zone_name).strip()
+        return bool(text and text[-1].isdigit())
+
+    def _event_zone_name(self, event):
+        zone_name = event.get("zone_name", "")
+        if self._has_trailing_furnace_digit(zone_name):
+            return zone_name
+        furnace_label = self._active_cycle_furnace_label()
+        return furnace_label or zone_name
+
+    def _should_reject_spectro_start(self, now_wall, zone_name):
+        if not self._deslagging_started:
+            logger.info(
+                "[spectro][%s] REJECTED: deslagging has not started yet",
+                zone_name,
+            )
+            return True
+        if self._last_deslagging_start_wall is None:
+            return False
+        delta = now_wall - self._last_deslagging_start_wall
+        if (
+            -self.SPECTRO_REJECT_BEFORE_DESLAGGING_S
+            <= delta
+            <= self.SPECTRO_REJECT_AFTER_DESLAGGING_S
+        ):
+            logger.info(
+                "[spectro][%s] REJECTED: %.1fs from deslagging start",
+                zone_name,
+                delta,
+            )
+            return True
+        return False
 
     def process_native_state(self, native_state, frame_meta, frame=None,
                              batch_meta=None, timestamp=None, datetime_obj=None):
@@ -123,14 +178,25 @@ class MeltingAnalysisController(BrightnessProcessor):
 
         now_wall = timestamp if timestamp is not None else time.time()
         now_dt = datetime_obj if datetime_obj is not None else datetime.now()
+        self._refresh_overlay_cache(native_state)
         transitions = self._peek_transitions(native_state)
         if not transitions:
             return
 
         for event_type, zone_name, zone_state, current_active in transitions:
             state_map = self._native_active[event_type]
+            if current_active and event_type == "spectro":
+                if self._should_reject_spectro_start(now_wall, zone_name):
+                    state_map[zone_name] = False
+                    self._event_starts[event_type].pop(zone_name, None)
+                    continue
             state_map[zone_name] = current_active
             if current_active:
+                if event_type == "tapping":
+                    self._tapping_started = True
+                elif event_type == "deslagging":
+                    self._deslagging_started = True
+                    self._last_deslagging_start_wall = now_wall
                 self._event_starts[event_type][zone_name] = (now_wall, now_dt)
                 event = {
                     "type": event_type,
@@ -166,6 +232,26 @@ class MeltingAnalysisController(BrightnessProcessor):
                 }
                 self._handle_native_event(event, frame)
 
+    def _refresh_overlay_cache(self, native_state):
+        active_by_type = {"tapping": False, "deslagging": False, "spectro": False}
+        ratio_by_type = {"tapping": 0.0, "deslagging": 0.0, "spectro": 0.0}
+        for event_type, _zone_name, zone_state in self._iter_zone_states(native_state):
+            if not zone_state or not zone_state.valid:
+                continue
+            is_active = bool(zone_state.active) and not self._is_event_type_disabled(event_type)
+            if event_type == "spectro" and not self._deslagging_started:
+                is_active = False
+            active_by_type[event_type] = active_by_type[event_type] or is_active
+            ratio_by_type[event_type] = max(
+                ratio_by_type[event_type],
+                float(getattr(zone_state, "white_ratio", 0.0) or 0.0),
+            )
+
+        self.tapping_tracker.state = "ACTIVE" if active_by_type["tapping"] else "IDLE"
+        self.deslagging_tracker.state = "ACTIVE" if active_by_type["deslagging"] else "IDLE"
+        self.spectro_tracker.state = "ACTIVE" if active_by_type["spectro"] else "IDLE"
+        self._last_white_ratios.update(ratio_by_type)
+
     def _handle_native_event_start(self, event, frame_rgba):
         if event["type"] != "tapping":
             return
@@ -180,6 +266,7 @@ class MeltingAnalysisController(BrightnessProcessor):
 
     def _handle_native_event(self, event, frame_rgba):
         event_type = event["type"]
+        event["zone_name"] = self._event_zone_name(event)
         logger.info(
             "[%s][%s] Event: %s -> %s (%ss)",
             event_type,

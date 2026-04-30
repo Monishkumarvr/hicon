@@ -2,7 +2,7 @@
 MJPEG HTTP Streaming Server for HiCon Live Inference Monitoring
 
 Provides HTTP endpoints for live MJPEG streams from DeepStream pipeline.
-Runs in background thread, serves annotated frames from both streams.
+Runs in background thread, serves annotated frames from configured streams.
 
 Usage:
     from streaming.mjpeg_server import MJPEGServer
@@ -15,6 +15,7 @@ Usage:
     # Browser:
     # http://jetson-ip:8080/stream0
     # http://jetson-ip:8080/stream1
+    # http://jetson-ip:8080/stream2
 """
 
 import cv2
@@ -62,9 +63,11 @@ class MJPEGServer:
         self.timestamp_overlay = bool(timestamp_overlay)
 
         # Frame storage per stream
-        self.frames = {}  # stream_id → (frame_bgr, timestamp)
-        self.locks = {}   # stream_id → threading.Lock
+        self.frames = {}    # stream_id → (frame_bgr, timestamp)
+        self.locks = {}     # stream_id → threading.Lock
+        self.enabled = {}   # stream_id → bool
         self._age_log_last_time = {}
+        self._frame_counts = {}  # stream_id → int (for fps estimate)
 
         # Flask app
         self.app = Flask(__name__)
@@ -73,6 +76,14 @@ class MJPEGServer:
         # Register routes
         self.app.add_url_rule('/stream<int:stream_id>', 'stream',
                               self._stream_route, methods=['GET'])
+        self.app.add_url_rule('/snapshot<int:stream_id>', 'snapshot',
+                              self._snapshot_route, methods=['GET'])
+        self.app.add_url_rule('/api/status', 'status',
+                              self._status_route, methods=['GET'])
+        self.app.add_url_rule('/api/stream/<int:stream_id>/enable', 'enable',
+                              self._enable_route, methods=['POST'])
+        self.app.add_url_rule('/api/stream/<int:stream_id>/disable', 'disable',
+                              self._disable_route, methods=['POST'])
         self.app.add_url_rule('/', 'index', self._index_route, methods=['GET'])
 
         # Background thread
@@ -86,7 +97,9 @@ class MJPEGServer:
         if stream_id not in self.frames:
             self.frames[stream_id] = (None, 0.0)
             self.locks[stream_id] = threading.Lock()
+            self.enabled[stream_id] = True
             self._age_log_last_time[stream_id] = 0.0
+            self._frame_counts[stream_id] = 0
             logger.info(f"Registered stream {stream_id}")
 
     def update_frame(self, stream_id, frame_bgr):
@@ -100,8 +113,12 @@ class MJPEGServer:
         if stream_id not in self.locks:
             self.register_stream(stream_id)
 
+        if not self.enabled.get(stream_id, True):
+            return  # stream disabled — drop frame
+
         with self.locks[stream_id]:
             self.frames[stream_id] = (frame_bgr.copy(), time.time())
+            self._frame_counts[stream_id] = self._frame_counts.get(stream_id, 0) + 1
 
     def get_latest_frame_age(self, stream_id):
         """Return age in seconds for the newest cached frame of a stream."""
@@ -228,6 +245,8 @@ class MJPEGServer:
         """Flask route for /stream<id>."""
         if stream_id not in self.frames:
             return f"Stream {stream_id} not available", 404
+        if not self.enabled.get(stream_id, True):
+            return f"Stream {stream_id} is disabled", 503
 
         response = Response(
             self._generate_mjpeg(stream_id),
@@ -239,72 +258,161 @@ class MJPEGServer:
         response.headers['X-Accel-Buffering'] = 'no'
         return response
 
+    def _snapshot_route(self, stream_id):
+        """Flask route for /snapshot<id> — returns a single JPEG."""
+        if stream_id not in self.frames:
+            return f"Stream {stream_id} not available", 404
+        if not self.enabled.get(stream_id, True):
+            return f"Stream {stream_id} is disabled", 503
+
+        frame, timestamp, _ = self._get_frame_snapshot(stream_id)
+        if frame is None:
+            return "No frame available yet", 503
+
+        ret, jpeg = cv2.imencode('.jpg', frame,
+                                 [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        if not ret:
+            return "Failed to encode frame", 500
+
+        from flask import make_response
+        resp = make_response(jpeg.tobytes())
+        resp.headers['Content-Type'] = 'image/jpeg'
+        resp.headers['Cache-Control'] = 'no-store'
+        resp.headers['X-Stream-Id'] = str(stream_id)
+        resp.headers['X-Timestamp'] = str(timestamp)
+        return resp
+
+    def _status_route(self):
+        """Flask route for /api/status — JSON status of all registered streams."""
+        from flask import jsonify
+        streams = []
+        for sid in sorted(self.frames.keys()):
+            frame, timestamp, age = self._get_frame_snapshot(sid)
+            streams.append({
+                'id': sid,
+                'enabled': self.enabled.get(sid, True),
+                'has_frame': frame is not None,
+                'frame_age_s': round(age, 2) if age is not None else None,
+                'total_frames': self._frame_counts.get(sid, 0),
+                'url': f'/stream{sid}',
+                'snapshot_url': f'/snapshot{sid}',
+            })
+        return jsonify({'streams': streams, 'server': f'{self.host}:{self.port}'})
+
+    def _enable_route(self, stream_id):
+        """POST /api/stream/<id>/enable — enable MJPEG capture for stream."""
+        from flask import jsonify
+        if stream_id not in self.frames:
+            return jsonify({'error': f'Stream {stream_id} not registered'}), 404
+        self.enabled[stream_id] = True
+        logger.info(f"Stream {stream_id} MJPEG enabled")
+        return jsonify({'stream_id': stream_id, 'enabled': True})
+
+    def _disable_route(self, stream_id):
+        """POST /api/stream/<id>/disable — disable MJPEG capture for stream."""
+        from flask import jsonify
+        if stream_id not in self.frames:
+            return jsonify({'error': f'Stream {stream_id} not registered'}), 404
+        self.enabled[stream_id] = False
+        logger.info(f"Stream {stream_id} MJPEG disabled")
+        return jsonify({'stream_id': stream_id, 'enabled': False})
+
     def _index_route(self):
-        """Flask route for / (index page with all streams)."""
-        html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>HiCon Live Inference</title>
-            <style>
-                body {
-                    margin: 0;
-                    padding: 20px;
-                    background: #1a1a1a;
-                    color: #fff;
-                    font-family: Arial, sans-serif;
-                }
-                h1 {
-                    text-align: center;
-                    color: #00ff00;
-                }
-                .streams {
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 20px;
-                    justify-content: center;
-                }
-                .stream-container {
-                    border: 2px solid #00ff00;
-                    padding: 10px;
-                    background: #000;
-                }
-                .stream-container h2 {
-                    margin: 0 0 10px 0;
-                    color: #00ffff;
-                }
-                img {
-                    display: block;
-                    max-width: 100%;
-                    height: auto;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>HiCon Live Inference Monitoring</h1>
-            <div class="streams">
-                {% for sid in stream_ids %}
-                <div class="stream-container">
-                    <h2>{{ stream_names[sid] }}</h2>
-                    <img src="/stream{{ sid }}" alt="Stream {{ sid }}">
+        """Flask route for / (index page with all streams, controls, and status)."""
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>HiCon Live Inference</title>
+    <meta http-equiv="refresh" content="60">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: #111; color: #eee; font-family: monospace; padding: 16px; }
+        h1 { color: #0f0; text-align: center; margin-bottom: 16px; font-size: 1.3em; }
+        .streams { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; }
+        .card {
+            background: #1a1a1a; border: 1px solid #333; padding: 10px;
+            min-width: 320px; max-width: 640px; flex: 1;
+        }
+        .card-title {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 8px;
+        }
+        .card-title h2 { color: #0ff; font-size: 0.9em; }
+        .controls { display: flex; gap: 6px; }
+        .btn {
+            padding: 3px 10px; font-size: 0.75em; cursor: pointer;
+            border: 1px solid #555; background: #333; color: #eee;
+            border-radius: 3px;
+        }
+        .btn:hover { background: #444; }
+        .btn-enable { border-color: #0a0; color: #0f0; }
+        .btn-disable { border-color: #a00; color: #f44; }
+        .btn-snap { border-color: #55f; color: #aaf; }
+        img { display: block; width: 100%; border: 1px solid #222; }
+        .disabled-overlay {
+            width: 100%; height: 180px; background: #000; color: #555;
+            display: flex; align-items: center; justify-content: center; font-size: 1.2em;
+        }
+        .status { font-size: 0.7em; color: #666; margin-top: 4px; }
+        .api { margin-top: 20px; text-align: center; font-size: 0.75em; color: #555; }
+        .api a { color: #777; }
+    </style>
+</head>
+<body>
+    <h1>&#9650; HiCon Live Inference Monitoring</h1>
+    <div class="streams">
+        {% for sid in stream_ids %}
+        <div class="card">
+            <div class="card-title">
+                <h2>{{ stream_names[sid] }}</h2>
+                <div class="controls">
+                    <button class="btn btn-snap"
+                        onclick="window.open('/snapshot{{ sid }}','_blank')">&#128247; Snap</button>
+                    {% if enabled[sid] %}
+                    <button class="btn btn-disable"
+                        onclick="fetch('/api/stream/{{ sid }}/disable',{method:'POST'}).then(()=>location.reload())">
+                        &#9632; Disable</button>
+                    {% else %}
+                    <button class="btn btn-enable"
+                        onclick="fetch('/api/stream/{{ sid }}/enable',{method:'POST'}).then(()=>location.reload())">
+                        &#9654; Enable</button>
+                    {% endif %}
                 </div>
-                {% endfor %}
             </div>
-        </body>
-        </html>
-        """
+            {% if enabled[sid] %}
+            <img src="/stream{{ sid }}" alt="Stream {{ sid }}" loading="lazy">
+            {% else %}
+            <div class="disabled-overlay">Stream {{ sid }} disabled</div>
+            {% endif %}
+            <div class="status">
+                Frames received: {{ frame_counts[sid] }} &nbsp;|&nbsp;
+                <a href="/stream{{ sid }}" target="_blank">/stream{{ sid }}</a> &nbsp;|&nbsp;
+                <a href="/snapshot{{ sid }}" target="_blank">snapshot</a>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    <div class="api">
+        API: <a href="/api/status">/api/status</a> &nbsp;|&nbsp;
+        POST /api/stream/&lt;id&gt;/enable|disable &nbsp;|&nbsp;
+        Page auto-refreshes every 60s
+    </div>
+</body>
+</html>"""
 
         _names = {
-            0: "Process Camera (Pouring + Tapping + Deslagging)",
-            1: "Pyrometer Camera (Rod Detection)",
-            2: "Second Pouring Camera",
+            0: "Stream 0 — Process Camera (Pouring / Tapping / Deslagging)",
+            1: "Stream 1 — Pyrometer Camera (Rod Detection)",
+            2: "Stream 2 — Furnace 1 Melting / Shared Spectro",
         }
-        stream_ids = list(self.frames.keys())
-        stream_names = {sid: _names.get(sid, f"Stream {sid}") for sid in stream_ids}
-
-        return render_template_string(html,
-                                       stream_ids=stream_ids,
-                                       stream_names=stream_names)
+        stream_ids = sorted(self.frames.keys())
+        return render_template_string(
+            html,
+            stream_ids=stream_ids,
+            stream_names={sid: _names.get(sid, f"Stream {sid}") for sid in stream_ids},
+            enabled={sid: self.enabled.get(sid, True) for sid in stream_ids},
+            frame_counts={sid: self._frame_counts.get(sid, 0) for sid in stream_ids},
+        )
 
     def start(self):
         """Start MJPEG server in background thread."""

@@ -42,7 +42,7 @@ typedef struct _GstHiConMeltingClass GstHiConMeltingClass;
 #define HICON_MELTING_META_TYPE (NvDsMetaType)(NVDS_START_USER_META + 2)
 static constexpr uint32_t HICON_MELTING_META_VERSION = 1;
 static constexpr uint32_t HICON_MELTING_MAX_ZONES = 8;
-static constexpr float HICON_NODULIZER_WHITE_RATIO_THRESHOLD = 0.6f;
+static constexpr float HICON_NODULIZER_WHITE_RATIO_THRESHOLD = 0.9f;
 static constexpr float HICON_NODULIZER_BLACKOUT_S = 10.0f;
 static constexpr float HICON_MELTING_STARTUP_WARMUP_S = 10.0f;
 
@@ -110,7 +110,7 @@ struct MeltingConfig {
     int tapping_off_frames = 25;
 
     int deslagging_min_blob_area = 500;
-    int deslagging_brightness_thresh = 180;
+    int deslagging_brightness_thresh = 200;
 
     int spectro_min_blob_area = 50;
     int spectro_brightness_thresh = 180;

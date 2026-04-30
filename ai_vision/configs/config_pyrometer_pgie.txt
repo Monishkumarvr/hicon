@@ -2,8 +2,8 @@
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
-onnx-file=../models/onnx/best_pyro_rod_v1.onnx
-model-engine-file=../models/onnx/best_pyro_rod_v1.onnx_b1_gpu0_fp16.engine
+onnx-file=../models/onnx/best_pyro_rod_v2.onnx
+model-engine-file=../models/onnx/best_pyro_rod_v2.onnx_b1_gpu0_fp16.engine
 labelfile-path=labels_pyrometer.txt
 batch-size=1
 network-mode=2

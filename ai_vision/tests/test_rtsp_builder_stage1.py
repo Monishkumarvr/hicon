@@ -21,6 +21,9 @@ class DummySource:
     def set_property(self, name, value):
         self.props[name] = value
 
+    def get_property(self, name):
+        return self.props.get(name, 0)
+
     def connect(self, signal, callback, stream_id):
         self.connected_signals.append((signal, callback, stream_id))
 
@@ -235,6 +238,27 @@ def test_stream1_per_stream_recording_flag_skips_recording_topology(monkeypatch)
     assert "post_osd_caps_1" not in builder.elements
     assert "tee_1" not in builder.elements
     assert "queue_display_1" not in builder.elements
+
+
+def test_stream2_melting_only_topology_skips_pouring_infer(monkeypatch):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_stream_2="rtsp://example/stream2",
+        use_safe_cuda_brightness=True,
+        enable_brightness_stream_2=True,
+        enable_stream_2_pouring_processor=False,
+        stream_2_melting_config_ini="[global]\nfps=25\n",
+    )
+    builder.pipeline = FakePipeline()
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
+
+    assert builder._create_all_elements() is True
+    assert "hicon_melting_2" in builder.elements
+    assert "pgie_pouring_2" not in builder.elements
+    assert "tracker_2" not in builder.elements
 
 
 def test_get_restartable_stream_ids_only_returns_native_rtsp_streams():

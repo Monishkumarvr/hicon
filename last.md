@@ -61,3 +61,25 @@ New data from user:
 Ai data heat 0148  is 19 mould--Actual 44
 Ai data heat 0146  is 20 mould--Actual 48
 validate this plan
+
+
+Source image - 720x1280
+Deslagging 2:
+[
+    np.array([[855, 447], [991, 439], [1069, 617], [910, 635]])
+]
+
+Spectro zone 2:
+[
+    np.array([[1084, 551], [1111, 638], [1146, 627], [1198, 531]])
+]
+
+Spectro zone 1:
+[
+    np.array([[965, 304], [994, 383], [1015, 381], [1021, 341], [1069, 334], [1049, 289]])
+]
+
+Tapping 2:
+[
+    np.array([[1046, 439], [1085, 426], [1052, 371], [1026, 385]])
+]

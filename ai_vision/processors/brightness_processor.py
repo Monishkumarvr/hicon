@@ -39,7 +39,7 @@ class BrightnessProcessor:
     def __init__(self, zones_config, db_manager, config, screenshot_dir,
                  heat_cycle_manager=None, enable_display_meta=True,
                  enable_tapping=True, enable_deslagging=True, enable_spectro=True,
-                 screenshot_writer=None):
+                 screenshot_writer=None, camera_id_override=None):
         """
         Args:
             zones_config: Dict with tapping/deslagging/spectro zone configs from zones.json
@@ -60,7 +60,7 @@ class BrightnessProcessor:
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.customer_id = config.CUSTOMER_ID
-        self.camera_id = config.CAMERA_ID_STREAM_0
+        self.camera_id = camera_id_override or config.CAMERA_ID_STREAM_0
         self.location = config.LOCATION
 
         # Build ROI masks (will be created on first frame when we know dimensions)
@@ -159,6 +159,8 @@ class BrightnessProcessor:
         zones = cfg.get('zones', {})
         if zones:
             for zone in zones.values():
+                if not zone.get('enabled', True):
+                    continue
                 pts = self._scale_pts(zone.get('roi_points', []), frame_w, frame_h, ref_w, ref_h)
                 if pts:
                     pts_list.append(np.array(pts, dtype=np.int32))
@@ -400,6 +402,10 @@ class BrightnessProcessor:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
                 return
+            display_meta.num_labels = 0
+            display_meta.num_lines = 0
+            display_meta.num_rects = 0
+            display_meta.num_circles = 0
 
             # Scale overlay text when recording is downscaled
             scale_up = 1.0
@@ -535,6 +541,63 @@ class BrightnessProcessor:
         finally:
             if display_meta is not None:
                 pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+    def draw_cpu_overlay(self, frame_bgr: np.ndarray) -> None:
+        """Draw tapping/deslagging/spectro status and ROI polygons onto a BGR frame.
+
+        Called from the MJPEG streaming probe as a CPU replacement for nvosd GPU rendering.
+        Reads cached state — safe to call from any thread after analysis branch has run.
+        """
+        if not self.enable_display_meta:
+            return
+        try:
+            h, w = frame_bgr.shape[:2]
+
+            # Left-side status panel
+            active_names = [
+                n for n, t in [
+                    ("TAPPING", self.tapping_tracker.is_active),
+                    ("DESLAG", self.deslagging_tracker.is_active),
+                    ("SPECTRO", self.spectro_tracker.is_active),
+                ] if t
+            ]
+            lines = [
+                ("MELTING EVENTS", (255, 255, 255)),
+                ("ACTIVE: " + (", ".join(active_names) if active_names else "NONE"), (0, 255, 0)),
+                (
+                    f"TAPPING: {'ON' if self.tapping_tracker.is_active else 'OFF'}"
+                    f"  ratio={self._last_white_ratios.get('tapping', 0.0):.3f}",
+                    (0, 165, 255),
+                ),
+                (
+                    f"DESLAG:  {'ON' if self.deslagging_tracker.is_active else 'OFF'}"
+                    f"  ratio={self._last_white_ratios.get('deslagging', 0.0):.3f}",
+                    (0, 0, 255),
+                ),
+                (
+                    f"SPECTRO: {'ON' if self.spectro_tracker.is_active else 'OFF'}"
+                    f"  ratio={self._last_white_ratios.get('spectro', 0.0):.3f}",
+                    (255, 255, 0),
+                ),
+            ]
+            y = 30
+            for text, color in lines:
+                tw = len(text) * 9
+                cv2.rectangle(frame_bgr, (5, y - 16), (5 + tw, y + 4), (0, 0, 0), -1)
+                cv2.putText(frame_bgr, text, (8, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                y += 22
+
+            # ROI polygon outlines
+            for polys, color in [
+                (self._get_zone_pts_list(self._tapping_config, w, h), (0, 165, 255)),
+                (self._get_zone_pts_list(self._deslagging_config, w, h), (0, 0, 255)),
+                (self._get_zone_pts_list(self._spectro_config, w, h), (255, 255, 0)),
+            ]:
+                for pts in polys:
+                    cv2.polylines(frame_bgr, [pts.reshape(-1, 1, 2)], True, color, 2)
+        except Exception as exc:
+            logger.debug("[cpu-overlay] brightness draw error: %s", exc)
 
     def _handle_event_start(self, event, frame_rgba, white_ratio=0.0):
         """Handle tapping start screenshot."""

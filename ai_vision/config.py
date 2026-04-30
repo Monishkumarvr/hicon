@@ -140,7 +140,7 @@ POURING_CYCLE_TIMEOUT_S = float(os.getenv('HICON_POURING_CYCLE_TIMEOUT', '600.0'
 TAPPING_ONLY_CYCLE_TIMEOUT_S = float(os.getenv('HICON_TAPPING_ONLY_CYCLE_TIMEOUT', '900.0'))
 
 # Minimum pyrometer rod bbox area in pixels² — rejects small false-positive detections
-PYROMETER_MIN_AREA_PX2 = int(os.getenv('HICON_PYROMETER_MIN_AREA', '6000'))
+PYROMETER_MIN_AREA_PX2 = int(os.getenv('HICON_PYROMETER_MIN_AREA', '7000'))
 
 # Mould switch requires last pour >= this duration
 MOULD_SWITCH_MIN_POUR_S = float(os.getenv('HICON_MOULD_SWITCH_MIN_POUR', '2.0'))
@@ -162,6 +162,10 @@ STREAM_0_MUX_WIDTH = int(os.getenv('HICON_STREAM_0_MUX_WIDTH', '1280'))
 STREAM_0_MUX_HEIGHT = int(os.getenv('HICON_STREAM_0_MUX_HEIGHT', '720'))
 STREAM_0_TRACKER_WIDTH = int(os.getenv('HICON_STREAM_0_TRACKER_WIDTH', '640'))
 STREAM_0_TRACKER_HEIGHT = int(os.getenv('HICON_STREAM_0_TRACKER_HEIGHT', '384'))
+STREAM_1_MUX_WIDTH = int(os.getenv('HICON_STREAM_1_MUX_WIDTH', '1280'))
+STREAM_1_MUX_HEIGHT = int(os.getenv('HICON_STREAM_1_MUX_HEIGHT', '720'))
+STREAM_2_MUX_WIDTH = int(os.getenv('HICON_STREAM_2_MUX_WIDTH', '1280'))
+STREAM_2_MUX_HEIGHT = int(os.getenv('HICON_STREAM_2_MUX_HEIGHT', '720'))
 
 # Annotated inference video (DS-native: tee + nvosd + RecordingManager)
 ENABLE_INFERENCE_VIDEO = os.getenv('HICON_ENABLE_INFERENCE_VIDEO', 'false').lower() == 'true'
@@ -322,7 +326,12 @@ LOG_SOURCE_IDS = os.getenv('HICON_LOG_SOURCE_IDS', 'true').lower() == 'true'
 ENABLE_STREAM_0_PROBE = os.getenv('HICON_ENABLE_STREAM_0_PROBE', 'true').lower() == 'true'
 ENABLE_STREAM_1_PROBE = os.getenv('HICON_ENABLE_STREAM_1_PROBE', 'true').lower() == 'true'
 ENABLE_STREAM_2_PROBE = os.getenv('HICON_ENABLE_STREAM_2_PROBE', 'true').lower() == 'true'
-ENABLE_BRIGHTNESS_STREAM_2 = False  # Stream 2 is pouring-only; no brightness checks
+ENABLE_STREAM_2_POURING_PROCESSOR = os.getenv(
+    'HICON_ENABLE_STREAM_2_POURING_PROCESSOR', 'false'
+).lower() == 'true'
+ENABLE_BRIGHTNESS_STREAM_2 = os.getenv(
+    'HICON_ENABLE_BRIGHTNESS_STREAM_2', 'true'
+).lower() == 'true'
 
 # =============================================================================
 # PATH CONFIGURATION
@@ -392,6 +401,7 @@ LIVE_STREAM_TIMESTAMP_OVERLAY = os.getenv(
 # Per-stream live streaming control (default: follow ENABLE_LIVE_STREAM)
 ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
+ENABLE_LIVE_STREAM_2 = os.getenv('HICON_ENABLE_LIVE_STREAM_2', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 
 
 # =============================================================================
@@ -488,10 +498,16 @@ def get_config_summary():
         'stream_0_analysis_probe_enabled': STREAM_0_ANALYSIS_PROBE_ENABLED,
         'stream_0_mux_width': STREAM_0_MUX_WIDTH,
         'stream_0_mux_height': STREAM_0_MUX_HEIGHT,
+        'stream_1_mux_width': STREAM_1_MUX_WIDTH,
+        'stream_1_mux_height': STREAM_1_MUX_HEIGHT,
+        'stream_2_mux_width': STREAM_2_MUX_WIDTH,
+        'stream_2_mux_height': STREAM_2_MUX_HEIGHT,
         'stream_0_tracker_width': STREAM_0_TRACKER_WIDTH,
         'stream_0_tracker_height': STREAM_0_TRACKER_HEIGHT,
         'enable_stream_0_pouring_processor': ENABLE_STREAM_0_POURING_PROCESSOR,
         'enable_stream_0_brightness_processor': ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR,
+        'enable_stream_2_pouring_processor': ENABLE_STREAM_2_POURING_PROCESSOR,
+        'enable_brightness_stream_2': ENABLE_BRIGHTNESS_STREAM_2,
         'base_dir': str(BASE_DIR),
         'config_dir': str(CONFIG_DIR),
         'data_dir': str(DATA_DIR),
@@ -527,6 +543,9 @@ def get_config_summary():
         'enable_inference_video_stream_1': ENABLE_INFERENCE_VIDEO_STREAM_1,
         'enable_inference_video_stream_2': ENABLE_INFERENCE_VIDEO_STREAM_2,
         'enable_live_stream': ENABLE_LIVE_STREAM,
+        'enable_live_stream_0': ENABLE_LIVE_STREAM_0,
+        'enable_live_stream_1': ENABLE_LIVE_STREAM_1,
+        'enable_live_stream_2': ENABLE_LIVE_STREAM_2,
         'live_stream_timestamp_overlay': LIVE_STREAM_TIMESTAMP_OVERLAY,
         'inference_video_fps': INFERENCE_VIDEO_FPS,
         'inference_video_width': INFERENCE_VIDEO_WIDTH,

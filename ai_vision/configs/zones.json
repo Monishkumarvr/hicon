@@ -1,79 +1,115 @@
 {
   "metadata": {
-    "version": "7.0",
+    "version": "8.0",
     "created_at": "2026-02-10",
-    "updated_at": "2026-03-26",
-    "description": "Zone configuration for HiCon 3-stream system (Process + Pyrometer + Pouring2)",
-    "notes": "All coordinates in 1280x720 space (camera sub-stream native resolution). Tapping from 2560x1440 (x0.5). Deslagging/spectro from 1923x1076 (x0.666). Pyrometer from 2560x1440 (x0.5).",
-    "ref_width": 1280,
-    "ref_height": 720
+    "updated_at": "2026-04-30",
+    "description": "Zone configuration for HiCon 3-stream furnace monitoring",
+    "notes": "All stream-scoped melting and pyrometer coordinates are stored in 1920x1080 source space and scaled to each stream mux/output size at runtime.",
+    "source_width": 1920,
+    "source_height": 1080,
+    "ref_width": 1920,
+    "ref_height": 1080
   },
-  "tapping": {
-    "description": "Tapping detection zones on Stream 0 (Process Camera) — CUDA white-ratio",
-    "detection_mode": "cuda_white_ratio",
-    "enabled": true,
-    "annotation_size": [2048, 1158],
-    "zones": {
-      "tap-1": {
-        "roi_points": [[1456, 280], [1495, 250], [1547, 323], [1495, 353]]
+  "streams": {
+    "stream_0": {
+      "description": "Stream 0: pouring for both furnaces plus Furnace 2 tapping/deslagging",
+      "tapping": {
+        "description": "Furnace 2 tapping detection on Stream 0",
+        "detection_mode": "cuda_white_ratio",
+        "enabled": true,
+        "annotation_size": [1920, 1080],
+        "zones": {
+          "tap-2": {
+            "roi_points": [[1536.2, 79.93], [1583.42, 172.84], [1536.2, 214.8], [1500.03, 138.87]]
+          }
+        },
+        "abs_brightness_threshold": 230,
+        "start_white_ratio": 0.18,
+        "start_frame_count": 20,
+        "end_white_ratio": 0.10,
+        "end_frame_count": 25
       },
-      "tap-2": {
-        "roi_points": [[1694, 720], [1741, 698], [1692, 610], [1647, 644]]
+      "deslagging": {
+        "description": "Furnace 2 deslagging detection on Stream 0",
+        "detection_mode": "cuda_molten_blob",
+        "annotation_size": [1920, 1080],
+        "zones": {
+          "deslag-2": {
+            "roi_points": [[1241.82, 190.82], [1420.66, 195.82], [1471.90, 363.66], [1301.10, 436.60]]
+          }
+        },
+        "min_blob_area": 500,
+        "brightness_thresh": 200
+      },
+      "spectro": {
+        "description": "No spectro zones on Stream 0 in the 3-stream routing",
+        "detection_mode": "cuda_molten_blob",
+        "annotation_size": [1920, 1080],
+        "zones": {},
+        "min_blob_area": 50,
+        "brightness_thresh": 180
       }
     },
-    "abs_brightness_threshold": 180,
-    "start_white_ratio": 0.15,
-    "start_frame_count": 20,
-    "end_white_ratio": 0.05,
-    "end_frame_count": 25
-  },
-  "deslagging": {
-    "description": "Deslagging detection zones on Stream 0 (Process Camera) — CUDA molten blob",
-    "detection_mode": "cuda_molten_blob",
-    "annotation_size": [1280, 720],
-    "zones": {
-      "zone-1": {
-        "roi_points": [[805, 225], [894, 234], [918, 295], [856, 295], [840, 361], [803, 261]]
+    "stream_2": {
+      "description": "Stream 2: Furnace 1 tapping/deslagging plus shared spectro",
+      "tapping": {
+        "description": "Furnace 1 tapping detection on Stream 2",
+        "detection_mode": "cuda_white_ratio",
+        "enabled": true,
+        "annotation_size": [1920, 1080],
+        "zones": {
+          "tap-1": {
+            "roi_points": [[991.13, 149.72], [1070.46, 143.73], [1077.49, 190.65], [997.15, 204.62]]
+          }
+        },
+        "abs_brightness_threshold": 230,
+        "start_white_ratio": 0.18,
+        "start_frame_count": 20,
+        "end_white_ratio": 0.10,
+        "end_frame_count": 25
       },
-      "zone-2": {
-        "roi_points": [[874, 470], [1011, 456], [1069, 620], [921, 645]]
+      "deslagging": {
+        "description": "Furnace 1 deslagging detection on Stream 2",
+        "detection_mode": "cuda_molten_blob",
+        "annotation_size": [1920, 1080],
+        "zones": {
+          "deslag-1": {
+            "roi_points": [[921.84, 375.3], [1153.81, 326.4], [1293.39, 409.24], [1044.35, 467.13]]
+          }
+        },
+        "min_blob_area": 500,
+        "brightness_thresh": 200
+      },
+      "spectro": {
+        "description": "Shared spectro detection zone on Stream 2",
+        "detection_mode": "cuda_molten_blob",
+        "annotation_size": [1920, 1080],
+        "zones": {
+          "spectro-zone": {
+            "roi_points": [[1174.9, 177.67], [1184.94, 240.55], [1239.16, 231.57], [1221.09, 168.69]],
+            "on_frames": 0,
+            "max_aspect_ratio": null,
+            "max_coverage": null
+          }
+        },
+        "min_blob_area": 50,
+        "brightness_thresh": 180,
+        "max_white_ratio": 0.2
       }
-    },
-    "min_blob_area": 500,
-    "brightness_thresh": 180
+    }
   },
   "pyrometer": {
-    "description": "Pyrometer rod detection zones on Stream 1 (Pyrometer Camera)",
+    "description": "Shared pyrometer rod detection zone on Stream 1",
+    "annotation_size": [1920, 1080],
     "zones": {
-      "furnace-1": {
-        "roi_points": [[152, 76], [152, 284], [362, 284], [362, 76]]
+      "pyro-zone": {
+        "roi_points": [[210.0, 150.0], [508.0, 147.0], [598.0, 340.0], [598.0, 566.0], [299.0, 572.0], [198.0, 394.0]]
       }
     },
     "confidence_threshold": 0.4,
+    "min_area_px2": 7000,
     "temporal_in_frames": 10,
     "temporal_out_frames": 10
-  },
-  "spectro": {
-    "description": "Spectro detection zones on Stream 0 (Process Camera) — CUDA molten blob",
-    "detection_mode": "cuda_molten_blob",
-    "annotation_size": [1280, 720],
-    "zones": {
-      "zone-1": {
-        "roi_points": [[963, 314], [1057, 308], [1070, 337], [1052, 337], [1061, 354], [1031, 353], [1029, 386], [997, 392]],
-        "on_frames": 0,
-        "max_aspect_ratio": null,
-        "max_coverage": null
-      },
-      "zone-2": {
-        "roi_points": [[1089, 563], [1193, 548], [1138, 629], [1103, 635]],
-        "on_frames": 10,
-        "max_aspect_ratio": 2.0,
-        "max_coverage": 0.20
-      }
-    },
-    "min_blob_area": 50,
-    "brightness_thresh": 180,
-    "max_white_ratio": 0.2
   },
   "pouring": {
     "description": "Pouring detection parameters for Stream 0 (Process Camera)",

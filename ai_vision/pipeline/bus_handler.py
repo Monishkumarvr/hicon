@@ -362,6 +362,28 @@ class BusHandler:
                     "[RELAY] Local relay sink error (relay disabled until restart): %s",
                     err.message,
                 )
+            elif src_name.startswith("nvosd"):
+                # nvosd overlay rendering errors are non-fatal — detection probes run before
+                # nvosd and are unaffected. Overlays will be skipped for this session but
+                # detection, DB writes, and sync continue normally.
+                logger.warning(
+                    "[NVOSD] Overlay rendering error (display skipped, detection unaffected): %s",
+                    err.message,
+                )
+            elif src_name.startswith("udpsrc"):
+                # Internal UDP element of rtspsrc — non-fatal. When pgie-pyrometer fails,
+                # Stream 1 buffers back up causing udpsrc to flood errors. Let rtspsrc
+                # handle recovery rather than killing the pipeline.
+                logger.warning("[UDPSRC] Internal RTSP UDP error (rtspsrc will recover): %s",
+                               err.message)
+            elif src_name == "pgie-pyrometer":
+                # pgie-pyrometer TensorRT errors share the same CUDA/GPU memory root cause
+                # as nvosd crashes. When pyrometer inference fails, Stream 1 detection is
+                # paused for this session but Stream 0 (pouring/tapping) is unaffected.
+                logger.warning(
+                    "[PYROMETER] Inference engine error (pyrometer paused, Stream 0 unaffected): %s",
+                    err.message,
+                )
             else:
                 # Non-RTSP, non-relay error (nvinfer, decoder, mux, etc.) → fatal
                 logger.error(f"[FATAL] Non-recoverable error from {src_name}")

@@ -2089,6 +2089,10 @@ class PouringProcessor:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
                 return
+            display_meta.num_labels = 0
+            display_meta.num_lines = 0
+            display_meta.num_rects = 0
+            display_meta.num_circles = 0
 
             # Scale overlay text when recording is downscaled
             scale_up = 1.0
@@ -2259,6 +2263,69 @@ class PouringProcessor:
         finally:
             if display_meta is not None:
                 pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+    def draw_cpu_overlay(self, frame_bgr: np.ndarray) -> None:
+        """Draw pouring panel, probe dot, and trolley bbox onto a BGR frame.
+
+        Called from the MJPEG streaming probe as a CPU replacement for nvosd GPU rendering.
+        Reads cached internal state — safe to call after analysis branch has populated it.
+        """
+        if not self.enable_display_meta:
+            return
+        try:
+            h, w = frame_bgr.shape[:2]
+            panel_w = max(340, int(w * 0.38))
+            px = max(8, w - panel_w - 8)
+            py = 8
+
+            brightness_txt = (
+                f"{self._last_probe_brightness:.0f}"
+                if self._last_probe_brightness is not None else "-"
+            )
+            lock_tid = self.locked_trolley_id if self.locked_trolley_id is not None else "-"
+
+            rows = [
+                f"{datetime.now().strftime('%H:%M:%S')} "
+                f"S:{'ON' if self.session_active else 'OFF'} "
+                f"P:{'ON' if self.pour_active else 'OFF'} "
+                f"M:{self.mould_count} B:{brightness_txt} T:{lock_tid}",
+            ]
+            if self.trolley_locked and self.locked_trolley_id is not None:
+                rows.append(f"Trolley #{self.locked_trolley_id} [LOCKED]  Moulds: {self.mould_count}")
+                for mid, frames in list(self.mould_completed_times.items())[-6:]:
+                    rows.append(f"  M#{mid}: {frames / self.fps:.1f}s")
+                if self.pour_active and self._pour_start_time_wall is not None:
+                    active_s = time.time() - self._pour_start_time_wall
+                    rows.append(f"  M#{self.mould_count + 1}: {active_s:.1f}s ACTIVE")
+            else:
+                rows.append("No active trolley")
+
+            panel_h = len(rows) * 20 + 28
+            cv2.rectangle(frame_bgr, (px, py), (px + panel_w, py + panel_h),
+                          (0, 0, 0), -1)
+            cv2.putText(frame_bgr, "POURING INFERENCE", (px + 6, py + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            for i, row in enumerate(rows):
+                cv2.putText(frame_bgr, row, (px + 6, py + 36 + i * 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Probe dot
+            if self._last_probe_base is not None:
+                cx, cy = int(self._last_probe_base[0]), int(self._last_probe_base[1])
+                color = (0, 255, 0) if self.pour_active else (0, 0, 255)
+                cv2.circle(frame_bgr, (cx, cy), 6, color, -1)
+                cv2.circle(frame_bgr, (cx, cy), 6, (255, 255, 255), 1)
+
+            # Expanded trolley bbox
+            if self.trolley_locked and self.locked_trolley_bbox:
+                x1, y1, x2, y2 = self.locked_trolley_bbox
+                ex1 = max(0, int(x1 - self.edge_expand_x_px))
+                ey1 = max(0, int(y1 - self.edge_expand_y_px))
+                ex2 = int(x2 + self.edge_expand_x_px)
+                ey2 = int(y2 + self.edge_expand_y_px)
+                cv2.rectangle(frame_bgr, (ex1, ey1), (ex2, ey2), (0, 255, 0), 1)
+        except Exception as exc:
+            logger.debug("[cpu-overlay] pouring draw error: %s", exc)
 
     def write_recording_overlay(self, batch_meta, frame_meta):
         """Write display overlay from latest cached detection state.

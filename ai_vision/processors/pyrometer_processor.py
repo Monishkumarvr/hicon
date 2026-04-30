@@ -31,6 +31,7 @@ class PyroZoneState:
     """Per-zone state for pyrometer rod detection."""
     name: str
     zone: List[Tuple[float, float]]  # polygon vertices as (x, y) tuples
+    exclusive_group: Optional[str] = None  # zones sharing a group suppress each other
     state: str = "IDLE"              # IDLE or ACTIVE
     in_zone_counter: int = 0
     out_zone_counter: int = 0
@@ -48,7 +49,7 @@ class PyrometerProcessor:
 
     Algorithm per zone:
     1. Filter detections: confidence >= threshold
-    2. Zone check: bbox top-left AND bottom-center must be inside polygon
+    2. Zone check: bbox top-left AND bottom-left must be inside polygon
     3. Temporal: N consecutive in-zone frames → EVENT START
                  N consecutive absent frames → EVENT END
     """
@@ -67,7 +68,10 @@ class PyrometerProcessor:
 
         # Shared thresholds
         self.confidence_threshold = zone_config.get('confidence_threshold', 0.25)
-        self.min_area_px2 = getattr(config, 'PYROMETER_MIN_AREA_PX2', 6000)
+        self.min_area_px2 = zone_config.get(
+            'min_area_px2',
+            getattr(config, 'PYROMETER_MIN_AREA_PX2', 7000),
+        )
         self.temporal_in_frames = zone_config.get('temporal_in_frames', 10)
         self.temporal_out_frames = zone_config.get('temporal_out_frames', 10)
 
@@ -79,7 +83,10 @@ class PyrometerProcessor:
                 pts = zcfg.get('roi_points', [])
                 if pts:
                     polygon = [(float(p[0]), float(p[1])) for p in pts]
-                    self.zone_states[name] = PyroZoneState(name=name, zone=polygon)
+                    exclusive_group = zcfg.get('exclusive_group') or None
+                    self.zone_states[name] = PyroZoneState(
+                        name=name, zone=polygon, exclusive_group=exclusive_group
+                    )
         else:
             # Legacy single-zone fallback
             legacy_pts = zone_config.get('zone_polygon', [])
@@ -136,16 +143,16 @@ class PyrometerProcessor:
                     y2 = y1 + rect.height
                     area = rect.width * rect.height
 
-                    if area < self.min_area_px2:
+                    if area <= self.min_area_px2:
                         raw_confs.append(
-                            f"{round(obj_meta.confidence, 3)}(area={area:.0f}<{self.min_area_px2})"
+                            f"{round(obj_meta.confidence, 3)}(area={area:.0f}<={self.min_area_px2})"
                         )
                     else:
                         detections.append({
                             'bbox': (int(x1), int(y1), int(x2), int(y2)),
                             'confidence': obj_meta.confidence,
                             'top_left': (x1, y1),
-                            'bottom_center': ((x1 + x2) / 2, y2),
+                            'bottom_left': (x1, y2),
                         })
 
                 try:
@@ -177,8 +184,14 @@ class PyrometerProcessor:
                 event = self._update_zone_state(zs, rod_in_zone, now_wall=now_wall, now_dt=now_dt)
                 if event:
                     if event["phase"] == "start":
+                        furnace_label = None
+                        if self.heat_cycle_manager:
+                            ac = self.heat_cycle_manager.active_cycle
+                            if ac and ac.furnace_label:
+                                furnace_label = ac.furnace_label
+                        start_label = furnace_label or zs.name
                         self._save_event_screenshot(
-                            f"PYROMETER ROD START ({zs.name})",
+                            f"PYROMETER ROD START ({start_label})",
                             zone_state=zs,
                             capture_dt=event["start_datetime"],
                         )
@@ -189,10 +202,10 @@ class PyrometerProcessor:
             logger.error(f"PyrometerProcessor error: {e}", exc_info=True)
 
     def _any_detection_in_zone(self, detections, zone):
-        """Check if any detection has top-left AND bottom-center inside zone polygon."""
+        """Check if any detection has top-left AND bottom-left inside zone polygon."""
         for det in detections:
             if (self._point_in_polygon(det['top_left'], zone) and
-                    self._point_in_polygon(det['bottom_center'], zone)):
+                    self._point_in_polygon(det['bottom_left'], zone)):
                 return True
         return False
 
@@ -263,9 +276,20 @@ class PyrometerProcessor:
         zone_name = event["zone_name"]
         duration = event["duration_sec"]
 
+        # Tag event to the active furnace (set by tapping/pouring earlier in the heat).
+        # Falls back to the detection zone name if no heat cycle is active yet.
+        furnace_label = None
+        if self.heat_cycle_manager:
+            ac = self.heat_cycle_manager.active_cycle
+            if ac and ac.furnace_label:
+                furnace_label = ac.furnace_label  # e.g. "Furnace1" or "Furnace2"
+        if not furnace_label:
+            logger.warning("[pyrometer] No active furnace label — tagging event as '%s'", zone_name)
+        event_zone_name = furnace_label or zone_name
+
         # Save end screenshot
         screenshot_path = self._save_event_screenshot(
-            f"PYROMETER ROD END ({zone_name})",
+            f"PYROMETER ROD END ({event_zone_name})",
             duration=duration,
             zone_state=zs,
             capture_dt=event["end_datetime"],
@@ -282,7 +306,7 @@ class PyrometerProcessor:
                 camera_id=self.camera_id,
                 location=self.location,
                 screenshot_path=screenshot_path or "",
-                zone_name=zone_name,
+                zone_name=event_zone_name,
             )
         except Exception as e:
             logger.error(f"Failed to insert pyrometer event: {e}")
@@ -295,7 +319,7 @@ class PyrometerProcessor:
                     end_wall=event["end_wall"],
                     end_dt=event["end_datetime"],
                     duration=duration,
-                    zone_name=zone_name,
+                    zone_name=event_zone_name,
                 )
             except Exception as e:
                 logger.error(f"Failed to push pyrometer to heat cycle manager: {e}")
@@ -388,6 +412,10 @@ class PyrometerProcessor:
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
                 return
+            display_meta.num_labels = 0
+            display_meta.num_lines = 0
+            display_meta.num_rects = 0
+            display_meta.num_circles = 0
 
             labels = []
             labels.append(("PYROMETER ROD", (1.0, 1.0, 1.0, 1.0)))
