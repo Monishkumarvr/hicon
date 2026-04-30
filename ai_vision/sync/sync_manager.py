@@ -385,19 +385,17 @@ class SyncManager:
                 logger.error(f"Failed to read image: {image_path}")
                 return None
 
-            # Resize to 50% of original dimensions for compression
+            # Resize to SCREENSHOT_MAX_WIDTH if wider, preserving aspect ratio
             height, width = img.shape[:2]
-            new_width = int(width * 0.5)
-            new_height = int(height * 0.5)
-            img = cv2.resize(
-                img,
-                (new_width, new_height),
-                interpolation=cv2.INTER_AREA  # Best for downscaling
-            )
-            logger.debug(f"Compressed screenshot from {width}×{height} to {new_width}×{new_height} (50%)")
+            if width > SCREENSHOT_MAX_WIDTH:
+                scale = SCREENSHOT_MAX_WIDTH / width
+                new_width = SCREENSHOT_MAX_WIDTH
+                new_height = int(height * scale)
+                img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                logger.debug(f"Compressed screenshot from {width}×{height} to {new_width}×{new_height}")
 
-            # Encode to JPEG with 50% quality (aggressive compression for API)
-            encode_params = [cv2.IMWRITE_JPEG_QUALITY, 50]
+            # Encode to JPEG using configured quality
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, SCREENSHOT_JPEG_QUALITY]
             success, buffer = cv2.imencode('.jpg', img, encode_params)
 
             if not success:
