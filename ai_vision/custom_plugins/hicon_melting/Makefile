@@ -22,7 +22,6 @@ PKGS:= gstreamer-1.0 gstreamer-base-1.0 gstreamer-video-1.0
 
 CFLAGS:= -std=c++14 -Wall -O2 -fPIC
 CFLAGS+= -I$(DS_INCLUDES)
-CFLAGS+= -I/usr/local/cuda-$(CUDA_VER)/include
 CFLAGS+= -I.
 CFLAGS+= -I$(LIBS_DIR)
 CFLAGS+= $(shell pkg-config --cflags $(PKGS))
@@ -31,7 +30,6 @@ LIBS:= $(shell pkg-config --libs $(PKGS))
 LIBS+= -L$(DS_LIB) \
        -lnvdsgst_meta -lnvds_meta -lnvbufsurface -lnvbufsurftransform \
        -lnvdsgst_helper -lnvds_utils -lm -lpthread \
-       -L/usr/local/cuda-$(CUDA_VER)/lib64 -lcudart \
        -L$(LIBS_DIR) -Wl,--no-as-needed -lds_white_ratio -lds_molten_detect -Wl,--as-needed \
        -Wl,-rpath,$(DS_LIB) -Wl,-rpath,'$$ORIGIN/../../libs'
 

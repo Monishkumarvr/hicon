@@ -14,8 +14,6 @@
 #include <string>
 #include <vector>
 
-#include <cuda_egl_interop.h>
-
 #include "white_ratio_cuda_kernel.h"
 
 GST_DEBUG_CATEGORY_STATIC(gst_hicon_melting_debug);
@@ -60,158 +58,70 @@ is_supported_rgba_format(NvBufSurfaceColorFormat fmt)
     return fmt == NVBUF_COLOR_FORMAT_RGBA;
 }
 
-static inline bool
-is_supported_cuda_format(NvBufSurfaceColorFormat fmt)
-{
-    return is_supported_nv12_format(fmt) || is_supported_rgba_format(fmt);
-}
 
-struct CudaFrameView {
+struct CpuFrameView {
     NvBufSurfaceColorFormat color_format = NVBUF_COLOR_FORMAT_INVALID;
-    const unsigned char *y_plane = nullptr;
-    const unsigned char *uv_plane = nullptr;
+    const unsigned char *y_plane    = nullptr;
+    const unsigned char *uv_plane   = nullptr;
     const unsigned char *rgba_plane = nullptr;
-    int pitch_y = 0;
-    int pitch_uv = 0;
+    int pitch_y    = 0;
+    int pitch_uv   = 0;
     int pitch_rgba = 0;
-    bool mapped_egl_here = false;
-    cudaGraphicsResource_t cuda_resource = nullptr;
+    bool surface_mapped = false;
 };
 
 static void
-release_cuda_frame_view(NvBufSurface *surface, guint batch_id, CudaFrameView &view)
+release_cpu_frame_view(NvBufSurface *surface, guint batch_id, CpuFrameView &view)
 {
-    if (view.cuda_resource) {
-        cudaGraphicsUnregisterResource(view.cuda_resource);
-        view.cuda_resource = nullptr;
+    if (view.surface_mapped) {
+        NvBufSurfaceUnMap(surface, (int)batch_id, -1);
+        view.surface_mapped = false;
     }
-#if defined(__aarch64__)
-    if (view.mapped_egl_here) {
-        NvBufSurfaceUnMapEglImage(surface, batch_id);
-        view.mapped_egl_here = false;
-    }
-#endif
 }
 
 static bool
-acquire_cuda_frame_view(
+acquire_cpu_frame_view(
     GstHiConMelting *self,
     NvBufSurface *surface,
     guint batch_id,
     NvBufSurfaceParams &params,
-    CudaFrameView &view
+    CpuFrameView &view
 )
 {
-    view.color_format = params.colorFormat;
-    view.pitch_y = (int)params.planeParams.pitch[0];
-    view.pitch_uv = (int)(params.planeParams.pitch[1] ? params.planeParams.pitch[1]
-                                                      : params.planeParams.pitch[0]);
-    view.pitch_rgba = (int)(params.pitch ? params.pitch : params.planeParams.pitch[0]);
-    if (view.pitch_y <= 0 || view.pitch_uv <= 0) {
-        if (!is_supported_rgba_format(view.color_format)) {
-            GST_WARNING_OBJECT(self, "Invalid NV12 plane pitch");
-            return false;
-        }
+    if (NvBufSurfaceMap(surface, (int)batch_id, -1, NVBUF_MAP_READ) != 0) {
+        GST_WARNING_OBJECT(self, "NvBufSurfaceMap failed for batch %u", batch_id);
+        return false;
     }
+    view.surface_mapped = true;
+    view.color_format = params.colorFormat;
 
-    if (params.dataPtr) {
-        if (is_supported_rgba_format(view.color_format)) {
-            view.rgba_plane = reinterpret_cast<const unsigned char *>(params.dataPtr);
-            return true;
-        }
-        int uv_offset = (int)params.planeParams.offset[1];
-        if (uv_offset < 0) {
-            GST_WARNING_OBJECT(self, "Invalid NV12 UV offset");
+    if (is_supported_rgba_format(view.color_format)) {
+        view.rgba_plane = reinterpret_cast<const unsigned char *>(params.mappedAddr.addr[0]);
+        view.pitch_rgba = params.pitch
+            ? (int)params.pitch
+            : (int)params.planeParams.pitch[0];
+        if (!view.rgba_plane) {
+            GST_WARNING_OBJECT(self, "RGBA CPU mapped addr is null for batch %u", batch_id);
+            release_cpu_frame_view(surface, batch_id, view);
             return false;
         }
-        view.y_plane = reinterpret_cast<const unsigned char *>(params.dataPtr);
-        view.uv_plane = reinterpret_cast<const unsigned char *>(params.dataPtr) + uv_offset;
         return true;
     }
 
-#if defined(__aarch64__)
-    if (surface->memType == NVBUF_MEM_SURFACE_ARRAY || surface->memType == NVBUF_MEM_DEFAULT) {
-        if (params.mappedAddr.eglImage == NULL) {
-            if (NvBufSurfaceMapEglImage(surface, batch_id) != 0) {
-                GST_WARNING_OBJECT(self, "NvBufSurfaceMapEglImage failed for batch %u", batch_id);
-                return false;
-            }
-            view.mapped_egl_here = true;
-        }
+    /* NV12 */
+    view.y_plane  = reinterpret_cast<const unsigned char *>(params.mappedAddr.addr[0]);
+    view.uv_plane = reinterpret_cast<const unsigned char *>(params.mappedAddr.addr[1]);
+    view.pitch_y  = (int)params.planeParams.pitch[0];
+    view.pitch_uv = params.planeParams.pitch[1]
+        ? (int)params.planeParams.pitch[1]
+        : (int)params.planeParams.pitch[0];
 
-        cudaError_t cuda_err = cudaGraphicsEGLRegisterImage(
-            &view.cuda_resource,
-            (EGLImageKHR)params.mappedAddr.eglImage,
-            cudaGraphicsRegisterFlagsNone
-        );
-        if (cuda_err != cudaSuccess) {
-            GST_WARNING_OBJECT(
-                self,
-                "cudaGraphicsEGLRegisterImage failed for batch %u: %s",
-                batch_id,
-                cudaGetErrorString(cuda_err)
-            );
-            release_cuda_frame_view(surface, batch_id, view);
-            return false;
-        }
-
-        cudaEglFrame egl_frame = {};
-        cuda_err = cudaGraphicsResourceGetMappedEglFrame(&egl_frame, view.cuda_resource, 0, 0);
-        if (cuda_err != cudaSuccess) {
-            GST_WARNING_OBJECT(
-                self,
-                "cudaGraphicsResourceGetMappedEglFrame failed for batch %u: %s",
-                batch_id,
-                cudaGetErrorString(cuda_err)
-            );
-            release_cuda_frame_view(surface, batch_id, view);
-            return false;
-        }
-        if (egl_frame.frameType != cudaEglFrameTypePitch || egl_frame.planeCount < 1) {
-            GST_WARNING_OBJECT(
-                self,
-                "Unsupported EGL frame layout for batch %u: frameType=%u planeCount=%u",
-                batch_id,
-                (unsigned)egl_frame.frameType,
-                egl_frame.planeCount
-            );
-            release_cuda_frame_view(surface, batch_id, view);
-            return false;
-        }
-
-        if (is_supported_rgba_format(view.color_format)) {
-            view.rgba_plane = reinterpret_cast<const unsigned char *>(egl_frame.frame.pPitch[0].ptr);
-            if (egl_frame.planeDesc[0].pitch > 0) {
-                view.pitch_rgba = (int)egl_frame.planeDesc[0].pitch;
-            }
-            return view.rgba_plane != nullptr;
-        }
-
-        view.y_plane = reinterpret_cast<const unsigned char *>(egl_frame.frame.pPitch[0].ptr);
-        if (egl_frame.planeCount >= 2 && egl_frame.frame.pPitch[1].ptr != nullptr) {
-            view.uv_plane = reinterpret_cast<const unsigned char *>(egl_frame.frame.pPitch[1].ptr);
-        } else {
-            int uv_offset = (int)params.planeParams.offset[1];
-            if (view.y_plane == nullptr || uv_offset < 0) {
-                GST_WARNING_OBJECT(self, "Invalid NV12 EGL frame layout for batch %u", batch_id);
-                release_cuda_frame_view(surface, batch_id, view);
-                return false;
-            }
-            view.uv_plane = view.y_plane + uv_offset;
-        }
-        if (egl_frame.planeDesc[0].pitch > 0) {
-            view.pitch_y = (int)egl_frame.planeDesc[0].pitch;
-        }
-        if (egl_frame.planeCount >= 2 && egl_frame.planeDesc[1].pitch > 0) {
-            view.pitch_uv = (int)egl_frame.planeDesc[1].pitch;
-        }
-        return view.y_plane != nullptr && view.uv_plane != nullptr;
+    if (!view.y_plane || !view.uv_plane || view.pitch_y <= 0 || view.pitch_uv <= 0) {
+        GST_WARNING_OBJECT(self, "NV12 CPU mapped addr invalid for batch %u", batch_id);
+        release_cpu_frame_view(surface, batch_id, view);
+        return false;
     }
-#endif
-
-    GST_WARNING_OBJECT(self, "CUDA surface has no accessible device pointer (memType=%d)",
-                       (int)surface->memType);
-    return false;
+    return true;
 }
 
 static gpointer
@@ -610,7 +520,16 @@ gst_hicon_melting_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
             self->tapping_states.size(),
             HICON_MELTING_MAX_ZONES
         );
-        const int zone_stride_frames = std::max(1, tapping_zone_count);
+        const int deslagging_zone_count = (int)std::min<size_t>(
+            self->deslagging_states.size(),
+            HICON_MELTING_MAX_ZONES
+        );
+        const int spectro_zone_count = (int)std::min<size_t>(
+            self->spectro_states.size(),
+            HICON_MELTING_MAX_ZONES
+        );
+        const int tapping_stride_frames = std::max(1, tapping_zone_count);
+        const int spectro_stride_frames = std::max(1, spectro_zone_count);
 
         int run_tapping_zone = -1;
         int run_deslagging_zone = -1;
@@ -618,6 +537,14 @@ gst_hicon_melting_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
         if (tapping_zone_count > 0) {
             run_tapping_zone =
                 (int)(((uint64_t)frame_meta->frame_num) % (uint64_t)tapping_zone_count);
+        }
+        if (deslagging_zone_count > 0) {
+            run_deslagging_zone =
+                (int)(((uint64_t)frame_meta->frame_num) % (uint64_t)deslagging_zone_count);
+        }
+        if (spectro_zone_count > 0) {
+            run_spectro_zone =
+                (int)(((uint64_t)frame_meta->frame_num) % (uint64_t)spectro_zone_count);
         }
 
         guint batch_id = frame_meta->batch_id;
@@ -629,15 +556,16 @@ gst_hicon_melting_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
         }
 
         NvBufSurfaceParams &params = surface->surfaceList[batch_id];
-        if (!is_supported_cuda_format(params.colorFormat)) {
+        if (!is_supported_nv12_format(params.colorFormat) &&
+            !is_supported_rgba_format(params.colorFormat)) {
             meta_out.reserved0 = 2000U + (uint32_t)params.colorFormat;
             attach_melting_meta(batch_meta, frame_meta, meta_out);
             l_frame = l_frame->next;
             continue;
         }
 
-        CudaFrameView frame_view;
-        if (!acquire_cuda_frame_view(self, surface, batch_id, params, frame_view)) {
+        CpuFrameView frame_view;
+        if (!acquire_cpu_frame_view(self, surface, batch_id, params, frame_view)) {
             meta_out.reserved0 = 3000U + (uint32_t)surface->memType;
             attach_melting_meta(batch_meta, frame_meta, meta_out);
             l_frame = l_frame->next;
@@ -703,9 +631,9 @@ gst_hicon_melting_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
         meta_out.blackout_active = blackout_active ? 1U : 0U;
 
         const int tapping_on_frames =
-            scaled_temporal_threshold(self->config.tapping_on_frames, zone_stride_frames);
+            scaled_temporal_threshold(self->config.tapping_on_frames, tapping_stride_frames);
         const int tapping_off_frames =
-            scaled_temporal_threshold(self->config.tapping_off_frames, zone_stride_frames);
+            scaled_temporal_threshold(self->config.tapping_off_frames, tapping_stride_frames);
 
         for (size_t i = 0; i < self->tapping_states.size() && i < HICON_MELTING_MAX_ZONES; ++i) {
             auto &state = self->tapping_states[i];
@@ -868,7 +796,7 @@ gst_hicon_melting_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
 
                 bool any_blob = state.filtered_count > 0U;
                 const int spectro_on_frames =
-                    scaled_temporal_threshold(state.cfg.on_frames, zone_stride_frames);
+                    scaled_temporal_threshold(state.cfg.on_frames, spectro_stride_frames);
                 if (any_blob) {
                     state.on_count = std::min(state.on_count + 1, spectro_on_frames + 1);
                 } else {
@@ -892,7 +820,7 @@ gst_hicon_melting_transform_ip(GstBaseTransform *btrans, GstBuffer *buf)
         }
 
         attach_melting_meta(batch_meta, frame_meta, meta_out);
-        release_cuda_frame_view(surface, batch_id, frame_view);
+        release_cpu_frame_view(surface, batch_id, frame_view);
         l_frame = l_frame->next;
     }
 
