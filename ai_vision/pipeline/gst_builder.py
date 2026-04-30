@@ -3,7 +3,7 @@ DeepStream Pipeline Builder - HiCon 3-Stream Architecture
 Constructs DS 7.1 pipeline for induction furnace monitoring:
   Stream 0 (Process Camera):   pouring detection (nvinfer GIE-1) + brightness analysis (probe)
   Stream 1 (Pyrometer Camera): rod detection (nvinfer GIE-2)
-  Stream 2 (Pouring2 Camera):  pouring detection (nvinfer GIE-3, no brightness)
+  Stream 2 (Furnace 1 Camera): tapping/deslagging/spectro melting detection, optional pouring
 All cameras use H.265/HEVC; per-stream codec is configurable via 'rtsp_codec_N' config keys.
 """
 import logging
@@ -30,7 +30,7 @@ class DeepStreamPipelineBuilder:
     Architecture:
     - Stream 0 → nvv4l2decoder(H265) → mux_0 → nvinfer(pouring,GIE-1) → nvtracker → nvosd → sink_0
     - Stream 1 → nvv4l2decoder(H265) → mux_1 → nvinfer(pyrometer,GIE-2) → nvosd → sink_1
-    - Stream 2 → nvv4l2decoder(H265) → mux_2 → nvinfer(pouring,GIE-3) → nvtracker → nvosd → sink_2
+    - Stream 2 → nvv4l2decoder(H265) → mux_2 → [hicon_melting] → nvosd → sink_2
     """
 
     def __init__(self, config: dict):
@@ -93,6 +93,17 @@ class DeepStreamPipelineBuilder:
         self.stream0_melting_config_ini = str(
             config.get('stream_0_melting_config_ini', '') or ''
         )
+        self.stream2_melting_config_ini = str(
+            config.get('stream_2_melting_config_ini', '') or ''
+        )
+        self.stream1_mux_width = int(config.get('stream_1_mux_width', 1280) or 1280)
+        self.stream1_mux_height = int(config.get('stream_1_mux_height', 720) or 720)
+        self.stream2_mux_width = int(config.get('stream_2_mux_width', 1280) or 1280)
+        self.stream2_mux_height = int(config.get('stream_2_mux_height', 720) or 720)
+        self.enable_stream2_pouring = bool(
+            config.get('enable_stream_2_pouring_processor', False)
+        )
+        self.enable_stream2_melting = bool(config.get('enable_brightness_stream_2', True))
         self.use_segment_buffer_0 = bool(config.get('use_segment_buffer_0', False))
         self.segment_buffer_dir_0 = str(
             config.get('segment_buffer_dir_0', '/dev/shm/hicon/stream0-buffer')
@@ -1173,7 +1184,11 @@ class DeepStreamPipelineBuilder:
             else:
                 self._create_decode_chain(1, self.config['rtsp_stream_1'])
 
-            self.elements['mux_1'] = self._create_streammux("mux-1")
+            self.elements['mux_1'] = self._create_streammux(
+                "mux-1",
+                width=self.stream1_mux_width,
+                height=self.stream1_mux_height,
+            )
 
             # Pyrometer inference (GIE-2)
             self.elements['pgie_pyrometer'] = Gst.ElementFactory.make("nvinfer", "pgie-pyrometer")
@@ -1233,21 +1248,62 @@ class DeepStreamPipelineBuilder:
             else:
                 self._create_decode_chain(2, self.config['rtsp_stream_2'])
 
-            self.elements['mux_2'] = self._create_streammux("mux-2", width=1280, height=720)
-
-            # Pouring inference (GIE-3)
-            self.elements['pgie_pouring_2'] = Gst.ElementFactory.make("nvinfer", "pgie-pouring-2")
-            self.elements['pgie_pouring_2'].set_property(
-                'config-file-path', self.config['config_pouring_2']
+            self.elements['mux_2'] = self._create_streammux(
+                "mux-2",
+                width=self.stream2_mux_width,
+                height=self.stream2_mux_height,
             )
-            logger.info("Stream 2: Pouring nvinfer created (GIE-3)")
 
-            # Tracker for stream 2 pouring
-            self.elements['tracker_2'] = Gst.ElementFactory.make("nvtracker", "tracker-2")
-            self.elements['tracker_2'].set_property('ll-lib-file', self.config['tracker_lib'])
-            self.elements['tracker_2'].set_property('ll-config-file', self.config['tracker_config'])
-            self.elements['tracker_2'].set_property('tracker-width', 640)
-            self.elements['tracker_2'].set_property('tracker-height', 384)
+            if self.enable_stream2_pouring:
+                # Optional pouring inference (GIE-3)
+                self.elements['pgie_pouring_2'] = Gst.ElementFactory.make("nvinfer", "pgie-pouring-2")
+                self.elements['pgie_pouring_2'].set_property(
+                    'config-file-path', self.config['config_pouring_2']
+                )
+                logger.info("Stream 2: Pouring nvinfer created (GIE-3)")
+
+                # Tracker for stream 2 pouring
+                self.elements['tracker_2'] = Gst.ElementFactory.make("nvtracker", "tracker-2")
+                self.elements['tracker_2'].set_property('ll-lib-file', self.config['tracker_lib'])
+                self.elements['tracker_2'].set_property('ll-config-file', self.config['tracker_config'])
+                self.elements['tracker_2'].set_property('tracker-width', 640)
+                self.elements['tracker_2'].set_property('tracker-height', 384)
+            else:
+                logger.info("Stream 2: Pouring nvinfer/tracker disabled")
+
+            if self.enable_stream2_melting and self.use_safe_cuda_brightness:
+                self.elements['hicon_melting_2'] = Gst.ElementFactory.make(
+                    "hicon_melting_detect", "hicon-melting-2"
+                )
+                if self.elements['hicon_melting_2']:
+                    self.elements['hicon_melting_2'].set_property(
+                        'config-ini', self.stream2_melting_config_ini
+                    )
+                    try:
+                        tapping_zones = self.elements['hicon_melting_2'].get_property(
+                            'tapping-zone-count'
+                        )
+                        deslagging_zones = self.elements['hicon_melting_2'].get_property(
+                            'deslagging-zone-count'
+                        )
+                        spectro_zones = self.elements['hicon_melting_2'].get_property(
+                            'spectro-zone-count'
+                        )
+                        logger.info(
+                            "Stream 2: C++ melting config applied "
+                            "(len=%d, zones=%s/%s/%s)",
+                            len(self.stream2_melting_config_ini),
+                            tapping_zones,
+                            deslagging_zones,
+                            spectro_zones,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Stream 2: Failed to read melting plugin zone counts after config apply"
+                        )
+                    logger.info("Stream 2: C++ melting plugin created")
+                else:
+                    logger.error("Stream 2: Failed to create hicon_melting_detect element")
 
             # OSD for stream 2
             self.elements['nvvidconv_osd_2'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-2")
@@ -1607,12 +1663,17 @@ class DeepStreamPipelineBuilder:
                 if not self._link_to_mux('premuxq2', 'mux_2'):
                     return False
 
-            # mux_2 → [pouring(GIE-3) → tracker →] [cpp pouring →] nvvidconv → caps_rgba → osd → sink
+            # mux_2 -> optional pouring/tracker -> optional melting -> nvvidconv -> osd -> sink
             chain_2 = []
             stream2_head = 'mux_2'
-            chain_2.append(('mux_2', 'pgie_pouring_2'))
-            chain_2.append(('pgie_pouring_2', 'tracker_2'))
-            stream2_head = 'tracker_2'
+            if self.enable_stream2_pouring:
+                chain_2.append((stream2_head, 'pgie_pouring_2'))
+                stream2_head = 'pgie_pouring_2'
+                chain_2.append((stream2_head, 'tracker_2'))
+                stream2_head = 'tracker_2'
+            if 'hicon_melting_2' in self.elements and self.elements.get('hicon_melting_2'):
+                chain_2.append((stream2_head, 'hicon_melting_2'))
+                stream2_head = 'hicon_melting_2'
             chain_2.append((stream2_head, 'nvvidconv_osd_2'))
             chain_2.extend([
                 ('nvvidconv_osd_2', 'caps_osd_2'),
@@ -1637,7 +1698,7 @@ class DeepStreamPipelineBuilder:
                 if not self.elements['queue_display_2'].link(self.elements['sink_2']):
                     logger.error("Failed to link queue_display_2 -> sink_2")
                     return False
-            logger.info("Stream 2: Second pouring camera chain linked")
+            logger.info("Stream 2: Furnace 1 melting camera chain linked")
 
         # Connect pad-added callbacks for RTSP sources
         # (ffmpeg/fdsrc and segment-buffer both use static pads — no callback needed)
@@ -1740,7 +1801,14 @@ class DeepStreamPipelineBuilder:
                 )
 
     def _cb_nvurisrcbin_pad_added(self, uribin, pad, stream_id):
-        """nvurisrcbin pad-added callback — link video src pad to premuxq0."""
+        """nvurisrcbin pad-added callback — link video src pad to premuxq.
+
+        Also handles re-linking after a per-stream restart: when nvurisrcbin
+        cycles through NULL→PLAYING, GStreamer keeps the premuxq sink linked to
+        the old vsrc pad.  The new vsrc pad fires pad-added but the old code
+        returned early because is_linked() was True.  We now unlink the stale
+        peer first so the new pad connects cleanly.
+        """
         caps = pad.get_current_caps() or pad.query_caps(None)
         if not caps or caps.get_size() == 0:
             return
@@ -1751,12 +1819,21 @@ class DeepStreamPipelineBuilder:
             logger.debug(f"Stream {stream_id}: nvurisrcbin ignoring non-video pad {name}")
             return
 
-        # Link to premuxq (leaky queue) for ALL streams — absorbs backpressure
         target_name = f'premuxq{stream_id}'
         target_pad = self.elements[target_name].get_static_pad("sink")
+
         if target_pad.is_linked():
-            logger.debug(f"Stream {stream_id}: nvurisrcbin {target_name} already linked")
-            return
+            old_peer = target_pad.get_peer()
+            if old_peer and old_peer == pad:
+                # Same pad re-fired pad-added (e.g. caps change) — already wired correctly.
+                logger.debug(f"Stream {stream_id}: nvurisrcbin {target_name} already linked to same pad")
+                return
+            # Stale link from before per-stream restart — unlink it so the new pad can connect.
+            if old_peer:
+                old_peer.unlink(target_pad)
+                logger.info(
+                    f"Stream {stream_id}: unlinked stale {target_name} peer before re-link"
+                )
 
         try:
             pad.link(target_pad)
