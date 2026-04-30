@@ -1402,7 +1402,7 @@ def main():
                 config=config,
                 screenshot_dir=str(config.SCREENSHOT_DIR),
                 heat_cycle_manager=heat_cycle_manager,
-                enable_display_meta=False,
+                enable_display_meta=True,
                 screenshot_writer=screenshot_writer,
                 camera_id_override=config.CAMERA_ID_STREAM_2,
             )
