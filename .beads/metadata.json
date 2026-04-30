@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "hicon",
+  "project_id": "b8ae2101-8970-4104-8319-151fbde919bc"
+}

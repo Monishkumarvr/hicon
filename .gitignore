@@ -107,3 +107,7 @@ ai_vision/docs/*.prompt.md
 ai_vision_cpp/build/
 ai_vision_cpp/external/*/
 !ai_vision_cpp/external/README.md
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
