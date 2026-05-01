@@ -58,7 +58,8 @@ class PouringProcessor:
 
     def __init__(self, db_manager, config, screenshot_dir: str, heat_cycle_manager=None,
                  camera_id_override: str = None, enable_display_meta: bool = True,
-                 screenshot_writer=None):
+                 screenshot_writer=None, frame_width_hint: int = None,
+                 frame_height_hint: int = None):
         self.db_manager = db_manager
         self.config = config
         self.enable_display_meta = enable_display_meta
@@ -70,6 +71,8 @@ class PouringProcessor:
         self.customer_id = config.CUSTOMER_ID
         self.location = config.LOCATION
         self.camera_id = camera_id_override if camera_id_override else config.CAMERA_ID_STREAM_0
+        self._frame_width_hint = frame_width_hint
+        self._frame_height_hint = frame_height_hint
 
         # Detection thresholds
         self.mouth_conf = config.MOUTH_CONFIDENCE
@@ -116,7 +119,13 @@ class PouringProcessor:
         self.log_mould_displacement = bool(getattr(config, 'LOG_MOULD_DISPLACEMENT', False))
         self.mould_disp_log_interval_s = float(getattr(config, 'MOULD_DISP_LOG_INTERVAL_S', 0.25))
         self.fps = getattr(config, 'RTSP_FPS', 25.0)
-        self.pour_start_frames = max(1, int(round(self.pour_start_dur * self.fps)))
+        # nvinfer interval: pour_on_count and sustained_hold_frames only accumulate on inference
+        # frames (frames where the model ran), so they must be calibrated to inference fps, not
+        # stream fps.  pour_off_count uses frozen-probe brightness on every GStreamer frame, so
+        # it keeps stream fps.
+        nvinfer_interval = int(getattr(config, 'POUR_NVINFER_INTERVAL', 0))
+        self._inference_fps = self.fps / (nvinfer_interval + 1)
+        self.pour_start_frames = max(1, int(round(self.pour_start_dur * self._inference_fps)))
         self.pour_end_frames = max(1, int(round(self.pour_end_dur * self.fps)))
 
         # Edge expand and tolerances
@@ -190,7 +199,7 @@ class PouringProcessor:
         self.anchor_position: Optional[Tuple[float, float]] = None  # normalized mouth pos (trolley-relative)
         self.anchor_set = False  # anchor set on pour start
         self.displacement_hold_frames: Optional[int] = None  # frame counter for sustained displacement
-        self.sustained_hold_frames = int(round(self.sustained_dur * self.fps))
+        self.sustained_hold_frames = int(round(self.sustained_dur * self._inference_fps))
         self.mouth_hold_frames = int(round(self.mouth_hold_s * self.fps))
         # Direction consistency guard for split hold
         self.split_hold_quadrant: Optional[int] = None  # 1, 2, 3, or 4
@@ -391,8 +400,8 @@ class PouringProcessor:
             else:
                 frame_h, frame_w = frame.shape[:2]
         else:
-            frame_w = getattr(self.config, 'STREAM_0_MUX_WIDTH', 1600)
-            frame_h = getattr(self.config, 'STREAM_0_MUX_HEIGHT', 900)
+            frame_w = self._frame_width_hint or getattr(self.config, 'STREAM_0_MUX_WIDTH', 1600)
+            frame_h = self._frame_height_hint or getattr(self.config, 'STREAM_0_MUX_HEIGHT', 900)
 
         self._frame_w = frame_w
         self._frame_h = frame_h
@@ -403,7 +412,7 @@ class PouringProcessor:
 
         if frame_num and frame_num % 1000 == 0:
             logger.info(
-                f"Stream 0 Frame {frame_num}: {len(mouths)} mouths, {len(trolleys)} trolleys"
+                f"[{self.camera_id}] Frame {frame_num}: {len(mouths)} mouths, {len(trolleys)} trolleys"
             )
 
         # 2. Find the relevant trolley (locked or best candidate)

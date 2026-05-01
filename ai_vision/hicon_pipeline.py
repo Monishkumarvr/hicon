@@ -1442,6 +1442,8 @@ def main():
                 heat_cycle_manager=heat_cycle_manager,
                 camera_id_override=config.CAMERA_ID_STREAM_2,
                 screenshot_writer=screenshot_writer,
+                frame_width_hint=config.STREAM_2_MUX_WIDTH,
+                frame_height_hint=config.STREAM_2_MUX_HEIGHT,
             )
             logger.info("Stream 2: Pouring processor initialized")
         except Exception as e:
@@ -1485,6 +1487,9 @@ def main():
         'tracker_lib': config.TRACKER_LIB,
         'tracker_config': config.TRACKER_CONFIG,
         'stream_0_tracker_config': config.STREAM_0_TRACKER_CONFIG,
+        'stream_2_tracker_config': config.STREAM_2_TRACKER_CONFIG,
+        'stream_2_tracker_width': config.STREAM_2_TRACKER_WIDTH,
+        'stream_2_tracker_height': config.STREAM_2_TRACKER_HEIGHT,
         'rtsp_protocol_0': config.RTSP_PROTOCOL_0,
         'rtsp_protocol_1': config.RTSP_PROTOCOL_1,
         'rtsp_protocol_2': config.RTSP_PROTOCOL_2,

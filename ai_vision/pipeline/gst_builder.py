@@ -1256,6 +1256,9 @@ class DeepStreamPipelineBuilder:
 
             if self.enable_stream2_pouring:
                 # Optional pouring inference (GIE-3)
+                self.elements['postmuxq2'] = Gst.ElementFactory.make("queue", "postmuxq2")
+                self._configure_leaky_queue(self.elements['postmuxq2'], max_buffers=32)
+
                 self.elements['pgie_pouring_2'] = Gst.ElementFactory.make("nvinfer", "pgie-pouring-2")
                 self.elements['pgie_pouring_2'].set_property(
                     'config-file-path', self.config['config_pouring_2']
@@ -1265,9 +1268,16 @@ class DeepStreamPipelineBuilder:
                 # Tracker for stream 2 pouring
                 self.elements['tracker_2'] = Gst.ElementFactory.make("nvtracker", "tracker-2")
                 self.elements['tracker_2'].set_property('ll-lib-file', self.config['tracker_lib'])
-                self.elements['tracker_2'].set_property('ll-config-file', self.config['tracker_config'])
-                self.elements['tracker_2'].set_property('tracker-width', 640)
-                self.elements['tracker_2'].set_property('tracker-height', 384)
+                self.elements['tracker_2'].set_property(
+                    'll-config-file',
+                    self.config.get('stream_2_tracker_config', self.config['tracker_config'])
+                )
+                self.elements['tracker_2'].set_property(
+                    'tracker-width', self.config.get('stream_2_tracker_width', 640)
+                )
+                self.elements['tracker_2'].set_property(
+                    'tracker-height', self.config.get('stream_2_tracker_height', 384)
+                )
             else:
                 logger.info("Stream 2: Pouring nvinfer/tracker disabled")
 
@@ -1663,10 +1673,12 @@ class DeepStreamPipelineBuilder:
                 if not self._link_to_mux('premuxq2', 'mux_2'):
                     return False
 
-            # mux_2 -> optional pouring/tracker -> optional melting -> nvvidconv -> osd -> sink
+            # mux_2 -> [postmuxq2 ->] optional pouring/tracker -> optional melting -> nvvidconv -> osd -> sink
             chain_2 = []
             stream2_head = 'mux_2'
             if self.enable_stream2_pouring:
+                chain_2.append((stream2_head, 'postmuxq2'))
+                stream2_head = 'postmuxq2'
                 chain_2.append((stream2_head, 'pgie_pouring_2'))
                 stream2_head = 'pgie_pouring_2'
                 chain_2.append((stream2_head, 'tracker_2'))

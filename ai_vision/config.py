@@ -100,6 +100,10 @@ POUR_BRIGHTNESS_END = int(os.getenv('HICON_POUR_BRIGHTNESS_END', '160'))
 POUR_START_DURATION = float(os.getenv('HICON_POUR_START_DURATION', '0.20'))
 POUR_END_DURATION = float(os.getenv('HICON_POUR_END_DURATION', '0.80'))
 POUR_MIN_DURATION = float(os.getenv('HICON_POUR_MIN_DURATION', '2.0'))
+# nvinfer interval for pouring model — mirrors the `interval=N` value in config_pouring*.txt.
+# 0 = every frame (25fps inference); 1 = every 2nd frame (12.5fps inference).
+# Affects frame-count thresholds that only accumulate on inference frames.
+POUR_NVINFER_INTERVAL = int(os.getenv('HICON_POUR_NVINFER_INTERVAL', '1'))
 
 # Mould counting: anchor-based trolley motion + spatial clustering
 MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15'))
@@ -376,6 +380,13 @@ TRACKER_CONFIG = os.getenv(
 STREAM_0_TRACKER_CONFIG = os.getenv(
     'HICON_STREAM_0_TRACKER_CONFIG',
     TRACKER_CONFIG
+)
+
+STREAM_2_TRACKER_WIDTH = int(os.getenv('HICON_STREAM_2_TRACKER_WIDTH', '640'))
+STREAM_2_TRACKER_HEIGHT = int(os.getenv('HICON_STREAM_2_TRACKER_HEIGHT', '384'))
+STREAM_2_TRACKER_CONFIG = os.getenv(
+    'HICON_STREAM_2_TRACKER_CONFIG',
+    str(CONFIG_DIR / 'config_tracker_stream2.yml')
 )
 
 # =============================================================================
