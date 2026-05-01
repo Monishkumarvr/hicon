@@ -14,6 +14,7 @@ Environment=PATH=/usr/local/cuda-12.6/bin:/usr/local/sbin:/usr/local/bin:/usr/sb
 Environment=LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local/cuda-12.6/lib64
 Environment=GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
 Environment=GST_DEBUG=1
+Environment=SENTRY_DSN=https://088af9f4d42ff7ec125d741387f0f4ac@o4509393361043456.ingest.de.sentry.io/4511313799544912
 
 ExecStart=/bin/bash -lc 'set -o pipefail; python3 hicon_pipeline.py 2>&1 | grep --line-buffered -v "ErrorType="; exit ${PIPESTATUS[0]}'
 

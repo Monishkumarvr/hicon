@@ -8,6 +8,24 @@ All cameras decode H.265/HEVC via nvv4l2decoder.
 """
 import sys
 import os
+
+# ---------------------------------------------------------------------------
+# Sentry — must init before logging setup so startup errors are captured.
+# Load .env first so SENTRY_DSN is available.
+# ---------------------------------------------------------------------------
+def _bootstrap_sentry():
+    from pathlib import Path as _Path
+    _env = _Path(__file__).parent / ".env"
+    if _env.exists():
+        for _line in _env.read_text().splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip().strip("'\""))
+    import sentry_config
+    sentry_config.init()
+
+_bootstrap_sentry()
 import logging
 import time
 import json
@@ -2060,6 +2078,8 @@ def main():
         loop.run()
     except Exception as e:
         logger.error(f"Main loop error: {e}", exc_info=True)
+        import sentry_config
+        sentry_config.capture_exception(e, context="main_loop")
     finally:
         logger.info("Shutting down pipeline...")
         sync_stop_event.set()
@@ -2113,6 +2133,17 @@ def main():
         logger.info("Pipeline stopped")
 
     if bus_handler.fatal_exit:
+        import sentry_config
+        sentry_config.capture_pipeline_error(
+            "HiCon pipeline fatal exit",
+            fatal_exit=True,
+            device_id=getattr(config, "DEVICE_ID", "unknown"),
+        )
+        import sentry_sdk as _sentry_sdk
+        try:
+            _sentry_sdk.flush(timeout=3)
+        except Exception:
+            pass
         sys.exit(1)
 
 
