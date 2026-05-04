@@ -363,10 +363,11 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 **NVR:** CP Plus NVR at 192.168.28.6 (password `NVR@321#`) — tested and **rejected** for relay
 (March 19: 12-min soak showed NVR relay is worse than direct camera connection)
 
-**RTSP drop root cause (confirmed March 19):** Drops were caused by **DeepStream pipeline
-backpressure**, not camera firmware. Simultaneous soak test proved: standalone ffmpeg→/dev/null
-held connection indefinitely while DeepStream pipeline dropped on the same stream in the same window.
-Fix: `drop-on-latency=True`, `latency=4000ms`, `premuxq=128 leaky=2`, `num-extra-surfaces=16`.
+**RTSP drop root cause (confirmed 2026-05-04):** Drops were caused by `gst_builder.py` silently
+overriding stream 0's nvurisrcbin transport from `tcp` → `auto` (UDP multi). UDP has no
+retransmission — inference stalls caused permanent packet loss and session death.
+Fix: `HICON_STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL=true` in `.env`.
+Confirmed by 3-soak: 0 outages in 330s with TCP vs drops every ~300s with UDP.
 
 **Segment buffer code** (legacy, disabled): Still in codebase at `pipeline/segment_buffer_helper.py`
 and `gst_builder.py` segment buffer paths. Available if future cameras exhibit similar firmware drops.
