@@ -343,16 +343,15 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 - **Credentials:** `admin` / `india@789` (URL-encoded: `india%40789`)
 - **RTSP URL (sub-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/102`
 - **RTSP URL (main-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/101`
-- **All streams use sub-stream (Channels/102):** H.265, 1280×720 @ 25fps
-- **Main-stream:** H.265, 2688×1520 @ 25fps — do NOT use for pipeline (6144 kbps + audio → TCP drops)
+- **Stream 0 uses main-stream (Channels/101):** H.265, 2688×1520 @ 25fps — mux scaled to 1600×900
+- **Streams 1 & 2 use sub-stream (Channels/102):** H.265, 1280×720 @ 25fps
 - **ONVIF:** Disabled in camera settings (returns 404)
-- **ISAPI:** Available on HTTP :80 (streams 0, 1, 2); HTTPS :443 also works on all
-- **Audio:** CH101 audio ON (all cameras); CH102 audio OFF on stream 0/2, ON on stream 1 (pipeline uses CH102 for all)
+- **ISAPI:** Available on HTTP :80 and HTTPS :443 on all cameras
 
-**Sub-stream bitrates (CH102, confirmed via ISAPI):**
-- Stream 0 (192.168.28.119): 512 kbps VBR, audio OFF, SmartCodec off
-- Stream 1 (192.168.27.253): 320 kbps VBR, audio ON, SmartCodec off
-- Stream 2 (192.168.27.226): 512 kbps VBR, audio OFF, SmartCodec off
+**Stream configs (confirmed via ISAPI 2026-05-04):**
+- Stream 0 CH101 (192.168.28.119): 2688×1520, 6144 kbps VBR (avg 3072), **audio OFF**, **SmartCodec OFF** — disabled via ISAPI to reduce TCP backpressure drops
+- Stream 1 CH102 (192.168.27.253): 1280×720, 320 kbps VBR, audio ON, SmartCodec off
+- Stream 2 CH102 (192.168.27.226): 1280×720, 512 kbps VBR, audio OFF, SmartCodec off
 
 **Previous cameras (replaced 2026-03-20):** 3× CP Plus (Dahua OEM):
 - 192.168.28.155: CP-UNC-TC41L5C-VMD-LQ (fw 2.860.00AT001.0.R)
