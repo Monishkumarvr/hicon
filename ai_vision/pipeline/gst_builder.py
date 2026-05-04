@@ -353,11 +353,12 @@ class DeepStreamPipelineBuilder:
 
         uribin.set_property('uri', rtsp_url)
         uribin.set_property('type', 2)  # rtsp source type
-        # Stream 0 (1280x720) needs longer reconnect interval: decoder DPB reallocation
-        # + TCP socket cleanup takes >2s at higher resolution.  640x480 streams recover
-        # fast enough with 2s.  10s matches the nvurisrcbin default and avoids the
-        # "reconnect loop" where each attempt interrupts the previous one.
-        reconnect_s = 10 if stream_id == 0 else 2
+        # All streams use 2s reconnect interval. Stream 0 was previously 10s to avoid
+        # a "reconnect loop" at high resolution, but log analysis proved drops are caused
+        # by the camera's 300s firmware session timer (not backpressure). At 10s, each
+        # session reset causes a 15-50s visible stall. At 2s, stream 0 recovers like
+        # stream 2 (same timer, same camera, just different resolution DPB realloc time).
+        reconnect_s = 2
         uribin.set_property('rtsp-reconnect-interval', reconnect_s)
         uribin.set_property('rtsp-reconnect-attempts', -1)  # unlimited
         uribin.set_property('gpu-id', 0)
