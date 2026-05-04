@@ -349,7 +349,7 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 - **ISAPI:** Available on HTTP :80 and HTTPS :443 on all cameras
 
 **Stream configs (confirmed via ISAPI 2026-05-04):**
-- Stream 0 CH101 (192.168.28.119): 2688×1520, 6144 kbps VBR (avg 3072), **audio OFF**, **SmartCodec OFF** — disabled via ISAPI to reduce TCP backpressure drops
+- Stream 0 CH101 (192.168.28.119): 2688×1520, 3072 kbps VBR (avg 1536), **audio OFF**, **SmartCodec OFF** — CH102 tested and showed identical reconnect delays; bottleneck is camera-side reconnect speed, not resolution
 - Stream 1 CH102 (192.168.27.253): 1280×720, 320 kbps VBR, audio ON, SmartCodec off
 - Stream 2 CH102 (192.168.27.226): 1280×720, 512 kbps VBR, audio OFF, SmartCodec off
 
