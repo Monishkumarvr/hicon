@@ -330,25 +330,29 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 - Full pipeline watchdog: no frames > 10 min → systemd restart
 - Recording: post-OSD tee branch managed by `RecordingManager` for inference video capture
 
-## Camera Hardware (Updated 2026-03-20)
+## Camera Hardware (Updated 2026-05-04)
 
 **Current cameras:** 3× **Hikvision DS-2CD2043G2-LI2U** (4MP ColorVu bullet, ISAPI)
 
 | Stream | IP | Role | Firmware | Serial | MAC |
 |--------|-----|------|----------|--------|-----|
-| 0 | 192.168.27.226 | Process camera | V5.7.18 (build 240826) | ...FR7128559 | bc:29:78:53:24:78 |
-| 1 | 192.168.27.253 | Pyrometer camera | V5.7.18 (build 240826) | ...FR7129271 | bc:29:78:53:27:40 |
-| 2 | 192.168.28.119 | Pouring2 camera | V5.7.19 (build ???) | ...FW8319581 | bc:29:78:85:8a:85 |
+| 0 | 192.168.28.119 | Process (POURING) | V5.7.23 (build 260320) | ...FW8319581 | bc:29:78:85:8a:85 |
+| 1 | 192.168.27.253 | Pyrometer (FURNACE) | V5.7.23 (build 260320) | ...FR7129271 | bc:29:78:53:27:40 |
+| 2 | 192.168.27.226 | Pouring2 | V5.7.23 (build 260320) | ...FR7128559 | bc:29:78:53:24:78 |
 
 - **Credentials:** `admin` / `india@789` (URL-encoded: `india%40789`)
 - **RTSP URL (sub-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/102`
 - **RTSP URL (main-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/101`
-- **Sub-stream:** H.265 (HEVC), Main profile, **1280×720** @ 25fps (used by pipeline)
-- **Main-stream:** H.265 (HEVC), Main profile, 2688×1520 @ 25fps
-- **Note:** Dahua-style `/video/live?channel=1&subtype=1` returns main stream (2688×1520) — Hikvision ignores `subtype` param
+- **All streams use sub-stream (Channels/102):** H.265, 1280×720 @ 25fps
+- **Main-stream:** H.265, 2688×1520 @ 25fps — do NOT use for pipeline (6144 kbps + audio → TCP drops)
 - **ONVIF:** Disabled in camera settings (returns 404)
-- **ISAPI:** Available on HTTP :80 (streams 0, 1) and HTTPS :443 (stream 2)
-- **Audio:** Disabled in camera settings
+- **ISAPI:** Available on HTTP :80 (streams 0, 1, 2); HTTPS :443 also works on all
+- **Audio:** CH101 audio ON (all cameras); CH102 audio OFF on stream 0/2, ON on stream 1 (pipeline uses CH102 for all)
+
+**Sub-stream bitrates (CH102, confirmed via ISAPI):**
+- Stream 0 (192.168.28.119): 512 kbps VBR, audio OFF, SmartCodec off
+- Stream 1 (192.168.27.253): 320 kbps VBR, audio ON, SmartCodec off
+- Stream 2 (192.168.27.226): 512 kbps VBR, audio OFF, SmartCodec off
 
 **Previous cameras (replaced 2026-03-20):** 3× CP Plus (Dahua OEM):
 - 192.168.28.155: CP-UNC-TC41L5C-VMD-LQ (fw 2.860.00AT001.0.R)
