@@ -12,6 +12,7 @@ import json
 import logging
 import time
 import threading
+from datetime import datetime
 from pathlib import Path
 import gi
 gi.require_version('Gst', '1.0')
@@ -119,6 +120,7 @@ class BusHandler:
         self._nvurisrcbin_stream_ids = set(nvurisrcbin_stream_ids or [])
         self._last_stream_restart = {}
         self._pending_stream_restarts = set()
+        self._stream_outages = {}
 
         # Per-source RTSP error timestamps for rate-limiting
         self._rtsp_errors = {}  # {source_name: [timestamp, ...]}
@@ -316,6 +318,78 @@ class BusHandler:
         )
         return False
 
+    @staticmethod
+    def _format_event_time(timestamp: float) -> str:
+        return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+    def _note_stream_outage(self, stream_id: int, src_name: str, event_type: str, detail: str):
+        if stream_id < 0:
+            return
+
+        now = time.time()
+        outage = self._stream_outages.get(stream_id)
+        if outage is None:
+            outage = {
+                "start_ts": now,
+                "source_name": src_name or f"stream{stream_id}",
+                "start_detail": detail,
+                "last_detail": detail,
+                "warning_count": 0,
+                "error_count": 0,
+                "eos_count": 0,
+                "fps_zero_intervals": 0,
+            }
+            self._stream_outages[stream_id] = outage
+            logger.warning(
+                "[RTSP-OUTAGE] stream=%s phase=start source=%s start=%s trigger=%s",
+                stream_id,
+                outage["source_name"],
+                self._format_event_time(now),
+                detail,
+            )
+
+        if src_name:
+            outage["source_name"] = src_name
+        outage["last_detail"] = detail
+
+        if event_type == "warning":
+            outage["warning_count"] += 1
+        elif event_type == "error":
+            outage["error_count"] += 1
+        elif event_type == "eos":
+            outage["eos_count"] += 1
+        elif event_type == "fps_zero":
+            outage["fps_zero_intervals"] += 1
+
+    def _resolve_stream_outage(self, stream_id: int, frames_in_interval: int):
+        outage = self._stream_outages.pop(stream_id, None)
+        if outage is None:
+            return
+
+        end_ts = time.time()
+        duration_s = max(0.0, end_ts - outage["start_ts"])
+        source_signal_count = (
+            outage["warning_count"] + outage["error_count"] + outage["eos_count"]
+        )
+        logger.info(
+            "[RTSP-OUTAGE] stream=%s phase=recovered source=%s start=%s end=%s "
+            "duration_s=%.1f source_signal_count=%s warnings=%s errors=%s eos=%s "
+            "fps_zero_intervals=%s frames_in_interval=%s start_trigger=%s last_detail=%s",
+            stream_id,
+            outage["source_name"],
+            self._format_event_time(outage["start_ts"]),
+            self._format_event_time(end_ts),
+            duration_s,
+            source_signal_count,
+            outage["warning_count"],
+            outage["error_count"],
+            outage["eos_count"],
+            outage["fps_zero_intervals"],
+            frames_in_interval,
+            outage["start_detail"],
+            outage["last_detail"],
+        )
+
     def _on_bus_message(self, bus, message):
         """Process bus messages with RTSP-aware error classification."""
         t = message.type
@@ -323,6 +397,7 @@ class BusHandler:
         if t == Gst.MessageType.EOS:
             src_name = message.src.get_name() if message.src else "unknown"
             stream_id = self._stream_id_from_name(src_name)
+            self._note_stream_outage(stream_id, src_name, "eos", f"EOS from {src_name}")
             if self._schedule_stream_restart(stream_id, f"EOS from {src_name}"):
                 logger.warning("[RTSP-EOS] Recoverable EOS from %s; stream restart scheduled", src_name)
                 return
@@ -340,6 +415,10 @@ class BusHandler:
 
             # Classify: RTSP source errors are non-fatal (rtspsrc retries)
             if self._is_rtsp_source(src_name):
+                self._note_stream_outage(stream_id=self._stream_id_from_name(src_name),
+                                         src_name=src_name,
+                                         event_type="error",
+                                         detail=err.message)
                 if self._track_rtsp_error(src_name):
                     stream_id = self._stream_id_from_name(src_name)
                     if self._schedule_stream_restart(stream_id, f"RTSP error rate from {src_name}"):
@@ -399,6 +478,13 @@ class BusHandler:
             err, debug = message.parse_warning()
             src_name = message.src.get_name() if message.src else "unknown"
             logger.warning(f"Pipeline warning from {src_name}: {err.message}")
+            if self._is_rtsp_source(src_name):
+                self._note_stream_outage(
+                    stream_id=self._stream_id_from_name(src_name),
+                    src_name=src_name,
+                    event_type="warning",
+                    detail=err.message,
+                )
 
         elif t == Gst.MessageType.STATE_CHANGED:
             if message.src == self.pipeline:
@@ -487,6 +573,12 @@ class BusHandler:
                         self._zero_fps_counts[sid] = 0
                         continue
                     self._zero_fps_counts[sid] = self._zero_fps_counts.get(sid, 0) + 1
+                    self._note_stream_outage(
+                        sid,
+                        f"stream{sid}",
+                        "fps_zero",
+                        f"0fps watchdog interval (stall={self._zero_fps_counts[sid] * self._fps_log_interval}s)",
+                    )
                     if self._zero_fps_counts[sid] >= self._zero_fps_limit:
                         stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
                         if sid in self._restartable_stream_ids:
@@ -546,6 +638,7 @@ class BusHandler:
                             self.loop.quit()
                             return False
                 else:
+                    self._resolve_stream_outage(sid, count)
                     if self._zero_fps_counts.get(sid, 0) > 0:
                         stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
                         logger.info(f"[FPS-WATCHDOG] Stream {sid} recovered after {stall_sec}s stall")

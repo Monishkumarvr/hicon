@@ -290,3 +290,35 @@ def test_schedule_stream_restart_rejects_non_native_rtsp_stream():
     builder.elements["source0"] = FakeSourceElement("source0")
 
     assert builder.schedule_stream_restart(0, "unit test") is False
+
+
+def test_nvurisrcbin_stream0_keeps_historical_tcp_override(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_protocol_0="tcp",
+        stream_0_nvurisrcbin_respect_configured_protocol=False,
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_nvurisrcbin_chain(0, "rtsp://example/stream0") is True
+    assert "select-rtp-protocol" not in builder.elements["source0"].props
+    assert "requested=tcp effective=auto" in caplog.text
+
+
+def test_nvurisrcbin_stream0_can_respect_configured_tcp(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(
+        rtsp_protocol_0="tcp",
+        stream_0_nvurisrcbin_respect_configured_protocol=True,
+    )
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_nvurisrcbin_chain(0, "rtsp://example/stream0") is True
+    assert builder.elements["source0"].props["select-rtp-protocol"] == 4
+    assert "requested=tcp effective=tcp" in caplog.text

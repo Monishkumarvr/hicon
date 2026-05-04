@@ -369,12 +369,28 @@ class DeepStreamPipelineBuilder:
         uribin.set_property('latency', latency_ms)
         uribin.set_property('drop-on-latency', True)
 
-        # For nvurisrcbin, prefer auto (UDP fallback) — TCP-only reconnection is slower
-        # because of TCP socket TIME-WAIT cleanup.  Override any per-stream tcp setting.
-        protocol = str(self.config.get(f'rtsp_protocol_{stream_id}', 'auto') or 'auto').lower()
-        if protocol == 'tcp' and stream_id == 0:
-            logger.info(f"Stream {stream_id}: overriding protocol tcp→auto for nvurisrcbin (faster reconnect)")
+        requested_protocol = str(
+            self.config.get(f'rtsp_protocol_{stream_id}', 'auto') or 'auto'
+        ).lower()
+        respect_configured_protocol = bool(
+            self.config.get('stream_0_nvurisrcbin_respect_configured_protocol', False)
+        )
+        protocol = requested_protocol
+        override_applied = False
+        override_reason = "configured"
+
+        # Baseline Stream 0 keeps the historical nvurisrcbin tcp→multi override.
+        # The proof soak can disable it with
+        # HICON_STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL=true.
+        if (
+            stream_id == 0
+            and requested_protocol == 'tcp'
+            and not respect_configured_protocol
+        ):
             protocol = 'auto'
+            override_applied = True
+            override_reason = "stream0_nvurisrcbin_tcp_override"
+
         if protocol == 'tcp':
             uribin.set_property('select-rtp-protocol', 4)  # rtp-tcp
         # default 0 = rtp-multi (UDP + UDP Multicast + TCP)
@@ -396,6 +412,16 @@ class DeepStreamPipelineBuilder:
             f"protocol={'tcp' if protocol == 'tcp' else 'multi'}, latency={latency_ms}ms, "
             f"drop-on-latency=True, num-extra-surfaces=16, "
             f"premuxq={queue_name} leaky=2 max-buffers=128 max-time=5s)"
+        )
+        logger.info(
+            "Stream %s: nvurisrcbin transport requested=%s effective=%s "
+            "respect_configured_protocol=%s override_applied=%s reason=%s",
+            sid,
+            requested_protocol,
+            protocol,
+            respect_configured_protocol if stream_id == 0 else "n/a",
+            override_applied,
+            override_reason,
         )
         return True
 

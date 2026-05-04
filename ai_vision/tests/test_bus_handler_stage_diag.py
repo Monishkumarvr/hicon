@@ -242,3 +242,40 @@ def test_eos_from_non_restartable_stream_remains_fatal():
 
     assert handler.fatal_exit is True
     assert loop.quit_called is True
+
+
+class FakeWarningMessage(FakeMessage):
+    def __init__(self, src_name, text):
+        super().__init__(Gst.MessageType.WARNING, src_name)
+        self._text = text
+
+    def parse_warning(self):
+        class _Err:
+            def __init__(self, message):
+                self.message = message
+
+        return _Err(self._text), None
+
+
+def test_warning_then_frames_emit_structured_outage_recovery(monkeypatch, caplog):
+    scheduled = {}
+
+    def fake_timeout_add_seconds(_interval, callback):
+        scheduled["callback"] = callback
+        return 1
+
+    monkeypatch.setattr("pipeline.bus_handler.GLib.timeout_add_seconds", fake_timeout_add_seconds)
+
+    handler = BusHandler(FakePipeline(), FakeLoop())
+    handler.last_frame_time[0] = time.time()
+    handler._frame_counts[0] = 25
+
+    caplog.set_level(logging.INFO)
+    handler._on_bus_message(None, FakeWarningMessage("source0", "No data from source since last 3 sec. Trying reconnection"))
+    handler.start_fps_logger()
+
+    assert scheduled["callback"]() is True
+    assert "[RTSP-OUTAGE] stream=0 phase=start source=source0" in caplog.text
+    assert "[RTSP-OUTAGE] stream=0 phase=recovered source=source0" in caplog.text
+    assert "warnings=1" in caplog.text
+    assert "frames_in_interval=25" in caplog.text
