@@ -131,6 +131,7 @@ class DeepStreamPipelineBuilder:
         self.use_nvurisrcbin_0 = bool(config.get('use_nvurisrcbin_0', False))
         self.use_nvurisrcbin_1 = bool(config.get('use_nvurisrcbin_1', False))
         self.use_nvurisrcbin_2 = bool(config.get('use_nvurisrcbin_2', False))
+        self._nvurisrcbin_stream_ids: set = set()  # populated by _create_nvurisrcbin_chain
         if self.use_segment_buffer_0:
             self.use_udp_loopback_0 = False
             self.use_ffmpeg_src_0 = False
@@ -173,8 +174,26 @@ class DeepStreamPipelineBuilder:
             if self._is_native_rtsp_stream(sid)
         }
 
+    @property
+    def nvurisrcbin_stream_ids(self) -> frozenset:
+        return frozenset(self._nvurisrcbin_stream_ids)
+
     def schedule_stream_restart(self, stream_id, reason=""):
-        """Cycle a native RTSP source through NULL -> READY -> PLAYING."""
+        """Cycle a native RTSP source through NULL -> READY -> PLAYING.
+
+        nvurisrcbin streams are intentionally skipped: cycling nvurisrcbin through
+        NULL leaves its dynamic vsrc_0 pad registered, so the next pad-added event
+        fails with 'Padname vsrc_0 is not unique', permanently blocking video flow.
+        nvurisrcbin has built-in reconnection (rtsp-reconnect-interval) that handles
+        drops safely without corrupting the pad registry.
+        """
+        if stream_id in self._nvurisrcbin_stream_ids:
+            logger.warning(
+                "Stream %s: skipping state-cycle restart for nvurisrcbin — "
+                "built-in reconnect is already running (%s)",
+                stream_id, reason,
+            )
+            return True
         if not self._is_native_rtsp_stream(stream_id):
             logger.warning("Stream %s: local restart not supported (%s)", stream_id, reason)
             return False
@@ -360,6 +379,7 @@ class DeepStreamPipelineBuilder:
         # default 0 = rtp-multi (UDP + UDP Multicast + TCP)
 
         self.elements[f'source{sid}'] = uribin
+        self._nvurisrcbin_stream_ids.add(stream_id)
 
         # Leaky queue for ALL streams to absorb backpressure from downstream
         # inference spikes — prevents RTSP TCP socket stall → server disconnect.

@@ -28,6 +28,8 @@ _RTSP_ERROR_WINDOW_SEC = 60.0
 
 # Grace period: skip 0fps watchdog during startup (network may not be ready)
 _STARTUP_GRACE_SEC = 30
+# nvurisrcbin has built-in reconnection; only escalate to service restart after this long
+_NVURI_STALE_CAP_SEC = 300
 _STREAM0_STAGE_ORDER = (
     "decoder_src",
     "nvvidconv_src",
@@ -61,7 +63,8 @@ class BusHandler:
                  rtsp_restart_cooldown_sec=60,
                  rtsp_restart_backoff_sec=5,
                  stream_restart_cb=None,
-                 restartable_stream_ids=None):
+                 restartable_stream_ids=None,
+                 nvurisrcbin_stream_ids=None):
         """
         Args:
             pipeline: GStreamer pipeline
@@ -113,6 +116,7 @@ class BusHandler:
         self._rtsp_restart_backoff_sec = max(0, int(rtsp_restart_backoff_sec or 5))
         self._stream_restart_cb = stream_restart_cb
         self._restartable_stream_ids = set(restartable_stream_ids or [])
+        self._nvurisrcbin_stream_ids = set(nvurisrcbin_stream_ids or [])
         self._last_stream_restart = {}
         self._pending_stream_restarts = set()
 
@@ -486,16 +490,34 @@ class BusHandler:
                     if self._zero_fps_counts[sid] >= self._zero_fps_limit:
                         stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
                         if sid in self._restartable_stream_ids:
-                            logger.warning(
-                                f"[FPS-WATCHDOG] Stream {sid} at 0fps for {stall_sec}s — "
-                                f"waiting for per-stream restart threshold"
-                            )
-                            if stall_sec >= self._rtsp_restart_stale_sec:
-                                if self._schedule_stream_restart(
-                                    sid,
-                                    f"0fps for {stall_sec}s",
-                                ):
-                                    self._zero_fps_counts[sid] = 0
+                            if sid in self._nvurisrcbin_stream_ids:
+                                # nvurisrcbin reconnects internally; state-cycle restart
+                                # corrupts the vsrc_0 pad registry (GStreamer-CRITICAL:
+                                # "Padname vsrc_0 is not unique"). Let it self-heal.
+                                logger.warning(
+                                    f"[FPS-WATCHDOG] Stream {sid} at 0fps for {stall_sec}s — "
+                                    f"waiting for nvurisrcbin built-in reconnect"
+                                )
+                                if stall_sec >= _NVURI_STALE_CAP_SEC:
+                                    logger.critical(
+                                        f"[FPS-WATCHDOG] Stream {sid} nvurisrcbin stale "
+                                        f"{stall_sec}s — triggering service restart"
+                                    )
+                                    self._ping_healthcheck("/fail")
+                                    self.fatal_exit = True
+                                    self.loop.quit()
+                                    return False
+                            else:
+                                logger.warning(
+                                    f"[FPS-WATCHDOG] Stream {sid} at 0fps for {stall_sec}s — "
+                                    f"waiting for per-stream restart threshold"
+                                )
+                                if stall_sec >= self._rtsp_restart_stale_sec:
+                                    if self._schedule_stream_restart(
+                                        sid,
+                                        f"0fps for {stall_sec}s",
+                                    ):
+                                        self._zero_fps_counts[sid] = 0
                             continue
                         policy = self._stream_zero_fps_policy.get(sid, 'restart')
                         if policy == 'warn':

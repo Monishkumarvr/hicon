@@ -1602,6 +1602,7 @@ def main():
         rtsp_restart_backoff_sec=config.RTSP_RESTART_BACKOFF_SEC,
         stream_restart_cb=builder.schedule_stream_restart,
         restartable_stream_ids=builder.get_restartable_stream_ids(),
+        nvurisrcbin_stream_ids=builder.nvurisrcbin_stream_ids,
     )
 
     # Initialize MJPEG live streaming server (if enabled)
