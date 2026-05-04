@@ -1493,9 +1493,6 @@ def main():
         'rtsp_protocol_0': config.RTSP_PROTOCOL_0,
         'rtsp_protocol_1': config.RTSP_PROTOCOL_1,
         'rtsp_protocol_2': config.RTSP_PROTOCOL_2,
-        'stream_0_nvurisrcbin_respect_configured_protocol': (
-            config.STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL
-        ),
         'rtsp_udp_timeout_us': config.RTSP_UDP_TIMEOUT_US,
         'rtsp_tcp_timeout_us': config.RTSP_TCP_TIMEOUT_US,
         'rtsp_port_retry': config.RTSP_PORT_RETRY,

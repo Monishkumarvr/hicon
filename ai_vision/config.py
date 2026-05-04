@@ -255,10 +255,6 @@ STREAM_2_ZERO_FPS_POLICY = os.getenv('HICON_STREAM_2_ZERO_FPS_POLICY', 'restart'
 USE_NVURISRCBIN_0 = os.getenv('HICON_USE_NVURISRCBIN_0', 'false').lower() == 'true'
 USE_NVURISRCBIN_1 = os.getenv('HICON_USE_NVURISRCBIN_1', 'false').lower() == 'true'
 USE_NVURISRCBIN_2 = os.getenv('HICON_USE_NVURISRCBIN_2', 'false').lower() == 'true'
-STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL = os.getenv(
-    'HICON_STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL',
-    'false',
-).lower() == 'true'
 
 # Use ffmpeg subprocess as RTSP-to-pipe bridge (zero-drop, handles keepalives correctly).
 # ffmpeg -c:v copy remuxes only (~1% CPU); GStreamer fdsrc reads from pipe, NVDEC decodes.
@@ -497,9 +493,6 @@ def get_config_summary():
         'rtsp_protocol_0': RTSP_PROTOCOL_0,
         'rtsp_protocol_1': RTSP_PROTOCOL_1,
         'rtsp_protocol_2': RTSP_PROTOCOL_2,
-        'stream_0_nvurisrcbin_respect_configured_protocol': (
-            STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL
-        ),
         'rtsp_udp_timeout_us': RTSP_UDP_TIMEOUT_US,
         'rtsp_tcp_timeout_us': RTSP_TCP_TIMEOUT_US,
         'rtsp_port_retry': RTSP_PORT_RETRY,
