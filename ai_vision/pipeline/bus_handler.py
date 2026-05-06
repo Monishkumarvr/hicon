@@ -129,6 +129,11 @@ class BusHandler:
         # for systemd Restart=on-failure to trigger. EOS/SIGTERM stay False (clean exit).
         self.fatal_exit = False
 
+        # {stream_id: float} — wall-clock time of the most recent warning/error from
+        # that stream's rtspsrc/nvurisrcbin element.  Used to detect whether the source
+        # is still actively trying to reconnect (camera unreachable) vs silent/stuck.
+        self._last_source_signal_time: dict = {}
+
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
@@ -415,7 +420,10 @@ class BusHandler:
 
             # Classify: RTSP source errors are non-fatal (rtspsrc retries)
             if self._is_rtsp_source(src_name):
-                self._note_stream_outage(stream_id=self._stream_id_from_name(src_name),
+                _sid_e = self._stream_id_from_name(src_name)
+                if _sid_e >= 0:
+                    self._last_source_signal_time[_sid_e] = time.time()
+                self._note_stream_outage(stream_id=_sid_e,
                                          src_name=src_name,
                                          event_type="error",
                                          detail=err.message)
@@ -479,8 +487,11 @@ class BusHandler:
             src_name = message.src.get_name() if message.src else "unknown"
             logger.warning(f"Pipeline warning from {src_name}: {err.message}")
             if self._is_rtsp_source(src_name):
+                _sid_w = self._stream_id_from_name(src_name)
+                if _sid_w >= 0:
+                    self._last_source_signal_time[_sid_w] = time.time()
                 self._note_stream_outage(
-                    stream_id=self._stream_id_from_name(src_name),
+                    stream_id=_sid_w,
                     src_name=src_name,
                     event_type="warning",
                     detail=err.message,
@@ -591,14 +602,27 @@ class BusHandler:
                                     f"waiting for nvurisrcbin built-in reconnect"
                                 )
                                 if stall_sec >= _NVURI_STALE_CAP_SEC:
-                                    logger.critical(
-                                        f"[FPS-WATCHDOG] Stream {sid} nvurisrcbin stale "
-                                        f"{stall_sec}s — triggering service restart"
-                                    )
-                                    self._ping_healthcheck("/fail")
-                                    self.fatal_exit = True
-                                    self.loop.quit()
-                                    return False
+                                    last_sig = self._last_source_signal_time.get(sid)
+                                    if last_sig is not None and (now - last_sig) <= 30:
+                                        # Source is still sending reconnect signals — camera is
+                                        # IP-unreachable but pipeline is healthy.  nvurisrcbin
+                                        # will self-reconnect when the camera returns; a service
+                                        # restart won't help and just creates a restart storm.
+                                        logger.warning(
+                                            f"[FPS-WATCHDOG] Stream {sid} nvurisrcbin stale "
+                                            f"{stall_sec}s — source actively reconnecting "
+                                            f"(last signal {now - last_sig:.0f}s ago), "
+                                            f"suppressing restart"
+                                        )
+                                    else:
+                                        logger.critical(
+                                            f"[FPS-WATCHDOG] Stream {sid} nvurisrcbin stale "
+                                            f"{stall_sec}s — triggering service restart"
+                                        )
+                                        self._ping_healthcheck("/fail")
+                                        self.fatal_exit = True
+                                        self.loop.quit()
+                                        return False
                             else:
                                 logger.warning(
                                     f"[FPS-WATCHDOG] Stream {sid} at 0fps for {stall_sec}s — "
@@ -643,6 +667,7 @@ class BusHandler:
                         stall_sec = self._zero_fps_counts[sid] * self._fps_log_interval
                         logger.info(f"[FPS-WATCHDOG] Stream {sid} recovered after {stall_sec}s stall")
                     self._zero_fps_counts[sid] = 0
+                    self._last_source_signal_time.pop(sid, None)
 
             logger.info("[FPS] " + " | ".join(parts))
             if self.stream0_decoupled_analysis_mode and 0 in self.last_frame_time:
