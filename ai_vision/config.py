@@ -152,6 +152,29 @@ MOULD_SWITCH_MIN_POUR_S = float(os.getenv('HICON_MOULD_SWITCH_MIN_POUR', '2.0'))
 # Minimum cumulative pour time per mould cluster (offline parity filter)
 MIN_CLUSTER_POUR_S = float(os.getenv('HICON_MIN_CLUSTER_POUR_S', '1.5'))
 
+# =============================================================================
+# MOULD PLACEMENT DETECTION
+# Controls: HICON_MOULD_TRACKING_MODE
+#   reactive (default) — existing cluster-based mould_count, placement runs silently for logs
+#   predictive         — mould_count = blobs that received pours (placement detector is primary)
+#   hybrid             — predictive if detection succeeded; reactive fallback
+# Rollback: set HICON_MOULD_TRACKING_MODE=reactive in .env — no code change required.
+# =============================================================================
+MOULD_TRACKING_MODE            = os.getenv('HICON_MOULD_TRACKING_MODE', 'reactive')
+ENABLE_MOULD_PLACEMENT         = os.getenv('HICON_ENABLE_MOULD_PLACEMENT', 'true').lower() == 'true'
+PLACEMENT_DIFF_THRESH          = int(os.getenv('HICON_PLACEMENT_DIFF_THRESH', '30'))
+PLACEMENT_MIN_BLOB_AREA_PX     = int(os.getenv('HICON_PLACEMENT_MIN_BLOB_AREA_PX', '50'))
+PLACEMENT_MAX_BLOB_AREA_PX     = int(os.getenv('HICON_PLACEMENT_MAX_BLOB_AREA_PX', '2000'))
+PLACEMENT_R_ASSIGN             = float(os.getenv('HICON_PLACEMENT_R_ASSIGN', '0.15'))
+PLACEMENT_HYBRID_CONF_THRESHOLD= float(os.getenv('HICON_PLACEMENT_HYBRID_CONF_THRESHOLD', '0.70'))
+PLACEMENT_SAVE_DEBUG_IMAGES    = os.getenv('HICON_PLACEMENT_SAVE_DEBUG_IMAGES', 'false').lower() == 'true'
+PLACEMENT_CANONICAL_W          = int(os.getenv('HICON_PLACEMENT_CANONICAL_W', '128'))
+PLACEMENT_CANONICAL_H          = int(os.getenv('HICON_PLACEMENT_CANONICAL_H', '64'))
+PLACEMENT_MIN_ASPECT           = float(os.getenv('HICON_PLACEMENT_MIN_ASPECT', '0.15'))
+PLACEMENT_MAX_ASPECT           = float(os.getenv('HICON_PLACEMENT_MAX_ASPECT', '6.67'))
+PLACEMENT_CANNY_LOW            = int(os.getenv('HICON_PLACEMENT_CANNY_LOW', '40'))
+PLACEMENT_CANNY_HIGH           = int(os.getenv('HICON_PLACEMENT_CANNY_HIGH', '120'))
+
 # Enable per-frame CPU extraction for processors
 ENABLE_FRAME_PROCESSING = os.getenv('HICON_ENABLE_FRAME_PROCESSING', 'true').lower() == 'true'
 

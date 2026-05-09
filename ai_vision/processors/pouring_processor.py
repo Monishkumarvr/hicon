@@ -59,7 +59,7 @@ class PouringProcessor:
     def __init__(self, db_manager, config, screenshot_dir: str, heat_cycle_manager=None,
                  camera_id_override: str = None, enable_display_meta: bool = True,
                  screenshot_writer=None, frame_width_hint: int = None,
-                 frame_height_hint: int = None):
+                 frame_height_hint: int = None, placement_detector=None):
         self.db_manager = db_manager
         self.config = config
         self.enable_display_meta = enable_display_meta
@@ -151,6 +151,11 @@ class PouringProcessor:
 
         # Heat cycle manager (shared, injected from pipeline)
         self.heat_cycle_manager = heat_cycle_manager
+
+        # Mould placement detector (optional, injected from pipeline).
+        # Rollback: set HICON_MOULD_TRACKING_MODE=reactive — placement detector runs silently.
+        self.placement_detector = placement_detector
+        self._active_placement_blob_id: Optional[int] = None
 
         # --- Trolley locking state ---
         self.locked_trolley_id: Optional[int] = None
@@ -790,6 +795,12 @@ class PouringProcessor:
         self.session_start_datetime = datetime_obj
         self.mouth_inside_since = None
 
+        # Placement detector: capture initial trolley baseline
+        if self.placement_detector is not None and trolley is not None:
+            self.placement_detector.on_session_start(
+                frame, trolley.get('bbox'), timestamp
+            )
+
         tid = trolley['track_id'] if trolley else '?'
         logger.info(
             f"[session] START - mouth inside trolley T{tid} "
@@ -841,6 +852,9 @@ class PouringProcessor:
 
         if self.heat_cycle_manager:
             self.heat_cycle_manager.notify_session_ended()
+
+        if self.placement_detector is not None:
+            self.placement_detector.on_session_end()
 
     # =========================================================================
     # Sub-system 2: Pour Detector (multi-probe)
@@ -1631,6 +1645,12 @@ class PouringProcessor:
         if target_trolley and best_mouth:
             self._set_anchor_on_pour_start(best_mouth, target_trolley)
 
+        # Placement detector: capture pre-pour snapshot, detect new mould blob
+        if self.placement_detector is not None and target_trolley is not None:
+            self._active_placement_blob_id = self.placement_detector.on_pour_start(
+                frame, target_trolley.get('bbox'), timestamp
+            )
+
         logger.info(
             f"[pour] START - brightness={brightness:.0f}>{self.brightness_start} "
             f"at ({probe_x},{probe_y}), trolley_locked={self.trolley_locked}"
@@ -1697,6 +1717,7 @@ class PouringProcessor:
 
         if duration < self.pour_min_dur:
             logger.info(f"[pour] DISCARDED - duration={duration:.1f}s < {self.pour_min_dur}s minimum")
+            self._active_placement_blob_id = None
             if self.pour_sync_id:
                 try:
                     self.db_manager.delete_pouring_event(self.pour_sync_id)
@@ -1775,10 +1796,42 @@ class PouringProcessor:
             )
         self._pour_start_time_wall = None  # Clear for next pour
 
+        # Placement detector: close pour, cross-validate, compute effective count
+        predictive_count = None
+        if self.placement_detector is not None:
+            self.placement_detector.on_pour_end(self._active_placement_blob_id, duration)
+            self._active_placement_blob_id = None
+            predictive_count = self.placement_detector.get_poured_blob_count()
+            if predictive_count == self.mould_count:
+                logger.info(
+                    "[placement] CONFIRMED: predictive=%d == reactive=%d",
+                    predictive_count, self.mould_count,
+                )
+            else:
+                logger.warning(
+                    "[placement] DIVERGE: predictive=%d vs reactive=%d",
+                    predictive_count, self.mould_count,
+                )
+
+        # Tracking-mode-aware effective mould count:
+        #   reactive (default) → existing cluster-based count (no change)
+        #   predictive         → placement-based count
+        #   hybrid             → placement-based if detected; reactive otherwise
+        # Rollback: HICON_MOULD_TRACKING_MODE=reactive restores old output instantly.
+        tracking_mode = getattr(self.config, 'MOULD_TRACKING_MODE', 'reactive')
+        effective_mould_count = self.mould_count
+        if predictive_count is not None:
+            if tracking_mode == 'predictive':
+                effective_mould_count = predictive_count
+            elif tracking_mode == 'hybrid' and predictive_count > 0:
+                effective_mould_count = predictive_count
+
         # DB update
         try:
             mould_wise = {
-                "mould_count": self.mould_count,
+                "mould_count": effective_mould_count,
+                "reactive_mould_count": self.mould_count,
+                "predictive_mould_count": predictive_count,
                 "clustered_mould_count": self.clustered_mould_count,
                 "last_pour_duration": round(duration, 1),
                 "moulds": self._get_mould_breakdown(),
@@ -1985,6 +2038,9 @@ class PouringProcessor:
         self._clear_active_probe_state()
         self._relock_candidate_id = None
         self._relock_candidate_since = None
+        self._active_placement_blob_id = None
+        if self.placement_detector is not None:
+            self.placement_detector.on_cycle_reset()
         logger.info("[cycle] All state reset — ready for new pouring cycle")
 
     # =========================================================================
