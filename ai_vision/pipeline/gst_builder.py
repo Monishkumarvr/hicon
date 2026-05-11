@@ -1091,6 +1091,16 @@ class DeepStreamPipelineBuilder:
 
                 # Tracker for pouring
                 if not self.stream0_bypass_tracker:
+                    # rtspsrc path: nvtracker rejects caps events that arrive dynamically
+                    # during PLAYING state (camera connects after PLAYING with rtspsrc).
+                    # nvvideoconvert handles late/dynamic caps negotiation gracefully and
+                    # preserves NvDsBatchMeta — inserting it between nvinfer and tracker
+                    # absorbs the dynamic caps change before tracker sees it.
+                    if not self.use_nvurisrcbin_0:
+                        self.elements['nvvidconv_pre_tracker_0'] = Gst.ElementFactory.make(
+                            "nvvideoconvert", "nvvidconv-pre-tracker-0"
+                        )
+                        logger.info("Stream 0: nvvideoconvert inserted between pgie and tracker (rtspsrc caps bridge)")
                     self.elements['tracker_0'] = Gst.ElementFactory.make("nvtracker", "tracker-0")
                     self.elements['tracker_0'].set_property('ll-lib-file', self.config['tracker_lib'])
                     self.elements['tracker_0'].set_property('ll-config-file', self.stream0_tracker_config)
@@ -1584,6 +1594,9 @@ class DeepStreamPipelineBuilder:
                     chain_0.append((stream0_head, 'pgie_pouring'))
                     stream0_head = 'pgie_pouring'
                 if not self.stream0_bypass_tracker:
+                    if 'nvvidconv_pre_tracker_0' in self.elements:
+                        chain_0.append((stream0_head, 'nvvidconv_pre_tracker_0'))
+                        stream0_head = 'nvvidconv_pre_tracker_0'
                     chain_0.append((stream0_head, 'tracker_0'))
                     stream0_head = 'tracker_0'
                 if self.stream0_decoupled_analysis_mode:

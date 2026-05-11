@@ -2081,6 +2081,7 @@ def main():
             bus_handler.update_frame_time(_sid)
     bus_handler.start_watchdog(interval_sec=60)
     bus_handler.start_fps_logger()
+
     if config.ENABLE_DEBUG_PROBES:
         def _log_debug_memory_snapshot():
             _log_memory_snapshot("periodic")
