@@ -1077,7 +1077,7 @@ class DeepStreamPipelineBuilder:
                     height=self.stream0_mux_height,
                 )
                 if not self.use_nvurisrcbin_0:
-                    self._tune_stream0_mux_for_cp_plus(self.elements['mux_0'])
+                    logger.info("Stream 0: rtspsrc path — skipping CP Plus mux tuning (async-process stays True for Hikvision)")
                 else:
                     logger.info("Stream 0: skipping CP Plus mux tuning for nvurisrcbin (async-process=False blocks reconnection)")
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")

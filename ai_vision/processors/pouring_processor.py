@@ -1720,7 +1720,7 @@ class PouringProcessor:
             self._active_placement_blob_id = None
             if self.pour_sync_id:
                 try:
-                    self.db_manager.delete_pouring_event(self.pour_sync_id)
+                    self.db_manager.delete_pouring_event(sync_id=self.pour_sync_id)
                 except Exception as e:
                     logger.warning(f"[pour] Failed to clean up discarded pour row: {e}")
                 self.pour_sync_id = None
