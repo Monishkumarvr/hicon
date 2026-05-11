@@ -353,11 +353,24 @@ class DeepStreamPipelineBuilder:
 
         uribin.set_property('uri', rtsp_url)
         uribin.set_property('type', 2)  # rtsp source type
-        # All streams use 2s reconnect interval. Stream 0 was previously 10s to avoid
-        # a "reconnect loop" at high resolution, but log analysis proved drops are caused
-        # by the camera's 300s firmware session timer (not backpressure). At 10s, each
-        # session reset causes a 15-50s visible stall. At 2s, stream 0 recovers like
-        # stream 2 (same timer, same camera, just different resolution DPB realloc time).
+        # nvurisrcbin does not expose do-rtsp-keep-alive directly. Without keep-alive,
+        # the camera closes the RTSP session after its 300s inactivity timer, causing
+        # stream 0 to drop every 5 min. We intercept the internal rtspsrc child via
+        # deep-element-added and set the property on it as soon as it is created.
+        # rtspsrc elements that don't have this property silently skip the set attempt.
+        def _set_keepalive(bin_, subbin, element, sid=stream_id):
+            if element is None:
+                return
+            try:
+                element.set_property('do-rtsp-keep-alive', True)
+                logger.info(
+                    "Stream %s: nvurisrcbin child '%s': do-rtsp-keep-alive=True",
+                    sid, element.get_name(),
+                )
+            except Exception:
+                pass
+        uribin.connect('deep-element-added', _set_keepalive)
+
         reconnect_s = 2
         uribin.set_property('rtsp-reconnect-interval', reconnect_s)
         uribin.set_property('rtsp-reconnect-attempts', -1)  # unlimited
