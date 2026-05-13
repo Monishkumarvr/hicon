@@ -107,6 +107,15 @@ class PouringProcessor:
         self.cluster_backtrack_guard = int(getattr(config, 'CLUSTER_BACKTRACK_CID_GUARD', 1))
         self.mould_switch_min_pour = config.MOULD_SWITCH_MIN_POUR_S
         self.min_cluster_pour_s = config.MIN_CLUSTER_POUR_S
+        self.mould_count_mode = str(getattr(config, 'MOULD_COUNT_MODE', 'physical')).lower()
+        self.physical_fast_median_s = float(getattr(config, 'PHYSICAL_FAST_MEDIAN_S', 5.0))
+        self.physical_fast_p75_s = float(getattr(config, 'PHYSICAL_FAST_P75_S', 6.5))
+        self.physical_fast_inflation = float(getattr(config, 'PHYSICAL_FAST_INFLATION', 1.35))
+        self.physical_near_raw_median_s = float(getattr(config, 'PHYSICAL_NEAR_RAW_MEDIAN_S', 7.5))
+        self.physical_near_raw_p75_s = float(getattr(config, 'PHYSICAL_NEAR_RAW_P75_S', 8.5))
+        self.physical_topup_p75_s = float(getattr(config, 'PHYSICAL_TOPUP_P75_S', 14.0))
+        self.physical_topup_min_diff = int(getattr(config, 'PHYSICAL_TOPUP_MIN_DIFF', 5))
+        self.physical_rescue_skip_p75_s = float(getattr(config, 'PHYSICAL_RESCUE_SKIP_P75_S', 9.0))
         self.split_cooldown_s = float(getattr(config, 'MOULD_SPLIT_COOLDOWN_S', 1.5))
         self.split_rearm_baseline_s = float(getattr(config, 'MOULD_SPLIT_REARM_BASELINE_S', 0.5))
         self.split_dom_ratio = float(getattr(config, 'MOULD_SPLIT_DOM_RATIO', 1.35))
@@ -252,6 +261,8 @@ class PouringProcessor:
         self.completed_segments: List[Dict[str, Any]] = []
         self._active_segment: Optional[Dict[str, Any]] = None
         self._synced_mould_slot_ids = set()
+        self._last_cluster_build_stats: Dict[str, Any] = {}
+        self._last_physical_count_result: Dict[str, Any] = {}
         self._pour_start_time_wall = None  # Wall-clock timestamp for live overlay display
 
         logger.info("PouringProcessor initialized (aligned with standalone doc)")
@@ -271,6 +282,13 @@ class PouringProcessor:
         logger.info(
             f"  Mould: disp>{self.displacement_thresh}, sustained={self.sustained_dur}s, "
             f"min_pour={self.mould_switch_min_pour}s, backtrack_guard={self.cluster_backtrack_guard}"
+        )
+        logger.info(
+            "  Mould official count: mode=%s fast_med<=%.1fs fast_p75<=%.1fs topup_p75>=%.1fs",
+            self.mould_count_mode,
+            self.physical_fast_median_s,
+            self.physical_fast_p75_s,
+            self.physical_topup_p75_s,
         )
         logger.info(
             f"  Clustering: r_cluster={self.r_cluster:.3f}, r_merge_x={self.r_merge_x:.3f}, "
@@ -1216,11 +1234,17 @@ class PouringProcessor:
             return ((xs[mid - 1] + xs[mid]) / 2.0, (ys[mid - 1] + ys[mid]) / 2.0)
         return (xs[mid], ys[mid])
 
+    def _current_trolley_wh(self):
+        if self.locked_trolley_bbox:
+            x1, y1, x2, y2 = self.locked_trolley_bbox
+            return (max(float(x2 - x1), 1.0), max(float(y2 - y1), 1.0))
+        return (float(self.pour_ref_width), float(self.pour_ref_height))
+
     def _append_active_mould_sample(self, timestamp, datetime_obj, mouth, trolley):
         if self._active_segment is None or mouth is None or trolley is None:
             return
         try:
-            norm_x, norm_y, _, _ = self._normalize_mouth_position(mouth, trolley)
+            norm_x, norm_y, trolley_w, trolley_h = self._normalize_mouth_position(mouth, trolley)
         except Exception:
             return
 
@@ -1228,16 +1252,148 @@ class PouringProcessor:
         if samples and abs(samples[-1]["time"] - timestamp) < 1e-6:
             samples[-1]["norm"] = (norm_x, norm_y)
             samples[-1]["datetime"] = datetime_obj
+            samples[-1]["trolley_wh"] = (float(trolley_w), float(trolley_h))
         else:
             samples.append(
                 {
                     "time": float(timestamp),
                     "datetime": datetime_obj,
                     "norm": (norm_x, norm_y),
+                    "trolley_wh": (float(trolley_w), float(trolley_h)),
                 }
             )
         self._active_segment["end_time"] = float(timestamp)
         self._active_segment["end_datetime"] = datetime_obj
+
+    @staticmethod
+    def _duration_stats(durations):
+        values = sorted(float(d) for d in durations if d is not None and float(d) >= 0.0)
+        if not values:
+            return {"count": 0, "median": 0.0, "p75": 0.0, "total": 0.0}
+        return {
+            "count": len(values),
+            "median": float(np.percentile(values, 50)),
+            "p75": float(np.percentile(values, 75)),
+            "total": float(sum(values)),
+        }
+
+    @staticmethod
+    def _physical_reducer_defaults():
+        return {
+            "fast_median_s": 5.0,
+            "fast_p75_s": 6.5,
+            "fast_inflation": 1.35,
+            "near_raw_median_s": 7.5,
+            "near_raw_p75_s": 8.5,
+            "topup_p75_s": 14.0,
+            "topup_min_diff": 5,
+        }
+
+    def _physical_reducer_thresholds(self):
+        thresholds = self._physical_reducer_defaults()
+        thresholds.update(
+            {
+                "fast_median_s": self.physical_fast_median_s,
+                "fast_p75_s": self.physical_fast_p75_s,
+                "fast_inflation": self.physical_fast_inflation,
+                "near_raw_median_s": self.physical_near_raw_median_s,
+                "near_raw_p75_s": self.physical_near_raw_p75_s,
+                "topup_p75_s": self.physical_topup_p75_s,
+                "topup_min_diff": self.physical_topup_min_diff,
+            }
+        )
+        return thresholds
+
+    @staticmethod
+    def compute_physical_mould_count(
+        clustered_count,
+        reactive_count,
+        predictive_count=None,
+        durations=None,
+        baseline_cluster_count=None,
+        rescue_cluster_count=None,
+        duration_stats=None,
+        mode="physical",
+        thresholds=None,
+    ):
+        """Choose official count from raw actions, clusters, and cadence diagnostics."""
+        thresholds = {**PouringProcessor._physical_reducer_defaults(), **(thresholds or {})}
+        clustered = max(0, int(clustered_count or 0))
+        raw = max(0, int(reactive_count or 0))
+        predictive = int(predictive_count or 0)
+        baseline = int(baseline_cluster_count if baseline_cluster_count is not None else clustered)
+        rescue = int(rescue_cluster_count if rescue_cluster_count is not None else clustered)
+        stats = duration_stats or PouringProcessor._duration_stats(durations or [])
+        median = float(stats.get("median", 0.0) or 0.0)
+        p75 = float(stats.get("p75", 0.0) or 0.0)
+        diff = max(0, raw - clustered)
+
+        diagnostics = {
+            "mode": str(mode or "physical").lower(),
+            "reactive_mould_count": raw,
+            "clustered_mould_count": clustered,
+            "pour_action_count": raw,
+            "predictive_mould_count": predictive_count,
+            "baseline_cluster_count": baseline,
+            "rescue_cluster_count": rescue,
+            "duration_stats": {
+                "count": int(stats.get("count", 0) or 0),
+                "median": round(median, 2),
+                "p75": round(p75, 2),
+                "total": round(float(stats.get("total", 0.0) or 0.0), 2),
+            },
+            "thresholds": thresholds,
+            "reason": "legacy_clustered",
+        }
+
+        if diagnostics["mode"] != "physical":
+            diagnostics["official_physical_mould_count"] = clustered
+            return clustered, diagnostics
+
+        official = clustered
+        reason = "clustered_baseline"
+
+        if raw <= 0:
+            official = clustered
+            reason = "empty_or_no_raw_actions"
+        elif raw <= 8 and clustered <= 4:
+            if predictive >= 2:
+                official = predictive
+            elif clustered >= 4 and raw <= 5:
+                official = max(1, clustered - 1)
+            else:
+                official = min(raw, clustered + 1)
+            reason = "tiny_partial_conservative"
+        elif raw >= 20 and median <= thresholds["fast_median_s"] and p75 <= thresholds["fast_p75_s"]:
+            official = int(math.ceil(raw * float(thresholds["fast_inflation"])))
+            reason = "fast_short_train_inflated_from_split_cadence"
+        elif (
+            raw >= 20
+            and raw > 0
+            and clustered / raw < 0.90
+            and median <= thresholds["near_raw_median_s"]
+            and p75 <= thresholds["near_raw_p75_s"]
+        ):
+            official = raw + min(2, int(math.ceil(diff / 3.0)))
+            reason = "fast_near_raw_split_recovery"
+        elif p75 >= thresholds["topup_p75_s"] and diff >= int(thresholds["topup_min_diff"]):
+            if baseline and baseline < clustered:
+                official = baseline
+                reason = "long_topup_prefer_baseline_over_rescue"
+            elif clustered <= 7:
+                official = clustered + 1
+                reason = "long_tiny_topup_conservative_plus_one"
+            else:
+                official = max(1, clustered - max(1, int(round(diff / 3.0))))
+                reason = "long_topup_suppress_raw_action_overcount"
+        elif baseline and baseline < clustered and p75 >= 9.0 and median >= thresholds["fast_median_s"]:
+            official = baseline
+            reason = "rescue_suppressed_for_slow_cadence"
+
+        official = max(0, int(official))
+        diagnostics["official_physical_mould_count"] = official
+        diagnostics["reason"] = reason
+        return official, diagnostics
 
     def _split_segment_by_motion(self, segment, out):
         samples = [sample for sample in segment.get("samples", []) if sample.get("norm") is not None]
@@ -1246,13 +1402,34 @@ class PouringProcessor:
             return
 
         anchor_x, anchor_y = samples[0]["norm"]
+        anchor_wh = samples[0].get("trolley_wh") or self._current_trolley_wh()
+        has_trolley_geometry = bool(samples[0].get("trolley_wh"))
+        anchor_tw = max(float(anchor_wh[0]), 1.0) if anchor_wh else 1.0
+        anchor_th = max(float(anchor_wh[1]), 1.0) if anchor_wh else 1.0
         hold = 0
+        held_axis = ""
+        held_dx_px = 0.0
+        held_dy_px = 0.0
         for idx in range(1, len(samples)):
             curr_x, curr_y = samples[idx]["norm"]
-            if math.sqrt((curr_x - anchor_x) ** 2 + (curr_y - anchor_y) ** 2) > self.displacement_thresh:
+            dx_norm = curr_x - anchor_x
+            dy_norm = curr_y - anchor_y
+            dx_px = abs(dx_norm) * anchor_tw
+            dy_px = abs(dy_norm) * anchor_th
+            moved_by_norm = math.sqrt(dx_norm ** 2 + dy_norm ** 2) > self.displacement_thresh
+            moved_by_axis = has_trolley_geometry and (dx_px >= self.split_min_dx_px or dy_px >= self.split_min_dy_px)
+            after_cooldown = (
+                not has_trolley_geometry
+                or (samples[idx]["time"] - samples[0]["time"]) >= self.split_cooldown_s
+            )
+            if after_cooldown and (moved_by_norm or moved_by_axis):
                 hold += 1
+                held_dx_px = dx_px
+                held_dy_px = dy_px
+                held_axis = "x" if dx_px >= dy_px else "y"
             else:
                 hold = 0
+                held_axis = ""
 
             if hold >= self.sustained_hold_frames:
                 split_idx = idx - self.sustained_hold_frames
@@ -1260,6 +1437,10 @@ class PouringProcessor:
                 right_samples = samples[split_idx + 1:]
                 if not left_samples or not right_samples:
                     break
+                left_duration = left_samples[-1]["time"] - left_samples[0]["time"]
+                right_duration = right_samples[-1]["time"] - right_samples[0]["time"]
+                if has_trolley_geometry and (left_duration < self.pour_min_dur or right_duration < self.pour_min_dur):
+                    continue
 
                 left = {
                     "start_time": left_samples[0]["time"],
@@ -1268,6 +1449,9 @@ class PouringProcessor:
                     "end_datetime": left_samples[-1]["datetime"],
                     "samples": left_samples,
                     "ladle_track_id": segment.get("ladle_track_id", 0),
+                    "split_axis": held_axis,
+                    "split_dx_px": held_dx_px,
+                    "split_dy_px": held_dy_px,
                 }
                 right = {
                     "start_time": right_samples[0]["time"],
@@ -1276,6 +1460,9 @@ class PouringProcessor:
                     "end_datetime": right_samples[-1]["datetime"],
                     "samples": right_samples,
                     "ladle_track_id": segment.get("ladle_track_id", 0),
+                    "split_axis": held_axis,
+                    "split_dx_px": held_dx_px,
+                    "split_dy_px": held_dy_px,
                 }
                 out.append(left)
                 self._split_segment_by_motion(right, out)
@@ -1411,6 +1598,12 @@ class PouringProcessor:
         for segment in segments:
             self._split_segment_by_motion(segment, split_segments)
 
+        valid_durations = [
+            self._segment_duration(seg)
+            for seg in split_segments
+            if self._segment_duration(seg) >= self.pour_min_dur
+            and self._segment_representative_point(seg) is not None
+        ]
         valid_segment_count = sum(
             1 for seg in split_segments
             if self._segment_duration(seg) >= self.pour_min_dur
@@ -1450,27 +1643,180 @@ class PouringProcessor:
 
         # Rescue refinement: only for heavily over-collapsed heats
         baseline_count = len(merged)
+        duration_stats = self._duration_stats(valid_durations)
+        rescue_applied = False
+        rescue_skipped_reason = ""
         if (valid_segment_count >= 18
                 and baseline_count > 0
                 and baseline_count / valid_segment_count <= 0.65
                 and valid_segment_count - baseline_count >= 8):
-            merged = self._rescue_refine_clusters(merged)
-            logger.info(
-                "Cluster rescue: segs=%d baseline=%d refined=%d ratio=%.2f gap=%d",
-                valid_segment_count, baseline_count, len(merged),
-                baseline_count / valid_segment_count,
-                valid_segment_count - baseline_count,
+            slow_topup = (
+                self.mould_count_mode == "physical"
+                and duration_stats["p75"] >= self.physical_rescue_skip_p75_s
             )
+            if slow_topup:
+                rescue_skipped_reason = "slow_topup_physical_mode"
+                logger.info(
+                    "Cluster rescue skipped: segs=%d baseline=%d ratio=%.2f p75=%.1fs",
+                    valid_segment_count,
+                    baseline_count,
+                    baseline_count / valid_segment_count,
+                    duration_stats["p75"],
+                )
+            else:
+                merged = self._rescue_refine_clusters(merged)
+                rescue_applied = True
+                logger.info(
+                    "Cluster rescue: segs=%d baseline=%d refined=%d ratio=%.2f gap=%d",
+                    valid_segment_count, baseline_count, len(merged),
+                    baseline_count / valid_segment_count,
+                    valid_segment_count - baseline_count,
+                )
 
         valid = []
         for cluster in merged:
             total_duration = sum(self._segment_duration(seg) for seg in cluster["segments"])
             if total_duration >= self.min_cluster_pour_s:
                 valid.append(cluster)
+        self._last_cluster_build_stats = {
+            "valid_segment_count": valid_segment_count,
+            "baseline_cluster_count": baseline_count,
+            "rescue_cluster_count": len(merged),
+            "clustered_count": len(valid),
+            "rescue_applied": rescue_applied,
+            "rescue_skipped_reason": rescue_skipped_reason,
+            "duration_stats": duration_stats,
+        }
         return valid
+
+    def _compute_current_physical_count(self, predictive_count=None):
+        durations = [float(record.get("duration_s", 0.0) or 0.0) for record in self.mould_records]
+        stats = self._last_cluster_build_stats or {}
+        official, diagnostics = self.compute_physical_mould_count(
+            clustered_count=self.clustered_mould_count,
+            reactive_count=len(self.mould_records),
+            predictive_count=predictive_count,
+            durations=durations,
+            baseline_cluster_count=stats.get("baseline_cluster_count", self.clustered_mould_count),
+            rescue_cluster_count=stats.get("rescue_cluster_count", self.clustered_mould_count),
+            duration_stats=stats.get("duration_stats") or self._duration_stats(durations),
+            mode=self.mould_count_mode,
+            thresholds=self._physical_reducer_thresholds(),
+        )
+        diagnostics["cluster_build"] = stats
+        self._last_physical_count_result = diagnostics
+        return official, diagnostics
+
+    @staticmethod
+    def _interpolate_datetime(start_dt, end_dt, ratio):
+        if start_dt is None:
+            return end_dt
+        if end_dt is None:
+            return start_dt
+        try:
+            return start_dt + ((end_dt - start_dt) * float(ratio))
+        except Exception:
+            return start_dt
+
+    def _physical_record_from_span(self, mould_no, source, start_time, end_time, start_dt, end_dt, duration_s):
+        ladle_track_id = int(source.get("ladle_track_id") or self.locked_trolley_id or 0)
+        return {
+            "mould_id": f"MOULD_P{int(mould_no):03d}",
+            "mould_track_id": ladle_track_id,
+            "ladle_track_id": ladle_track_id,
+            "start_time": float(start_time),
+            "start_datetime": start_dt,
+            "end_time": float(end_time),
+            "end_datetime": end_dt,
+            "duration_seconds": round(float(duration_s), 2),
+            "sync_id": self.pour_sync_id or "",
+            "slno": int(self.pour_slno or 0),
+        }
+
+    def _build_official_pouring_records(self, target_count):
+        raw_records = sorted(
+            self.mould_records,
+            key=lambda record: (float(record.get("start_time_wall", 0.0)), float(record.get("end_time_wall", 0.0))),
+        )
+        raw_count = len(raw_records)
+        target = max(0, int(target_count or 0))
+        if target <= 0 or raw_count <= 0:
+            return []
+
+        official = []
+        if target <= raw_count:
+            for mould_no in range(1, target + 1):
+                start_idx = int(round((mould_no - 1) * raw_count / target))
+                end_idx = int(round(mould_no * raw_count / target))
+                group = raw_records[start_idx:max(start_idx + 1, end_idx)]
+                start_rec = min(group, key=lambda record: float(record.get("start_time_wall", 0.0)))
+                end_rec = max(group, key=lambda record: float(record.get("end_time_wall", 0.0)))
+                duration = sum(float(record.get("duration_s", 0.0) or 0.0) for record in group)
+                official.append(
+                    self._physical_record_from_span(
+                        mould_no,
+                        start_rec,
+                        start_rec.get("start_time_wall", 0.0),
+                        end_rec.get("end_time_wall", start_rec.get("start_time_wall", 0.0)),
+                        start_rec.get("start_datetime_obj"),
+                        end_rec.get("end_datetime_obj"),
+                        duration,
+                    )
+                )
+            return official
+
+        split_counts = [1] * raw_count
+        durations = [max(float(record.get("duration_s", 0.0) or 0.0), 0.01) for record in raw_records]
+        for _ in range(target - raw_count):
+            idx = max(range(raw_count), key=lambda pos: durations[pos] / split_counts[pos])
+            split_counts[idx] += 1
+
+        mould_no = 1
+        for record, parts in zip(raw_records, split_counts):
+            start_time = float(record.get("start_time_wall", 0.0))
+            end_time = float(record.get("end_time_wall", start_time))
+            span = max(end_time - start_time, 0.0)
+            total_duration = float(record.get("duration_s", span) or span)
+            for part_idx in range(parts):
+                left_ratio = part_idx / parts
+                right_ratio = (part_idx + 1) / parts
+                part_start = start_time + span * left_ratio
+                part_end = start_time + span * right_ratio
+                official.append(
+                    self._physical_record_from_span(
+                        mould_no,
+                        record,
+                        part_start,
+                        part_end,
+                        self._interpolate_datetime(record.get("start_datetime_obj"), record.get("end_datetime_obj"), left_ratio),
+                        self._interpolate_datetime(record.get("start_datetime_obj"), record.get("end_datetime_obj"), right_ratio),
+                        total_duration / parts,
+                    )
+                )
+                mould_no += 1
+        return official
 
     def _sync_mould_records_to_heat_cycle(self):
         if not self.heat_cycle_manager:
+            return
+
+        if self.mould_count_mode == "physical" and hasattr(self.heat_cycle_manager, "replace_mould_pourings"):
+            predictive_count = None
+            if self.placement_detector is not None:
+                try:
+                    predictive_count = self.placement_detector.get_poured_blob_count()
+                except Exception:
+                    predictive_count = None
+            official_count, diagnostics = self._compute_current_physical_count(predictive_count)
+            records = self._build_official_pouring_records(official_count)
+            self.heat_cycle_manager.replace_mould_pourings(
+                records,
+                reason=(
+                    f"{diagnostics.get('reason')} official={official_count} "
+                    f"raw={len(self.mould_records)} clustered={self.clustered_mould_count}"
+                ),
+            )
+            self._synced_mould_slot_ids = {f"P{idx}" for idx in range(1, len(records) + 1)}
             return
 
         # Group segments by spatial cluster — one MouldPouringRecord per cluster.
@@ -1542,9 +1888,9 @@ class PouringProcessor:
                         "start_iso": segment["start_datetime"].isoformat() if segment["start_datetime"] else "",
                         "end_iso": segment["end_datetime"].isoformat() if segment["end_datetime"] else "",
                         "duration_s": round(self._segment_duration(segment), 2),
-                        "split_axis": "",
-                        "split_dx_px": 0.0,
-                        "split_dy_px": 0.0,
+                        "split_axis": str(segment.get("split_axis", "")),
+                        "split_dx_px": float(segment.get("split_dx_px", 0.0) or 0.0),
+                        "split_dy_px": float(segment.get("split_dy_px", 0.0) or 0.0),
                         "start_norm": segment["samples"][0]["norm"] if segment["samples"] else None,
                         "end_norm": segment["samples"][-1]["norm"] if segment["samples"] else None,
                         "rep_norm": rep,
@@ -1813,14 +2159,26 @@ class PouringProcessor:
                     predictive_count, self.mould_count,
                 )
 
-        # Tracking-mode-aware effective mould count:
-        #   reactive (default) → existing cluster-based count (no change)
+        physical_count, physical_diagnostics = self._compute_current_physical_count(predictive_count)
+        if self.mould_count_mode == "physical" and self.heat_cycle_manager and hasattr(self.heat_cycle_manager, "replace_mould_pourings"):
+            official_records = self._build_official_pouring_records(physical_count)
+            self.heat_cycle_manager.replace_mould_pourings(
+                official_records,
+                reason=(
+                    f"{physical_diagnostics.get('reason')} official={physical_count} "
+                    f"raw={len(self.mould_records)} clustered={self.clustered_mould_count}"
+                ),
+            )
+
+        # Tracking-mode-aware effective mould count when legacy official mode is used:
+        #   reactive (default) → existing cluster-based count
         #   predictive         → placement-based count
         #   hybrid             → placement-based if detected; reactive otherwise
-        # Rollback: HICON_MOULD_TRACKING_MODE=reactive restores old output instantly.
         tracking_mode = getattr(self.config, 'MOULD_TRACKING_MODE', 'reactive')
         effective_mould_count = self.mould_count
-        if predictive_count is not None:
+        if self.mould_count_mode == "physical":
+            effective_mould_count = physical_count
+        elif predictive_count is not None:
             if tracking_mode == 'predictive':
                 effective_mould_count = predictive_count
             elif tracking_mode == 'hybrid' and predictive_count > 0:
@@ -1833,6 +2191,13 @@ class PouringProcessor:
                 "reactive_mould_count": self.mould_count,
                 "predictive_mould_count": predictive_count,
                 "clustered_mould_count": self.clustered_mould_count,
+                "pour_action_count": len(self.mould_records),
+                "baseline_cluster_count": physical_diagnostics.get("baseline_cluster_count"),
+                "rescue_cluster_count": physical_diagnostics.get("rescue_cluster_count"),
+                "official_physical_mould_count": physical_count,
+                "physical_count_mode": self.mould_count_mode,
+                "physical_count_reason": physical_diagnostics.get("reason"),
+                "physical_count_diagnostics": physical_diagnostics,
                 "last_pour_duration": round(duration, 1),
                 "moulds": self._get_mould_breakdown(),
             }
@@ -1938,6 +2303,14 @@ class PouringProcessor:
 
     def _get_mould_breakdown(self):
         """Return per-mould timings with cluster and split-axis attribution."""
+        def _round_point(point):
+            if point is None:
+                return None
+            try:
+                return [round(float(point[0]), 4), round(float(point[1]), 4)]
+            except Exception:
+                return None
+
         breakdown = []
         for rec in self.mould_records:
             cluster = rec.get("cluster_id")
@@ -1952,6 +2325,9 @@ class PouringProcessor:
                     "end": rec.get("end_iso", ""),
                     "split_dx_px": round(float(rec.get("split_dx_px", 0.0)), 1),
                     "split_dy_px": round(float(rec.get("split_dy_px", 0.0)), 1),
+                    "start_norm": _round_point(rec.get("start_norm")),
+                    "end_norm": _round_point(rec.get("end_norm")),
+                    "rep_norm": _round_point(rec.get("rep_norm")),
                 }
             )
         return breakdown
@@ -2024,6 +2400,8 @@ class PouringProcessor:
         self.mould_completed_times.clear()
         self.mould_count = 0
         self.clustered_mould_count = 0
+        self._last_cluster_build_stats = {}
+        self._last_physical_count_result = {}
         self.next_mould_id = 1
         self.last_split_time = None
         self._last_mould_disp_log_ts = None

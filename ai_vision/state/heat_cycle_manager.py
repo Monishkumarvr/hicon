@@ -767,6 +767,46 @@ class HeatCycleManager:
 
         logger.warning(f"Could not find active pouring for {mould_id} in {cycle.heat_no}")
         return False
+
+    def replace_mould_pourings(self, records: List[Dict], reason: str = "") -> bool:
+        """Replace active-cycle mould pourings with finalized physical-count records."""
+        if self.active_cycle is None:
+            logger.warning("Cannot replace mould pourings: no active cycle")
+            return False
+
+        cycle = self.active_cycle
+        pourings: List[MouldPouringRecord] = []
+        for record in records:
+            try:
+                ladle_track_id = int(record.get("ladle_track_id") or record.get("mould_track_id") or 0)
+                pouring = MouldPouringRecord(
+                    mould_id=str(record["mould_id"]),
+                    mould_track_id=int(record.get("mould_track_id") or ladle_track_id),
+                    start_time=float(record["start_time"]),
+                    start_datetime=record["start_datetime"],
+                    end_time=float(record["end_time"]) if record.get("end_time") is not None else None,
+                    end_datetime=record.get("end_datetime"),
+                    duration_seconds=float(record.get("duration_seconds") or 0.0),
+                    sync_id=str(record.get("sync_id") or ""),
+                    slno=int(record.get("slno") or 0),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Skipping invalid physical mould record: %s (%s)", record, exc)
+                continue
+
+            pourings.append(pouring)
+            if ladle_track_id > 0 and ladle_track_id not in cycle.ladle_track_ids:
+                cycle.ladle_track_ids.append(ladle_track_id)
+
+        cycle.mould_pourings = pourings
+        logger.info(
+            "  📊 Replaced %s mould pourings with %d physical moulds%s",
+            cycle.heat_no,
+            len(pourings),
+            f" ({reason})" if reason else "",
+        )
+        self._maybe_checkpoint()
+        return True
     
     def check_and_finalize_cycles(self, current_time: float, current_datetime: datetime) -> List[HeatCycle]:
         """
