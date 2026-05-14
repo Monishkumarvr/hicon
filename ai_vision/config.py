@@ -152,32 +152,16 @@ MOULD_SWITCH_MIN_POUR_S = float(os.getenv('HICON_MOULD_SWITCH_MIN_POUR', '2.0'))
 # Minimum cumulative pour time per mould cluster (offline parity filter)
 MIN_CLUSTER_POUR_S = float(os.getenv('HICON_MIN_CLUSTER_POUR_S', '1.5'))
 
-# Official mould count mode:
-#   legacy   — keep current heat-cycle/API count from spatial clusters
-#   physical — choose physical mould count from raw/cluster/top-up diagnostics
-MOULD_COUNT_MODE = os.getenv('HICON_MOULD_COUNT_MODE', 'physical').lower()
-
-# Physical count reducer thresholds. These are intentionally environment-driven
-# so site tuning can be done without code changes.
-PHYSICAL_FAST_MEDIAN_S = float(os.getenv('HICON_PHYSICAL_FAST_MEDIAN_S', '5.0'))
-PHYSICAL_FAST_P75_S = float(os.getenv('HICON_PHYSICAL_FAST_P75_S', '6.5'))
-PHYSICAL_FAST_INFLATION = float(os.getenv('HICON_PHYSICAL_FAST_INFLATION', '1.35'))
-PHYSICAL_NEAR_RAW_MEDIAN_S = float(os.getenv('HICON_PHYSICAL_NEAR_RAW_MEDIAN_S', '7.5'))
-PHYSICAL_NEAR_RAW_P75_S = float(os.getenv('HICON_PHYSICAL_NEAR_RAW_P75_S', '8.5'))
-PHYSICAL_TOPUP_P75_S = float(os.getenv('HICON_PHYSICAL_TOPUP_P75_S', '14.0'))
-PHYSICAL_TOPUP_MIN_DIFF = int(os.getenv('HICON_PHYSICAL_TOPUP_MIN_DIFF', '5'))
-PHYSICAL_RESCUE_SKIP_P75_S = float(os.getenv('HICON_PHYSICAL_RESCUE_SKIP_P75_S', '9.0'))
-
 # =============================================================================
 # MOULD PLACEMENT DETECTION
 # Controls: HICON_MOULD_TRACKING_MODE
-#   reactive (default) — existing cluster-based mould_count; placement is off unless enabled
+#   reactive (default) — existing cluster-based mould_count, placement runs silently for logs
 #   predictive         — mould_count = blobs that received pours (placement detector is primary)
 #   hybrid             — predictive if detection succeeded; reactive fallback
 # Rollback: set HICON_MOULD_TRACKING_MODE=reactive in .env — no code change required.
 # =============================================================================
 MOULD_TRACKING_MODE            = os.getenv('HICON_MOULD_TRACKING_MODE', 'reactive')
-ENABLE_MOULD_PLACEMENT         = os.getenv('HICON_ENABLE_MOULD_PLACEMENT', 'false').lower() == 'true'
+ENABLE_MOULD_PLACEMENT         = os.getenv('HICON_ENABLE_MOULD_PLACEMENT', 'true').lower() == 'true'
 PLACEMENT_DIFF_THRESH          = int(os.getenv('HICON_PLACEMENT_DIFF_THRESH', '30'))
 PLACEMENT_MIN_BLOB_AREA_PX     = int(os.getenv('HICON_PLACEMENT_MIN_BLOB_AREA_PX', '50'))
 PLACEMENT_MAX_BLOB_AREA_PX     = int(os.getenv('HICON_PLACEMENT_MAX_BLOB_AREA_PX', '2000'))
@@ -577,15 +561,6 @@ def get_config_summary():
         'pouring_cycle_timeout_s': POURING_CYCLE_TIMEOUT_S,
         'mould_switch_min_pour_s': MOULD_SWITCH_MIN_POUR_S,
         'min_cluster_pour_s': MIN_CLUSTER_POUR_S,
-        'mould_count_mode': MOULD_COUNT_MODE,
-        'physical_fast_median_s': PHYSICAL_FAST_MEDIAN_S,
-        'physical_fast_p75_s': PHYSICAL_FAST_P75_S,
-        'physical_fast_inflation': PHYSICAL_FAST_INFLATION,
-        'physical_near_raw_median_s': PHYSICAL_NEAR_RAW_MEDIAN_S,
-        'physical_near_raw_p75_s': PHYSICAL_NEAR_RAW_P75_S,
-        'physical_topup_p75_s': PHYSICAL_TOPUP_P75_S,
-        'physical_topup_min_diff': PHYSICAL_TOPUP_MIN_DIFF,
-        'physical_rescue_skip_p75_s': PHYSICAL_RESCUE_SKIP_P75_S,
         'cluster_backtrack_cid_guard': CLUSTER_BACKTRACK_CID_GUARD,
         'mould_split_min_dx_px': MOULD_SPLIT_MIN_DX_PX,
         'mould_split_min_dy_px': MOULD_SPLIT_MIN_DY_PX,
