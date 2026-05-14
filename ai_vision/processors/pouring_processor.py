@@ -1278,6 +1278,35 @@ class PouringProcessor:
         }
 
     @staticmethod
+    def _grouping_count(mould_records, gap_thresh=1.0, spatial_thresh=0.08):
+        """Count physical moulds by grouping reactive records on time-gap + spatial-jump.
+
+        A new mould starts when:
+          - consecutive pour gap >= gap_thresh seconds  (operator moved to next mould), OR
+          - gap < 2 s AND spatial distance between rep_norm positions >= spatial_thresh
+            (rapid move to a different mould slot, visible when position data is present).
+        """
+        if not mould_records:
+            return 0
+        records = sorted(mould_records, key=lambda r: float(r.get("start_time_wall") or 0.0))
+        groups = 1
+        for i in range(1, len(records)):
+            prev, curr = records[i - 1], records[i]
+            gap = float(curr.get("start_time_wall") or 0.0) - float(
+                prev.get("end_time_wall") or prev.get("start_time_wall") or 0.0
+            )
+            if gap >= gap_thresh:
+                groups += 1
+            elif 0.0 <= gap < 2.0:
+                rp = prev.get("rep_norm")
+                rc = curr.get("rep_norm")
+                if rp and rc:
+                    dist = math.sqrt((rc[0] - rp[0]) ** 2 + (rc[1] - rp[1]) ** 2)
+                    if dist >= spatial_thresh:
+                        groups += 1
+        return groups
+
+    @staticmethod
     def _physical_reducer_defaults():
         return {
             "fast_median_s": 5.0,
@@ -1703,6 +1732,22 @@ class PouringProcessor:
             mode=self.mould_count_mode,
             thresholds=self._physical_reducer_thresholds(),
         )
+        # Apply grouping cap when position data is available in live records.
+        # min(classifier_output, grouping_count) prevents inflation above what
+        # time-gap + spatial-jump analysis supports, without changing behaviour
+        # for heats that lack rep_norm (old data, tests, synthetic calls).
+        if (
+            self.mould_count_mode == "physical"
+            and self.mould_records
+            and any(r.get("rep_norm") for r in self.mould_records)
+        ):
+            grouped = self._grouping_count(self.mould_records)
+            if grouped < official:
+                diagnostics["reason"] = f"grouping_capped_from_{diagnostics.get('reason', 'unknown')}"
+                official = grouped
+                diagnostics["official_physical_mould_count"] = official
+            diagnostics["grouping_count"] = grouped
+
         diagnostics["cluster_build"] = stats
         self._last_physical_count_result = diagnostics
         return official, diagnostics
