@@ -97,6 +97,15 @@ def _before_send(event, hint):
     if logger_name in _IGNORE_LOGGERS:
         return None
 
+    # Drop werkzeug malformed-request noise. External scanners / NVRs probing the
+    # optional MJPEG HTTP port send non-HTTP payloads (TLS ClientHello, HTTP/0.9),
+    # which werkzeug logs as "code 400" at ERROR level. These are benign — the
+    # request is correctly rejected and no data is served. The MJPEG server is an
+    # internal access-log server (app.logger disabled); genuine server faults
+    # surface as Python exceptions on other loggers, not via werkzeug's request log.
+    if logger_name == "werkzeug":
+        return None
+
     # Filter by message content
     msg = ""
     if "logentry" in event:
