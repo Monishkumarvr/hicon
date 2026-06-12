@@ -1982,3 +1982,47 @@ ingest dependency for `hicon-vision.service`.
 - If operators later enable `HICON_ENABLE_STREAM0_LOCAL_RELAY=true` or set
   `HICON_STREAM0_REMOTE_RELAY_URL`, they must ensure `hicon-mediamtx.service` is started
   separately before expecting overlay relay publishing to work.
+
+---
+
+## 2026-06-12 Addendum: ACTUAL ROOT CAUSE FOUND — Dead Default Gateway
+
+All prior conclusions attributing the ~5-minute Stream 0 drops to "irreducible camera-side
+hardware behavior" were **wrong**. Live multi-layer probing on 2026-06-12 found the real cause.
+
+### Root Cause
+Camera 0 (192.168.28.119) had its default gateway configured as **192.168.28.1 — an IP that
+does not exist on the network** (ARP `(incomplete)` permanently). The camera firmware's periodic
+gateway health check failed every cycle, and its recovery action bounced the camera's
+network/streaming stack on a free-running **~298.5s** timer:
+
+- established RTSP sessions silently died (no FIN/RST at kill time; later packets answered with
+  `RST win 0` — the daemon lost its TCP state)
+- brief 0–9s ICMP/HTTP blackout, then service resumed within seconds
+- camera OS never rebooted (`deviceUpTime` 5.6 days at diagnosis)
+
+### Evidence (live probes, 16:18–16:30 IST)
+| Probe | Result |
+|---|---|
+| Outage cadence | 298.5s free-running, drifting ~1s earlier per cycle |
+| Independent parallel ffmpeg session | froze at the same cycle instant; conn stayed ESTAB |
+| Fresh TCP connects to :554 every 5s | succeeded throughout (old "95s refusal" no longer applies) |
+| ICMP/HTTP to camera | 0–9s gap per cycle |
+| tcpdump | camera ARPs for 192.168.28.1 before the cycle; 28.1 never resolves |
+| Controls | cameras 1&2 (identical model/firmware) use gateway 192.168.27.1 which EXISTS → zero drops ever |
+| ARP audit | no rogue/conflicting claims for .119 or .44 |
+
+This also explains why replacing the CP Plus camera with a Hikvision (2026-03-20) did not stop
+the cycle: the camera position stayed on 28.x with the same dead gateway.
+
+### Fix (2026-06-12 19:09 IST)
+- ISAPI PUT `DefaultGateway` 192.168.28.1 → **192.168.28.8** (NVR-1, always-on, answers ARP)
+- Camera reboot to apply (required by firmware), back online 19:11:03
+- The gateway is never actually used for routing (camera only talks on-subnet to the Jetson and
+  NVR-1) — it just needs to answer ARP so the firmware health check passes.
+
+### Fallback ladder (if the cycle ever returns)
+1. Disable NVR-1 channel 34 temporarily (NVR-perpetrator test; `enableTiming=true` on ch34)
+2. Change camera RTSP port 554→8554 (external-prober test)
+3. Firmware update beyond V5.7.23 build 260320
+4. Swap camera units 0↔2 (unit vs position differential)

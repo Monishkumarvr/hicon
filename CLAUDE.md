@@ -369,6 +369,17 @@ retransmission — inference stalls caused permanent packet loss and session dea
 Fix: `HICON_STREAM_0_NVURISRCBIN_RESPECT_CONFIGURED_PROTOCOL=true` in `.env`.
 Confirmed by 3-soak: 0 outages in 330s with TCP vs drops every ~300s with UDP.
 
+**Stream 0 five-minute cycle ROOT CAUSE (found 2026-06-12):** The residual ~298.5s drop cycle
+(persisting after the transport fix, ~167 outages/day) was caused by camera 0's default gateway
+being set to **192.168.28.1, which does not exist** (ARP never resolves). The Hikvision firmware's
+periodic gateway health check failed forever; its recovery action bounced the camera's
+network/streaming stack every ~298.5s, silently killing all RTSP sessions (camera OS never
+rebooted). Identical cameras 1&2 point at 192.168.27.1 (exists) — never dropped. Also explains
+why the CP Plus → Hikvision camera replacement didn't help (same position, same dead gateway).
+**Fix:** gateway changed to 192.168.28.8 (NVR-1, alive, answers ARP) via ISAPI + camera reboot.
+The gateway is never routed through — it only needs to answer ARP. Do NOT set camera 0's gateway
+back to 28.1. Full evidence: 2026-06-12 addendum in `ai_vision/docs/rtsp_stream0_investigation.md`.
+
 **Segment buffer code** (legacy, disabled): Still in codebase at `pipeline/segment_buffer_helper.py`
 and `gst_builder.py` segment buffer paths. Available if future cameras exhibit similar firmware drops.
 
