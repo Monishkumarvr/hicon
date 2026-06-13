@@ -96,10 +96,6 @@ archive/
 # Local assistant/session artifacts
 .claude/
 
-# Local DeepStream clones (keep out of main project repo)
-DeepStream-Yolo/
-DeepStream-Yolo-old/
-
 # Large documentation exports
 ai_vision/docs/whole_chat.md
 ai_vision/docs/*chat*.md
