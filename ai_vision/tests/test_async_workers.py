@@ -1,4 +1,5 @@
 import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -51,7 +52,7 @@ def test_async_db_writer_drains_pending_writes_on_stop():
     ]
 
 
-def test_async_db_writer_falls_back_to_sync_when_queue_is_full(monkeypatch):
+def test_async_db_writer_uses_nonblocking_overflow_when_queue_is_full(monkeypatch):
     db = FakeDB()
     writer = AsyncDBWriter(db, maxsize=1)
     try:
@@ -60,11 +61,62 @@ def test_async_db_writer_falls_back_to_sync_when_queue_is_full(monkeypatch):
             "put_nowait",
             lambda item: (_ for _ in ()).throw(queue.Full),
         )
-        assert writer.insert_pouring_event(sync_id="pour-2") == 11
+        assert writer.insert_pouring_event(sync_id="pour-2") is None
+        method, args, kwargs = writer._pop_overflow()
     finally:
         writer.stop(timeout=0.1, drain=False)
 
-    assert db.calls == [("insert_pouring_event", {"sync_id": "pour-2"})]
+    assert (method, args, kwargs) == (
+        "insert_pouring_event",
+        (),
+        {"sync_id": "pour-2"},
+    )
+    assert db.calls == []
+
+
+def test_async_db_writer_preserves_order_and_backpressures_terminal_saturation():
+    class BlockingDB(FakeDB):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def insert_pouring_event(self, **kwargs):
+            if kwargs.get("sync_id") == "first":
+                self.started.set()
+                assert self.release.wait(timeout=2.0)
+            return super().insert_pouring_event(**kwargs)
+
+    db = BlockingDB()
+    writer = AsyncDBWriter(db, maxsize=1, overflow_maxsize=1)
+    enqueue_done = threading.Event()
+
+    def enqueue_fourth():
+        writer.insert_heat_cycle(sync_id="fourth")
+        enqueue_done.set()
+
+    try:
+        writer.insert_pouring_event(sync_id="first")
+        assert db.started.wait(timeout=2.0)
+        writer.insert_pouring_event(sync_id="second")
+        writer.update_pouring_end(sync_id="third")
+        producer = threading.Thread(target=enqueue_fourth)
+        producer.start()
+        assert not enqueue_done.wait(timeout=0.1)
+        db.release.set()
+        assert enqueue_done.wait(timeout=2.0)
+        producer.join(timeout=2.0)
+        writer.stop(timeout=5.0)
+    finally:
+        db.release.set()
+        writer.stop(timeout=0.1, drain=False)
+
+    assert [kwargs["sync_id"] for _, kwargs in db.calls] == [
+        "first",
+        "second",
+        "third",
+        "fourth",
+    ]
 
 
 def test_async_screenshot_writer_returns_path_and_flushes_on_stop(tmp_path):

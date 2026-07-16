@@ -31,6 +31,7 @@ class MouldPouringRecord:
     duration_seconds: Optional[float] = None
     sync_id: str = ""
     slno: int = 0
+    source: str = "legacy"
 
 
 @dataclass
@@ -364,6 +365,7 @@ class HeatCycleManager:
                     'duration_seconds': p.duration_seconds,
                     'sync_id': p.sync_id,
                     'slno': p.slno,
+                    'source': p.source,
                 }
                 for p in cycle.mould_pourings
             ],
@@ -386,6 +388,7 @@ class HeatCycleManager:
                 duration_seconds=p.get('duration_seconds'),
                 sync_id=p.get('sync_id', ''),
                 slno=p.get('slno', 0),
+                source=p.get('source', 'legacy'),
             )
             for p in d.get('mould_pourings', [])
         ]
@@ -767,6 +770,72 @@ class HeatCycleManager:
 
         logger.warning(f"Could not find active pouring for {mould_id} in {cycle.heat_no}")
         return False
+
+    def upsert_completed_mould_pouring(
+        self,
+        *,
+        ladle_track_id: int,
+        mould_id: str,
+        mould_track_id: int,
+        start_time: float,
+        start_datetime: datetime,
+        end_time: float,
+        end_datetime: datetime,
+        duration_seconds: float,
+        sync_id: str = "",
+        slno: int = 0,
+    ) -> Optional[str]:
+        """Insert or refresh one distinct tracker-backed mould aggregate."""
+        self.update_pouring_session_presence(
+            ladle_track_id,
+            end_time,
+            end_datetime,
+        )
+        cycle = self.active_cycle
+        if cycle is None:
+            return None
+        if ladle_track_id not in cycle.ladle_track_ids:
+            cycle.ladle_track_ids.append(ladle_track_id)
+
+        for pouring in cycle.mould_pourings:
+            if pouring.mould_id != mould_id:
+                continue
+            if start_time < pouring.start_time:
+                pouring.start_time = start_time
+                pouring.start_datetime = start_datetime
+            if pouring.end_time is None or end_time >= pouring.end_time:
+                pouring.end_time = end_time
+                pouring.end_datetime = end_datetime
+            pouring.duration_seconds = float(duration_seconds)
+            pouring.mould_track_id = int(mould_track_id)
+            pouring.source = "tracker"
+            pouring.sync_id = sync_id or pouring.sync_id
+            pouring.slno = slno or pouring.slno
+            self._maybe_checkpoint()
+            return cycle.heat_no
+
+        cycle.mould_pourings.append(
+            MouldPouringRecord(
+                mould_id=mould_id,
+                mould_track_id=int(mould_track_id),
+                start_time=start_time,
+                start_datetime=start_datetime,
+                end_time=end_time,
+                end_datetime=end_datetime,
+                duration_seconds=float(duration_seconds),
+                sync_id=sync_id,
+                slno=slno,
+                source="tracker",
+            )
+        )
+        logger.info(
+            "  📊 Upserted tracker mould %s into %s (%d moulds)",
+            mould_id,
+            cycle.heat_no,
+            len(cycle.mould_pourings),
+        )
+        self._maybe_checkpoint()
+        return cycle.heat_no
     
     def check_and_finalize_cycles(self, current_time: float, current_datetime: datetime) -> List[HeatCycle]:
         """

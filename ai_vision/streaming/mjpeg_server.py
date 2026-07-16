@@ -45,6 +45,8 @@ class MJPEGServer:
         jpeg_quality=85,
         max_fps=30,
         timestamp_overlay=False,
+        demand_driven=True,
+        idle_grace_sec=5.0,
     ):
         """
         Initialize MJPEG server.
@@ -59,8 +61,10 @@ class MJPEGServer:
         self.host = host
         self.port = port
         self.jpeg_quality = jpeg_quality
-        self.frame_delay = 1.0 / max_fps
+        self.frame_delay = 1.0 / max_fps if max_fps > 0 else 0.0
         self.timestamp_overlay = bool(timestamp_overlay)
+        self.demand_driven = bool(demand_driven)
+        self.idle_grace_sec = max(0.0, float(idle_grace_sec))
 
         # Frame storage per stream
         self.frames = {}    # stream_id → (frame_bgr, timestamp)
@@ -68,6 +72,9 @@ class MJPEGServer:
         self.enabled = {}   # stream_id → bool
         self._age_log_last_time = {}
         self._frame_counts = {}  # stream_id → int (for fps estimate)
+        self._active_clients = {}
+        self._last_client_disconnect = {}
+        self._snapshot_demand_until = {}
 
         # Flask app
         self.app = Flask(__name__)
@@ -100,7 +107,53 @@ class MJPEGServer:
             self.enabled[stream_id] = True
             self._age_log_last_time[stream_id] = 0.0
             self._frame_counts[stream_id] = 0
+            self._active_clients[stream_id] = 0
+            self._last_client_disconnect[stream_id] = 0.0
+            self._snapshot_demand_until[stream_id] = 0.0
             logger.info(f"Registered stream {stream_id}")
+
+    def has_active_subscribers(self, stream_id):
+        """Whether the pipeline should pay the cost of extracting this preview."""
+        if not self.demand_driven:
+            return True
+        if stream_id not in self.locks or not self.enabled.get(stream_id, True):
+            return False
+
+        now = time.monotonic()
+        with self.locks[stream_id]:
+            clients = self._active_clients.get(stream_id, 0)
+            disconnected = self._last_client_disconnect.get(stream_id, 0.0)
+            snapshot_until = self._snapshot_demand_until.get(stream_id, 0.0)
+        return bool(
+            clients > 0
+            or now <= snapshot_until
+            or (disconnected > 0 and (now - disconnected) <= self.idle_grace_sec)
+        )
+
+    def _client_connected(self, stream_id):
+        with self.locks[stream_id]:
+            self._active_clients[stream_id] = self._active_clients.get(stream_id, 0) + 1
+        logger.info("MJPEG stream %s client connected (clients=%d)", stream_id,
+                    self._active_clients[stream_id])
+
+    def _client_disconnected(self, stream_id):
+        with self.locks[stream_id]:
+            self._active_clients[stream_id] = max(
+                0, self._active_clients.get(stream_id, 0) - 1
+            )
+            self._last_client_disconnect[stream_id] = time.monotonic()
+            clients = self._active_clients[stream_id]
+        logger.info("MJPEG stream %s client disconnected (clients=%d)", stream_id, clients)
+
+    def request_snapshot_frame(self, stream_id, timeout_sec=1.0):
+        """Temporarily request extraction so an idle demand-driven stream can snapshot."""
+        if stream_id not in self.locks:
+            return
+        with self.locks[stream_id]:
+            self._snapshot_demand_until[stream_id] = max(
+                self._snapshot_demand_until.get(stream_id, 0.0),
+                time.monotonic() + max(0.1, float(timeout_sec)),
+            )
 
     def update_frame(self, stream_id, frame_bgr):
         """
@@ -116,8 +169,11 @@ class MJPEGServer:
         if not self.enabled.get(stream_id, True):
             return  # stream disabled — drop frame
 
+        # Ownership is transferred: the producer creates a fresh array and never
+        # mutates it after this call. Holding the NumPy reference is therefore safe
+        # and avoids another full-frame allocation/copy on the streaming thread.
         with self.locks[stream_id]:
-            self.frames[stream_id] = (frame_bgr.copy(), time.time())
+            self.frames[stream_id] = (frame_bgr, time.time())
             self._frame_counts[stream_id] = self._frame_counts.get(stream_id, 0) + 1
 
     def get_latest_frame_age(self, stream_id):
@@ -204,42 +260,43 @@ class MJPEGServer:
     def _generate_mjpeg(self, stream_id):
         """Generator yielding MJPEG frames for a stream."""
         last_emit = 0.0
+        self._client_connected(stream_id)
 
-        while True:
-            now = time.time()
+        try:
+            while True:
+                now = time.time()
 
-            # Throttle to max_fps
-            if (now - last_emit) < self.frame_delay:
-                time.sleep(0.01)
-                continue
+                # Throttle to max_fps
+                if (now - last_emit) < self.frame_delay:
+                    time.sleep(0.01)
+                    continue
 
-            if stream_id not in self.locks:
-                time.sleep(0.1)
-                continue
+                if stream_id not in self.locks:
+                    time.sleep(0.1)
+                    continue
 
-            frame, timestamp, frame_age = self._get_frame_snapshot(stream_id)
+                frame, timestamp, frame_age = self._get_frame_snapshot(stream_id)
 
-            if frame is None:
-                # No frame yet, send placeholder
-                time.sleep(0.1)
-                continue
+                if frame is None:
+                    time.sleep(0.1)
+                    continue
 
-            self._maybe_log_frame_age(stream_id, frame_age, timestamp)
-            render_frame = self._render_frame(frame, timestamp, frame_age)
+                self._maybe_log_frame_age(stream_id, frame_age, timestamp)
+                render_frame = self._render_frame(frame, timestamp, frame_age)
 
-            # Encode JPEG
-            ret, jpeg = cv2.imencode('.jpg', render_frame,
-                                     [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
-            if not ret:
-                logger.error(f"Failed to encode JPEG for stream {stream_id}")
-                time.sleep(0.1)
-                continue
+                ret, jpeg = cv2.imencode('.jpg', render_frame,
+                                         [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                if not ret:
+                    logger.error(f"Failed to encode JPEG for stream {stream_id}")
+                    time.sleep(0.1)
+                    continue
 
-            # Yield MJPEG frame
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
 
-            last_emit = now
+                last_emit = now
+        finally:
+            self._client_disconnected(stream_id)
 
     def _stream_route(self, stream_id):
         """Flask route for /stream<id>."""
@@ -265,7 +322,13 @@ class MJPEGServer:
         if not self.enabled.get(stream_id, True):
             return f"Stream {stream_id} is disabled", 503
 
+        previous_timestamp = self.frames.get(stream_id, (None, 0.0))[1]
+        self.request_snapshot_frame(stream_id, timeout_sec=1.0)
+        deadline = time.monotonic() + 1.0
         frame, timestamp, _ = self._get_frame_snapshot(stream_id)
+        while time.monotonic() < deadline and (frame is None or timestamp <= previous_timestamp):
+            time.sleep(0.02)
+            frame, timestamp, _ = self._get_frame_snapshot(stream_id)
         if frame is None:
             return "No frame available yet", 503
 
@@ -294,6 +357,8 @@ class MJPEGServer:
                 'has_frame': frame is not None,
                 'frame_age_s': round(age, 2) if age is not None else None,
                 'total_frames': self._frame_counts.get(sid, 0),
+                'active_clients': self._active_clients.get(sid, 0),
+                'demand_active': self.has_active_subscribers(sid),
                 'url': f'/stream{sid}',
                 'snapshot_url': f'/snapshot{sid}',
             })

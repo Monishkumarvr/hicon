@@ -8,6 +8,7 @@ All cameras use H.265/HEVC; per-stream codec is configurable via 'rtsp_codec_N' 
 """
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -87,6 +88,13 @@ class DeepStreamPipelineBuilder:
         self.stream0_tracker_config = str(
             config.get('stream_0_tracker_config', config.get('tracker_config', '')) or ''
         )
+        self.stream0_tracker_max_targets = int(
+            config.get('stream_0_tracker_max_targets', 64) or 64
+        )
+        self.mould_gie_enabled = bool(config.get('mould_gie_enabled', False))
+        self.mould_gie_interval = int(config.get('mould_gie_interval', 11) or 0)
+        self.config_mould = str(config.get('config_mould', '') or '')
+        self.mould_count_mode = str(config.get('mould_count_mode', 'shadow')).lower()
         self.use_safe_cuda_brightness = bool(
             config.get('use_safe_cuda_brightness', False)
         )
@@ -150,11 +158,84 @@ class DeepStreamPipelineBuilder:
         if self.stream0_bypass_pgie and not self.stream0_bypass_tracker:
             logger.info("Stream 0: pgie bypass requested; tracker bypass forced on as well")
             self.stream0_bypass_tracker = True
+        if self.mould_count_mode == 'tracker' and not self.mould_gie_enabled:
+            raise ValueError("Tracker mould count mode requires HICON_MOULD_GIE_ENABLED=true")
+        if self.mould_gie_enabled and (self.stream0_bypass_pgie or self.stream0_bypass_tracker):
+            raise ValueError("Mould GIE requires the Stream 0 pouring GIE and tracker")
+        if self.mould_gie_enabled:
+            self._validate_mould_runtime_artifacts()
+        self._materialize_stream0_tracker_config()
         self.stream0_annotated_tee_enabled = bool(
             self.enable_inference_video_stream_0
             or self.enable_live_stream_0
             or self.enable_stream0_local_relay
         )
+
+    def _validate_mould_runtime_artifacts(self):
+        """Fail closed rather than letting nvinfer build or run without its engine."""
+        config_path = Path(self.config_mould)
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Stream 0 mould GIE config not found: {config_path}")
+
+        engine_value = None
+        try:
+            for raw_line in config_path.read_text().splitlines():
+                line = raw_line.strip()
+                if line.startswith('model-engine-file='):
+                    engine_value = line.split('=', 1)[1].strip()
+                    break
+        except OSError as exc:
+            raise RuntimeError(f"Could not read mould GIE config: {config_path}") from exc
+
+        if not engine_value:
+            raise ValueError(f"Mould GIE config has no model-engine-file: {config_path}")
+        engine_path = Path(engine_value)
+        if not engine_path.is_absolute():
+            engine_path = (config_path.parent / engine_path).resolve()
+        if not engine_path.is_file():
+            raise FileNotFoundError(
+                "Mould TensorRT engine is missing; build it with hicon-vision stopped: "
+                f"{engine_path}"
+            )
+
+    def _materialize_stream0_tracker_config(self):
+        """Create a runtime tracker YAML with the env-selected target capacity."""
+        source = Path(self.stream0_tracker_config)
+        if not source.is_file():
+            return
+
+        try:
+            original = source.read_text()
+            pattern = re.compile(r'^(\s*maxTargetsPerStream:\s*)\d+(.*)$', re.MULTILINE)
+            match = pattern.search(original)
+            if not match:
+                logger.warning("Tracker config has no maxTargetsPerStream: %s", source)
+                return
+            current = int(re.search(r'\d+', match.group(0).split(':', 1)[1]).group(0))
+            if current == self.stream0_tracker_max_targets:
+                return
+
+            rendered = pattern.sub(
+                lambda item: (
+                    f"{item.group(1)}{self.stream0_tracker_max_targets}"
+                    f"{item.group(2)}"
+                ),
+                original,
+                count=1,
+            )
+            runtime_dir = Path('/tmp/hicon-vision')
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            runtime_path = runtime_dir / 'config_tracker_stream0.yml'
+            runtime_path.write_text(rendered)
+            self.stream0_tracker_config = str(runtime_path)
+            logger.info(
+                "Stream 0: tracker maxTargetsPerStream overridden %d -> %d (%s)",
+                current,
+                self.stream0_tracker_max_targets,
+                runtime_path,
+            )
+        except (OSError, ValueError, AttributeError) as exc:
+            logger.warning("Could not materialize Stream 0 tracker override: %s", exc)
 
     def _is_native_rtsp_stream(self, stream_id):
         """True when the stream uses rtspsrc or nvurisrcbin directly."""
@@ -1089,6 +1170,21 @@ class DeepStreamPipelineBuilder:
                     self.elements['pgie_pouring'].set_property('config-file-path', self.config['config_pouring'])
                     logger.info("Stream 0: Pouring nvinfer created (GIE-1)")
 
+                    if self.mould_gie_enabled:
+                        self.elements['pgie_mould'] = Gst.ElementFactory.make(
+                            "nvinfer", "pgie-mould"
+                        )
+                        self.elements['pgie_mould'].set_property(
+                            'config-file-path', self.config_mould
+                        )
+                        self.elements['pgie_mould'].set_property(
+                            'interval', self.mould_gie_interval
+                        )
+                        logger.info(
+                            "Stream 0: Mould nvinfer created (GIE-4, interval=%d)",
+                            self.mould_gie_interval,
+                        )
+
                 # Tracker for pouring
                 if not self.stream0_bypass_tracker:
                     # rtspsrc path: nvtracker rejects caps events that arrive dynamically
@@ -1593,6 +1689,9 @@ class DeepStreamPipelineBuilder:
                 if not self.stream0_bypass_pgie:
                     chain_0.append((stream0_head, 'pgie_pouring'))
                     stream0_head = 'pgie_pouring'
+                    if self.mould_gie_enabled:
+                        chain_0.append((stream0_head, 'pgie_mould'))
+                        stream0_head = 'pgie_mould'
                 if not self.stream0_bypass_tracker:
                     if 'nvvidconv_pre_tracker_0' in self.elements:
                         chain_0.append((stream0_head, 'nvvidconv_pre_tracker_0'))

@@ -27,6 +27,7 @@ def _bootstrap_sentry():
 
 _bootstrap_sentry()
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 import json
 import configparser
@@ -74,7 +75,11 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_DIR / 'pipeline.log'),
+        RotatingFileHandler(
+            LOG_DIR / 'pipeline.log',
+            maxBytes=50 * 1024 * 1024,
+            backupCount=5,
+        ),
     ],
 )
 logger = logging.getLogger('hicon')
@@ -393,11 +398,17 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 and config.ENABLE_FRAME_PROCESSING
                 and melting_controller.needs_frame(native_melting_state)
             )
+            pouring_needs_frame = False
+            if run_python_pouring and config.ENABLE_FRAME_PROCESSING:
+                try:
+                    pouring_needs_frame = pouring_processor.needs_frame(frame_meta)
+                except Exception as exc:
+                    logger.warning("Pouring frame-need check failed: %s", exc)
 
             stream0_needs_frame = (
                 config.ENABLE_FRAME_PROCESSING
                 and (
-                    run_python_pouring
+                    pouring_needs_frame
                     or cpu_brightness
                     or melting_needs_frame
                 )
@@ -696,6 +707,54 @@ def stream0_stage_probe_tracker_sink(pad, info):
     return _mark_stream0_stage("tracker_sink", info)
 
 
+def mould_src_pad_relabel_probe(pad, info):
+    """Relabel GIE-4 mould class 0 to shared tracker class 2, metadata only."""
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    try:
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+
+            l_obj = frame_meta.obj_meta_list
+            while l_obj is not None:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                except StopIteration:
+                    break
+                if (
+                    int(getattr(obj_meta, 'unique_component_id', 0))
+                    == int(config.MOULD_GIE_UNIQUE_ID)
+                    and int(obj_meta.class_id) == 0
+                ):
+                    obj_meta.class_id = int(config.MOULD_TRACKER_CLASS_ID)
+                    try:
+                        obj_meta.obj_label = 'mould'
+                    except Exception:
+                        pass
+                try:
+                    l_obj = l_obj.next
+                except StopIteration:
+                    break
+
+            try:
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+    except Exception as exc:
+        logger.error("Mould relabel probe failed: %s", exc, exc_info=True)
+    return Gst.PadProbeReturn.OK
+
+
 def stream0_stage_probe_tracker_src(pad, info):
     """Track Stream 0 liveness at tracker_0.src and sample tracked mouth output."""
     _mark_stream0_stage("tracker_src", info)
@@ -786,6 +845,13 @@ def stream0_stage_probe_tracker_src(pad, info):
 def _should_extract_live_frame(stream_id: int) -> bool:
     """Throttle MJPEG extraction before expensive GPU-to-CPU frame copies."""
     global _live_stream_warmup_deadline
+
+    if (
+        mjpeg_server is not None
+        and bool(getattr(config, 'LIVE_STREAM_DEMAND_DRIVEN', True))
+        and not mjpeg_server.has_active_subscribers(stream_id)
+    ):
+        return False
 
     target_fps = max(int(getattr(config, "LIVE_STREAM_FPS", 0) or 0), 0)
     if target_fps <= 0:
@@ -1273,8 +1339,13 @@ def main():
 
     # Initialize database
     db = HiConDatabase(str(config.DB_PATH))
-    async_db_writer = AsyncDBWriter(db, maxsize=64)
-    screenshot_writer = AsyncScreenshotWriter(maxsize=20)
+    async_db_writer = AsyncDBWriter(db, maxsize=256, overflow_maxsize=1024)
+    screenshot_writer = AsyncScreenshotWriter(
+        maxsize=20,
+        max_width=config.SCREENSHOT_MAX_WIDTH,
+        jpeg_quality=config.SCREENSHOT_JPEG_QUALITY,
+        save_raw=config.SAVE_RAW_SCREENSHOTS,
+    )
 
     # Load zone configuration
     zones_path = str(config.CONFIG_DIR / 'zones.json')
@@ -1301,7 +1372,7 @@ def main():
 
     # Create shared HeatCycleManager for Stream 0 (owned by pipeline, shared by processors)
     heat_cycle_manager = HeatCycleManager(
-        db_manager=db,
+        db_manager=async_db_writer,
         ladle_absence_timeout=config.POURING_CYCLE_TIMEOUT_S,
         tapping_only_timeout=config.TAPPING_ONLY_CYCLE_TIMEOUT_S,
         base_location=config.LOCATION,
@@ -1496,9 +1567,14 @@ def main():
         'config_pouring': config.CONFIG_POURING,
         'config_pyrometer': config.CONFIG_PYROMETER,
         'config_pouring_2': config.CONFIG_POURING_2,
+        'config_mould': config.CONFIG_MOULD,
+        'mould_gie_enabled': config.MOULD_GIE_ENABLED,
+        'mould_gie_interval': config.MOULD_GIE_INTERVAL,
+        'mould_count_mode': config.MOULD_COUNT_MODE,
         'tracker_lib': config.TRACKER_LIB,
         'tracker_config': config.TRACKER_CONFIG,
         'stream_0_tracker_config': config.STREAM_0_TRACKER_CONFIG,
+        'stream_0_tracker_max_targets': config.STREAM_0_TRACKER_MAX_TARGETS,
         'stream_2_tracker_config': config.STREAM_2_TRACKER_CONFIG,
         'stream_2_tracker_width': config.STREAM_2_TRACKER_WIDTH,
         'stream_2_tracker_height': config.STREAM_2_TRACKER_HEIGHT,
@@ -1626,6 +1702,8 @@ def main():
             jpeg_quality=config.LIVE_STREAM_QUALITY,
             max_fps=config.LIVE_STREAM_FPS,
             timestamp_overlay=config.LIVE_STREAM_TIMESTAMP_OVERLAY,
+            demand_driven=config.LIVE_STREAM_DEMAND_DRIVEN,
+            idle_grace_sec=config.LIVE_STREAM_IDLE_GRACE_SEC,
         )
         # Only register streams that have pipeline elements and are enabled for live preview.
         live_stream_keys = [
@@ -1736,6 +1814,21 @@ def main():
             logger.warning("Stream 0 local relay enabled but tee_0 is missing; relay disabled")
 
     # Attach pad probes
+    if 'pgie_mould' in elements and elements['pgie_mould']:
+        mould_srcpad = elements['pgie_mould'].get_static_pad("src")
+        if not mould_srcpad:
+            raise RuntimeError("Stream 0 mould GIE has no src pad for metadata relabeling")
+        mould_srcpad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            mould_src_pad_relabel_probe,
+        )
+        logger.info(
+            "Stream 0: metadata-only mould relabel probe attached "
+            "(GIE-%d class 0 -> %d)",
+            config.MOULD_GIE_UNIQUE_ID,
+            config.MOULD_TRACKER_CLASS_ID,
+        )
+
     # Stream 0: OSD sink pad probe (pouring + brightness)
     if 'nvosd_0' in elements and elements['nvosd_0']:
         osd_sinkpad = elements['nvosd_0'].get_static_pad("sink")

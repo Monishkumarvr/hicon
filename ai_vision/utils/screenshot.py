@@ -9,6 +9,7 @@ import cv2
 import json
 import numpy as np
 import logging
+import os
 import queue
 import threading
 from pathlib import Path
@@ -18,6 +19,10 @@ from typing import List, Optional, Tuple, Any
 from utils.perf import timed_section
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_WIDTH = int(os.getenv('HICON_SCREENSHOT_MAX_WIDTH', '1280'))
+_DEFAULT_JPEG_QUALITY = int(os.getenv('HICON_SCREENSHOT_JPEG_QUALITY', '75'))
+_DEFAULT_SAVE_RAW = os.getenv('HICON_SAVE_RAW_SCREENSHOTS', 'false').lower() == 'true'
 
 
 def prepare_frame(frame_rgba: np.ndarray) -> np.ndarray:
@@ -142,15 +147,40 @@ def _write_screenshot_bundle(
     event_type: Optional[str] = None,
     camera_id: Optional[str] = None,
     categories: Optional[List[dict]] = None,
+    max_width: int = _DEFAULT_MAX_WIDTH,
+    jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
+    save_raw: bool = _DEFAULT_SAVE_RAW,
 ) -> Optional[str]:
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(filepath), annotated)
+        source_h, source_w = annotated.shape[:2]
+        scale = min(1.0, float(max_width) / max(source_w, 1))
+        if scale < 1.0:
+            output_size = (max_width, max(1, int(round(source_h * scale))))
+            annotated = cv2.resize(annotated, output_size, interpolation=cv2.INTER_AREA)
+            if raw_frame is not None:
+                raw_frame = cv2.resize(raw_frame, output_size, interpolation=cv2.INTER_AREA)
+            if annotations:
+                scaled_annotations = []
+                for annotation in annotations:
+                    scaled = dict(annotation)
+                    bbox = annotation.get('bbox')
+                    if bbox and len(bbox) == 4:
+                        scaled['bbox'] = [
+                            round(float(value) * scale, 2) for value in bbox
+                        ]
+                    if 'area' in annotation:
+                        scaled['area'] = round(float(annotation['area']) * scale * scale, 2)
+                    scaled_annotations.append(scaled)
+                annotations = scaled_annotations
+
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)]
+        cv2.imwrite(str(filepath), annotated, encode_params)
         logger.info(f"Saved screenshot: {filepath.name}")
 
         image_name = None
-        if raw_frame is not None:
-            cv2.imwrite(str(raw_filepath), raw_frame)
+        if save_raw and raw_frame is not None:
+            cv2.imwrite(str(raw_filepath), raw_frame, encode_params)
             logger.info(f"Saved raw screenshot: {raw_filename}")
             image_name = raw_filename
 
@@ -179,8 +209,13 @@ class AsyncScreenshotWriter:
 
     _SENTINEL = object()
 
-    def __init__(self, maxsize: int = 20):
+    def __init__(self, maxsize: int = 20, *, max_width: int = _DEFAULT_MAX_WIDTH,
+                 jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
+                 save_raw: bool = _DEFAULT_SAVE_RAW):
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+        self._max_width = int(max_width)
+        self._jpeg_quality = int(jpeg_quality)
+        self._save_raw = bool(save_raw)
         self._stopped = False
         self._thread = threading.Thread(
             target=self._worker,
@@ -221,6 +256,9 @@ class AsyncScreenshotWriter:
             "event_type": event_type,
             "camera_id": camera_id,
             "categories": categories,
+            "max_width": self._max_width,
+            "jpeg_quality": self._jpeg_quality,
+            "save_raw": self._save_raw,
         }
 
         if self._stopped:
@@ -314,4 +352,7 @@ def save(
             event_type=event_type,
             camera_id=camera_id,
             categories=categories,
+            max_width=_DEFAULT_MAX_WIDTH,
+            jpeg_quality=_DEFAULT_JPEG_QUALITY,
+            save_raw=_DEFAULT_SAVE_RAW,
         )

@@ -5,6 +5,7 @@ import sqlite3
 import logging
 import queue
 import threading
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -814,9 +815,22 @@ class AsyncDBWriter:
 
     _SENTINEL = object()
 
-    def __init__(self, db: HiConDatabase, maxsize: int = 64):
+    _COALESCIBLE = frozenset({
+        'save_active_cycle_checkpoint',
+        'update_pouring_location_by_heat_no',
+    })
+
+    def __init__(self, db: HiConDatabase, maxsize: int = 256,
+                 overflow_maxsize: int = 1024):
         self._db = db
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+        self._overflow = deque()
+        self._overflow_maxsize = max(1, int(overflow_maxsize))
+        self._overflow_lock = threading.Lock()
+        self._overflow_not_full = threading.Condition(self._overflow_lock)
+        self._overflow_drained = threading.Event()
+        self._overflow_drained.set()
+        self._queue_full_count = 0
         self._stopped = False
         self._thread = threading.Thread(
             target=self._worker,
@@ -824,57 +838,170 @@ class AsyncDBWriter:
             daemon=False,
         )
         self._thread.start()
-        logger.info("AsyncDBWriter initialized (maxsize=%d)", maxsize)
+        logger.info(
+            "AsyncDBWriter initialized (maxsize=%d, overflow_maxsize=%d)",
+            maxsize,
+            self._overflow_maxsize,
+        )
 
     def __getattr__(self, name):
         return getattr(self._db, name)
 
-    def _enqueue(self, method_name: str, kwargs: Dict[str, Any]):
+    @staticmethod
+    def _coalesce_key(method_name: str, args, kwargs):
+        if method_name == 'save_active_cycle_checkpoint':
+            return (method_name,)
+        if method_name == 'update_pouring_location_by_heat_no':
+            heat_no = kwargs.get('heat_no') if kwargs else None
+            if heat_no is None and args:
+                heat_no = args[0]
+            return (method_name, heat_no)
+        return None
+
+    def _enqueue_overflow_locked(self, item) -> bool:
+        """Append while ``_overflow_lock`` is held, coalescing replaceable work."""
+        method_name, args, kwargs = item
+        key = self._coalesce_key(method_name, args, kwargs)
+        if key is not None:
+            for index in range(len(self._overflow) - 1, -1, -1):
+                existing = self._overflow[index]
+                if self._coalesce_key(*existing) == key:
+                    self._overflow[index] = item
+                    return True
+
+        if len(self._overflow) >= self._overflow_maxsize:
+            # Terminal event writes take precedence over replaceable checkpoints.
+            evicted = False
+            if key is None:
+                for index, existing in enumerate(self._overflow):
+                    if self._coalesce_key(*existing) is not None:
+                        del self._overflow[index]
+                        evicted = True
+                        break
+            if not evicted and key is not None:
+                logger.warning(
+                    "AsyncDBWriter overflow full; dropped replaceable %s",
+                    method_name,
+                )
+                return False
+            if not evicted:
+                logger.critical(
+                    "AsyncDBWriter overflow full; applying terminal-write backpressure for %s",
+                    method_name,
+                )
+                # A bounded queue cannot guarantee terminal-event preservation
+                # without backpressure once every slot contains non-replaceable
+                # work. This path is exceptional (after 1,280 queued writes) and
+                # releases the lock while the worker frees a slot.
+                while len(self._overflow) >= self._overflow_maxsize:
+                    self._overflow_not_full.wait(timeout=0.1)
+
+        self._overflow.append(item)
+        self._overflow_drained.clear()
+        return True
+
+    def _enqueue_overflow(self, item) -> bool:
+        with self._overflow_lock:
+            return self._enqueue_overflow_locked(item)
+
+    def _pop_overflow(self):
+        with self._overflow_lock:
+            if not self._overflow:
+                self._overflow_drained.set()
+                return None
+            item = self._overflow.popleft()
+            self._overflow_not_full.notify_all()
+            if not self._overflow:
+                self._overflow_drained.set()
+            return item
+
+    def _enqueue(self, method_name: str, args=(), kwargs=None):
+        kwargs = kwargs or {}
         if self._stopped:
             logger.warning("AsyncDBWriter stopped; executing %s synchronously", method_name)
             with timed_section(f"db.{method_name}.sync_stopped", logger=logger):
-                return getattr(self._db, method_name)(**kwargs)
+                return getattr(self._db, method_name)(*args, **kwargs)
 
-        try:
-            self._queue.put_nowait((method_name, kwargs))
-        except queue.Full:
-            logger.critical(
-                "AsyncDBWriter queue full while scheduling %s; falling back to sync write",
+        item = (method_name, args, kwargs)
+        scheduled = True
+        overflowed = False
+        # Once overflow begins, route later writes there as well. Together with
+        # the worker's primary-first policy this preserves database write order.
+        with self._overflow_lock:
+            if self._overflow:
+                overflowed = True
+                scheduled = self._enqueue_overflow_locked(item)
+            else:
+                try:
+                    self._queue.put_nowait(item)
+                except queue.Full:
+                    overflowed = True
+                    scheduled = self._enqueue_overflow_locked(item)
+
+        if overflowed:
+            self._queue_full_count += 1
+            logger.warning(
+                "AsyncDBWriter primary queue full; %s %s in overflow "
+                "(queue_full_count=%d)",
                 method_name,
+                "scheduled" if scheduled else "NOT scheduled",
+                self._queue_full_count,
             )
-            with timed_section(f"db.{method_name}.sync_fallback", logger=logger):
-                return getattr(self._db, method_name)(**kwargs)
         return None
 
     def _worker(self):
         while True:
-            item = self._queue.get()
+            from_primary = True
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                item = self._pop_overflow()
+                from_primary = False
+                if item is None:
+                    try:
+                        item = self._queue.get(timeout=0.1)
+                        from_primary = True
+                    except queue.Empty:
+                        continue
             try:
                 if item is self._SENTINEL:
                     return
 
-                method_name, kwargs = item
+                method_name, args, kwargs = item
                 with timed_section(f"db.{method_name}.async", logger=logger):
-                    getattr(self._db, method_name)(**kwargs)
+                    getattr(self._db, method_name)(*args, **kwargs)
             except Exception as exc:
                 logger.error("AsyncDBWriter %s failed: %s", method_name, exc, exc_info=True)
             finally:
-                self._queue.task_done()
+                if from_primary:
+                    self._queue.task_done()
 
     def insert_melting_event(self, **kwargs) -> Optional[str]:
-        return self._enqueue("insert_melting_event", kwargs)
+        return self._enqueue("insert_melting_event", kwargs=kwargs)
 
     def insert_pouring_event(self, **kwargs) -> Optional[str]:
-        return self._enqueue("insert_pouring_event", kwargs)
+        return self._enqueue("insert_pouring_event", kwargs=kwargs)
 
     def update_pouring_end(self, **kwargs) -> None:
-        self._enqueue("update_pouring_end", kwargs)
+        self._enqueue("update_pouring_end", kwargs=kwargs)
 
     def delete_pouring_event(self, **kwargs) -> None:
-        self._enqueue("delete_pouring_event", kwargs)
+        self._enqueue("delete_pouring_event", kwargs=kwargs)
 
     def insert_heat_cycle(self, **kwargs) -> Optional[str]:
-        return self._enqueue("insert_heat_cycle", kwargs)
+        return self._enqueue("insert_heat_cycle", kwargs=kwargs)
+
+    def save_active_cycle_checkpoint(self, cycle_json: str) -> None:
+        self._enqueue("save_active_cycle_checkpoint", args=(cycle_json,))
+
+    def clear_active_cycle_checkpoint(self) -> None:
+        self._enqueue("clear_active_cycle_checkpoint")
+
+    def update_pouring_location_by_heat_no(self, heat_no: str, location: str) -> None:
+        self._enqueue(
+            "update_pouring_location_by_heat_no",
+            args=(heat_no, location),
+        )
 
     def stop(self, timeout: float = 5.0, drain: bool = True) -> None:
         if self._stopped:
@@ -882,6 +1009,8 @@ class AsyncDBWriter:
 
         if drain:
             self._queue.join()
+            if not self._overflow_drained.wait(timeout=timeout):
+                logger.warning("AsyncDBWriter overflow did not drain within %.1fs", timeout)
         self._queue.put(self._SENTINEL)
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():

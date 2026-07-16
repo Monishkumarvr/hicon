@@ -11,7 +11,7 @@ BaseConfig:
 TargetManagement:
   enableBboxUnClipping: 1    # In case the bbox is likely to be clipped by image border, unclip bbox
   preserveStreamUpdateOrder: 0    # When assigning new target ids, preserve input streams' order to keep target ids in a deterministic order over multuple runs
-  maxTargetsPerStream: 20    # Max targets per stream (4 trolleys + 1 mouth + shadow tracks). Reduced from 150 to match actual scene constraints.
+  maxTargetsPerStream: 64    # Runtime may override via HICON_STREAM0_TRACKER_MAX_TARGETS.
 
   # [Creation & Termination Policy]
   minIouDiff4NewTarget: 0.50    # Discard new detections with >50% IOU overlap with existing tracks (lowered from 0.74 to prevent duplicate IDs for same object)
@@ -23,7 +23,7 @@ TargetManagement:
   # Matches typical pouring cycle duration to maintain persistent IDs throughout active operations
   maxShadowTrackingAge: 2400    # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated.
 
-  earlyTerminationAge: 50    # Increased from 10: give shadow tracks 50 frames (2s @25fps) before termination; prevents real trolley loss when model misses detection for a few frames during pouring
+  earlyTerminationAge: 50    # Preserve mouth/trolley occlusion tolerance; also spans multiple mould detector gaps.
 
 TrajectoryManagement:
   useUniqueID: 1    # Use 64-bit long Unique ID - IDs never recycled during session (persistent tracking)

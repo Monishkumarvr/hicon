@@ -72,6 +72,9 @@ class BrightnessProcessor:
         self._tapping_mask = None
         self._deslagging_mask = None
         self._spectro_mask = None
+        self._tapping_bbox = None
+        self._deslagging_bbox = None
+        self._spectro_bbox = None
         self._tapping_pixel_count = 0
         self._deslagging_pixel_count = 0
         self._spectro_pixel_count = 0
@@ -178,28 +181,42 @@ class BrightnessProcessor:
         # Tapping ROI (flat or multi-zone)
         tapping_polys = self._get_zone_pts_list(self._tapping_config, frame_w, frame_h)
         if tapping_polys:
-            self._tapping_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-            cv2.fillPoly(self._tapping_mask, tapping_polys, 255)
+            self._tapping_mask, self._tapping_bbox = self._build_cropped_mask(tapping_polys)
             self._tapping_pixel_count = int(np.sum(self._tapping_mask > 0))
-            logger.info(f"Tapping ROI mask: {len(tapping_polys)} zone(s), {self._tapping_pixel_count} pixels")
+            logger.info(f"Tapping ROI mask: {len(tapping_polys)} zone(s), {self._tapping_pixel_count} pixels, bbox={self._tapping_bbox}")
 
         # Deslagging ROI (flat or multi-zone)
         deslag_polys = self._get_zone_pts_list(self._deslagging_config, frame_w, frame_h)
         if deslag_polys:
-            self._deslagging_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-            cv2.fillPoly(self._deslagging_mask, deslag_polys, 255)
+            self._deslagging_mask, self._deslagging_bbox = self._build_cropped_mask(deslag_polys)
             self._deslagging_pixel_count = int(np.sum(self._deslagging_mask > 0))
             logger.info(f"Deslagging ROI mask: {len(deslag_polys)} zone(s), {self._deslagging_pixel_count} pixels")
 
         # Spectro ROI (flat or multi-zone)
         spectro_polys = self._get_zone_pts_list(self._spectro_config, frame_w, frame_h)
         if spectro_polys:
-            self._spectro_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-            cv2.fillPoly(self._spectro_mask, spectro_polys, 255)
+            self._spectro_mask, self._spectro_bbox = self._build_cropped_mask(spectro_polys)
             self._spectro_pixel_count = int(np.sum(self._spectro_mask > 0))
             logger.info(f"Spectro ROI mask: {len(spectro_polys)} zone(s), {self._spectro_pixel_count} pixels")
 
         self._masks_built = True
+
+    @staticmethod
+    def _build_cropped_mask(polygons):
+        """Return an ROI-sized mask and its frame-space bounding rectangle."""
+        all_points = np.concatenate(polygons, axis=0)
+        x, y, width, height = cv2.boundingRect(all_points)
+        shifted = [poly - np.array([x, y], dtype=np.int32) for poly in polygons]
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, shifted, 255)
+        return mask, (x, y, x + width, y + height)
+
+    @staticmethod
+    def _crop_to_bbox(gray, bbox):
+        if bbox is None:
+            return gray
+        x1, y1, x2, y2 = bbox
+        return gray[y1:y2, x1:x2]
 
     def _is_deslagging_suppressed(self):
         """
@@ -253,7 +270,8 @@ class BrightnessProcessor:
             # Process tapping zone
             if self.enable_tapping and self._tapping_mask is not None and self._tapping_pixel_count > 0:
                 self._process_zone(
-                    gray, self._tapping_mask, self._tapping_pixel_count,
+                    self._crop_to_bbox(gray, self._tapping_bbox),
+                    self._tapping_mask, self._tapping_pixel_count,
                     self.tapping_tracker, frame_for_ss
                 )
 
@@ -267,12 +285,14 @@ class BrightnessProcessor:
                     # Check if we should use blob detection for deslagging
                     if "min_blob_area" in self._deslagging_config:
                         self._process_zone_blobs(
-                            gray, self._deslagging_mask, self._deslagging_pixel_count,
+                            self._crop_to_bbox(gray, self._deslagging_bbox),
+                            self._deslagging_mask, self._deslagging_pixel_count,
                             self.deslagging_tracker, self._deslagging_config, frame_for_ss
                         )
                     else:
                         self._process_zone(
-                            gray, self._deslagging_mask, self._deslagging_pixel_count,
+                            self._crop_to_bbox(gray, self._deslagging_bbox),
+                            self._deslagging_mask, self._deslagging_pixel_count,
                             self.deslagging_tracker, frame_for_ss
                         )
 
@@ -285,12 +305,14 @@ class BrightnessProcessor:
                     # Check if we should use blob detection for spectro
                     if "min_blob_area" in self._spectro_config:
                         self._process_zone_blobs(
-                            gray, self._spectro_mask, self._spectro_pixel_count,
+                            self._crop_to_bbox(gray, self._spectro_bbox),
+                            self._spectro_mask, self._spectro_pixel_count,
                             self.spectro_tracker, self._spectro_config, frame_for_ss
                         )
                     else:
                         self._process_zone(
-                            gray, self._spectro_mask, self._spectro_pixel_count,
+                            self._crop_to_bbox(gray, self._spectro_bbox),
+                            self._spectro_mask, self._spectro_pixel_count,
                             self.spectro_tracker, frame_for_ss
                         )
 

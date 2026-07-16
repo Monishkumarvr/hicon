@@ -4,7 +4,7 @@ Pouring Processor - HiCon pouring detection per standalone pouring system docume
 Three sub-systems running in the OSD sink pad probe on Stream 0:
 1. Session Manager:  ladle_mouth center inside expanded trolley bbox → session lifecycle
 2. Pour Detector:    multi-probe brightness below ladle_mouth → pour start/end
-3. Mould Counter:    reference-style segment split + spatial clustering → mould count
+3. Mould Counter:    YOLO mould detections + NvDCF IDs, with legacy clustering fallback
 
 Key behaviors:
 - Trolley locking: lock onto trolley where first pour starts, ignore others
@@ -12,7 +12,7 @@ Key behaviors:
 - Session persistence: mould data preserved across session boundaries for same locked trolley
 - Pouring cycle timeout: 5 min mouth absence from locked trolley → reset everything
 
-Model classes: ladle_mouth (class 0), trolley (class 1).
+Model classes: ladle_mouth (class 0), trolley (class 1), relabelled mould (class 2).
 """
 
 import cv2
@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 # Class IDs from labels_pouring.txt
 CLASS_MOUTH = 0
 CLASS_TROLLEY = 1
+CLASS_MOULD = 2
+_UNTRACKED_OBJECT_ID = (1 << 64) - 1
 
 _POURING_CATEGORIES = [
     {"id": CLASS_MOUTH,   "name": "ladle_mouth"},
@@ -77,6 +79,12 @@ class PouringProcessor:
         # Detection thresholds
         self.mouth_conf = config.MOUTH_CONFIDENCE
         self.trolley_conf = config.TROLLEY_CONFIDENCE
+        self.mould_gie_enabled = bool(getattr(config, 'MOULD_GIE_ENABLED', False))
+        self.mould_gie_unique_id = int(getattr(config, 'MOULD_GIE_UNIQUE_ID', 4))
+        self.mould_tracker_class_id = int(getattr(config, 'MOULD_TRACKER_CLASS_ID', CLASS_MOULD))
+        self.mould_min_area_px = int(getattr(config, 'MOULD_MIN_AREA_PX', 400))
+        self.mould_count_mode = str(getattr(config, 'MOULD_COUNT_MODE', 'shadow')).lower()
+        self.tracker_max_targets = int(getattr(config, 'STREAM_0_TRACKER_MAX_TARGETS', 64))
 
         # Session timing
         self.session_start_dur = config.SESSION_START_DURATION
@@ -217,6 +225,21 @@ class PouringProcessor:
         self.next_mould_id = 1
         self.last_split_time: Optional[float] = None
         self._last_mould_disp_log_ts: Optional[float] = None
+        self._last_active_materialize_ts: Optional[float] = None
+
+        # Dedicated mould detector/NvDCF state. Only IDs that receive a committed
+        # (>= pour_min_dur) pour contribute to the tracker-based count.
+        self._tracked_mould_observations: List[Dict[str, Any]] = []
+        self._active_tracked_mould_id: Optional[int] = None
+        self._poured_mould_ids = set()
+        self._poured_mould_durations: Dict[int, float] = defaultdict(float)
+        self._tracker_pour_records: Dict[int, Dict[str, Any]] = {}
+        self._tracker_slot_by_id: Dict[int, int] = {}
+        self._seen_mould_ids = set()
+        self._mould_peak_visible = 0
+        self._last_mould_observations_by_id: Dict[int, Dict[str, Any]] = {}
+        self._mould_id_switches = 0
+        self._restore_tracker_state_from_heat_cycle()
 
         # --- Last known probe state (for screenshot annotations) ---
         self._last_probe_base: Optional[Tuple[int, int]] = None  # (base_x, base_y) before offsets
@@ -277,6 +300,14 @@ class PouringProcessor:
             f"r_merge_y={self.r_merge_y:.3f}, min_cluster_pour={self.min_cluster_pour_s}s"
         )
         logger.info(
+            "  Mould GIE: enabled=%s mode=%s class=%d min_area=%d tracker_cap=%d",
+            self.mould_gie_enabled,
+            self.mould_count_mode,
+            self.mould_tracker_class_id,
+            self.mould_min_area_px,
+            self.tracker_max_targets,
+        )
+        logger.info(
             f"  Split gates: min_dx_px={self.split_min_dx_px:.1f}, min_dy_px={self.split_min_dy_px:.1f}, "
             f"dom_ratio={self.split_dom_ratio:.2f}, axis_only_min_mag={self.axis_only_min_mag:.3f}, "
             f"rearm_dx_px={self.split_rearm_dx_px:.1f}, rearm_dy_px={self.split_rearm_dy_px:.1f}, "
@@ -297,8 +328,30 @@ class PouringProcessor:
             self.enable_display_meta,
         )
 
-    def needs_frame(self, obj_count: int) -> bool:
-        return bool(obj_count > 0 or self.pour_active)
+    def needs_frame(self, frame_meta) -> bool:
+        """Return whether this frame needs a GPU-to-CPU copy for pour brightness."""
+        if self.pour_active:
+            return True
+        if not self.session_active or frame_meta is None:
+            return False
+
+        l_obj = getattr(frame_meta, 'obj_meta_list', None)
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+            if (
+                int(obj_meta.class_id) == CLASS_MOUTH
+                and int(getattr(obj_meta, 'unique_component_id', 0)) != self.mould_gie_unique_id
+                and float(obj_meta.confidence) >= self.mouth_conf
+            ):
+                return True
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+        return False
 
     @staticmethod
     def _scale_pixel_value(value, scale, minimum=0, as_float=False):
@@ -413,7 +466,12 @@ class PouringProcessor:
         self._update_runtime_geometry(frame_w, frame_h)
 
         # 1. Extract detections
-        mouths, trolleys = self._extract_detections(frame_meta)
+        detections = self._extract_detections(frame_meta)
+        if len(detections) == 2:  # Backward-compatible processor/test adapters.
+            mouths, trolleys = detections
+            moulds = []
+        else:
+            mouths, trolleys, moulds = detections
 
         if frame_num and frame_num % 1000 == 0:
             logger.info(
@@ -422,6 +480,7 @@ class PouringProcessor:
 
         # 2. Find the relevant trolley (locked or best candidate)
         target_trolley = self._get_target_trolley(trolleys, timestamp, mouths)
+        self._update_tracked_mould_observations(moulds, target_trolley)
 
         # 3. Check mouth-in-trolley (with EDGE_EXPAND)
         mouth_in_trolley = False
@@ -470,6 +529,11 @@ class PouringProcessor:
         # 8. Mould counter (during active session)
         mould_mouth = pour_probe_mouth or best_mouth
         if self.session_active and self.pour_active and mould_mouth and target_trolley:
+            if self._active_tracked_mould_id is None:
+                self._active_tracked_mould_id = self._select_tracked_mould_for_pour(
+                    mould_mouth,
+                    target_trolley,
+                )
             self._update_mould_counter(mould_mouth, target_trolley, timestamp, datetime_obj)
 
         # 9. Pouring cycle timeout check (5 min)
@@ -506,12 +570,13 @@ class PouringProcessor:
     # =========================================================================
 
     def _extract_detections(self, frame_meta):
-        """Extract ladle_mouth and trolley detections from NvDsObjectMeta."""
+        """Extract pouring and dedicated mould detections from NvDsObjectMeta."""
         mouths = []
         trolleys = []
+        moulds = []
 
         if frame_meta is None:
-            return mouths, trolleys
+            return mouths, trolleys, moulds
 
         l_obj = getattr(frame_meta, 'obj_meta_list', None)
         while l_obj is not None:
@@ -528,6 +593,7 @@ class PouringProcessor:
             x2 = int(rect.left + rect.width)
             y2 = int(rect.top + rect.height)
             track_id = int(obj_meta.object_id)
+            gie_id = int(getattr(obj_meta, 'unique_component_id', 0))
 
             det = {
                 'bbox': (x1, y1, x2, y2),
@@ -535,9 +601,16 @@ class PouringProcessor:
                 'track_id': track_id,
                 'center': ((x1 + x2) // 2, (y1 + y2) // 2),
                 'bottom_center': ((x1 + x2) // 2, y2),
+                'gie_id': gie_id,
             }
 
-            if class_id == CLASS_MOUTH and conf >= self.mouth_conf:
+            if (
+                gie_id == self.mould_gie_unique_id
+                and class_id == self.mould_tracker_class_id
+                and track_id != _UNTRACKED_OBJECT_ID
+            ):
+                moulds.append(det)
+            elif class_id == CLASS_MOUTH and conf >= self.mouth_conf:
                 mouths.append(det)
             elif class_id == CLASS_TROLLEY and conf >= self.trolley_conf:
                 trolleys.append(det)
@@ -547,7 +620,181 @@ class PouringProcessor:
             except StopIteration:
                 break
 
-        return mouths, trolleys
+        return mouths, trolleys, moulds
+
+    @staticmethod
+    def _bboxes_overlap(a, b) -> bool:
+        return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+    def _update_tracked_mould_observations(self, moulds, target_trolley) -> None:
+        """Filter tracked mould boxes to the active/target trolley like the C++ reference."""
+        observations = []
+        if target_trolley is not None:
+            trolley_bbox = target_trolley['bbox']
+            tx1, ty1, tx2, ty2 = trolley_bbox
+            padded_bbox = (
+                tx1 - self.edge_expand_x_px,
+                ty1 - self.edge_expand_y_px,
+                tx2 + self.edge_expand_x_px,
+                ty2 + self.edge_expand_y_px,
+            )
+            tw = max(float(tx2 - tx1), 1.0)
+            th = max(float(ty2 - ty1), 1.0)
+
+            for mould in moulds:
+                x1, y1, x2, y2 = mould['bbox']
+                if max(0, x2 - x1) * max(0, y2 - y1) < self.mould_min_area_px:
+                    continue
+                cx, cy = mould['center']
+                center_inside = (
+                    padded_bbox[0] <= cx <= padded_bbox[2]
+                    and padded_bbox[1] <= cy <= padded_bbox[3]
+                )
+                if not center_inside and not self._bboxes_overlap(mould['bbox'], padded_bbox):
+                    continue
+                observations.append(
+                    {
+                        **mould,
+                        'centroid_rel': ((cx - tx1) / tw, (cy - ty1) / th),
+                    }
+                )
+
+        observations.sort(key=lambda item: (item['center'][0], item['bbox'][1]))
+        self._tracked_mould_observations = observations
+        current_by_id = {int(item['track_id']): item for item in observations}
+        previous_ids = set(self._last_mould_observations_by_id)
+        current_ids = set(current_by_id)
+
+        # NvDCF does not expose an explicit ID-switch counter. Flag the common
+        # observable signature: a prior ID disappears while a new ID appears at
+        # nearly the same trolley-normalized centroid on the next frame.
+        disappeared = previous_ids - current_ids
+        appeared = current_ids - previous_ids
+        unmatched_appeared = set(appeared)
+        for old_id in disappeared:
+            old = self._last_mould_observations_by_id[old_id]
+            if not unmatched_appeared:
+                break
+            new_id = min(
+                unmatched_appeared,
+                key=lambda candidate: math.hypot(
+                    old['centroid_rel'][0] - current_by_id[candidate]['centroid_rel'][0],
+                    old['centroid_rel'][1] - current_by_id[candidate]['centroid_rel'][1],
+                ),
+            )
+            distance = math.hypot(
+                old['centroid_rel'][0] - current_by_id[new_id]['centroid_rel'][0],
+                old['centroid_rel'][1] - current_by_id[new_id]['centroid_rel'][1],
+            )
+            if distance <= 0.12:
+                self._mould_id_switches += 1
+                unmatched_appeared.remove(new_id)
+                logger.warning(
+                    "[mould-tracker] ID switch candidate old=%d new=%d distance=%.3f total=%d",
+                    old_id,
+                    new_id,
+                    distance,
+                    self._mould_id_switches,
+                )
+
+        self._last_mould_observations_by_id = current_by_id
+        self._seen_mould_ids.update(current_ids)
+        self._mould_peak_visible = max(self._mould_peak_visible, len(observations))
+
+        if self._frame_count % 250 == 0 and self.mould_gie_enabled:
+            cap_pressure = len(observations) / max(self.tracker_max_targets, 1)
+            log = logger.warning if cap_pressure >= 0.75 else logger.info
+            log(
+                "[mould-tracker] visible=%d peak=%d seen_ids=%d poured_ids=%d "
+                "active_ids=%s cap=%d pressure=%.1f%% id_switches=%d",
+                len(observations),
+                self._mould_peak_visible,
+                len(self._seen_mould_ids),
+                len(self._poured_mould_ids),
+                ','.join(str(value) for value in sorted(current_ids)) or 'none',
+                self.tracker_max_targets,
+                cap_pressure * 100.0,
+                self._mould_id_switches,
+            )
+
+    def _select_tracked_mould_for_pour(self, mouth, trolley) -> Optional[int]:
+        """Assign a pour using 30/50px containment, then nearest centroid."""
+        observations = self._tracked_mould_observations
+        if not observations or mouth is None or trolley is None:
+            return None
+
+        base_x, mouth_y2 = mouth['bottom_center']
+        probe_30 = (float(base_x), float(mouth_y2 + self.probe_below_px))
+        fallback_delta = int(round(20.0 * self.geometry_scale_y))
+        probe_50 = (probe_30[0], probe_30[1] + fallback_delta)
+
+        for probe in (probe_30, probe_50):
+            for observation in observations:
+                x1, y1, x2, y2 = observation['bbox']
+                if x1 <= probe[0] <= x2 and y1 <= probe[1] <= y2:
+                    return int(observation['track_id'])
+
+        tx1, ty1, tx2, ty2 = trolley['bbox']
+        tw = max(float(tx2 - tx1), 1.0)
+        th = max(float(ty2 - ty1), 1.0)
+        probe_rel = ((probe_30[0] - tx1) / tw, (probe_30[1] - ty1) / th)
+        nearest = min(
+            observations,
+            key=lambda item: math.hypot(
+                probe_rel[0] - item['centroid_rel'][0],
+                probe_rel[1] - item['centroid_rel'][1],
+            ),
+        )
+        return int(nearest['track_id'])
+
+    @property
+    def tracker_mould_count(self) -> int:
+        return len(self._poured_mould_ids)
+
+    def _restore_tracker_state_from_heat_cycle(self) -> None:
+        """Restore distinct tracker aggregates after a mid-cycle service restart."""
+        if self.mould_count_mode != 'tracker' or not self.heat_cycle_manager:
+            return
+        cycle = getattr(self.heat_cycle_manager, 'active_cycle', None)
+        if cycle is None:
+            return
+
+        legacy_records = [
+            record for record in cycle.mould_pourings
+            if getattr(record, 'source', 'legacy') != 'tracker'
+        ]
+        if legacy_records:
+            raise RuntimeError(
+                "Cannot enable tracker mould mode during a legacy active heat cycle; "
+                "switch modes at a heat-cycle boundary"
+            )
+
+        restored_ladle_id = int(cycle.ladle_track_ids[0]) if cycle.ladle_track_ids else 0
+        for fallback_slot, record in enumerate(cycle.mould_pourings, start=1):
+            if record.end_time is None or record.duration_seconds is None:
+                continue
+            tracker_id = int(record.mould_track_id)
+            try:
+                slot_id = int(str(record.mould_id).rsplit('C', 1)[1])
+            except (IndexError, ValueError):
+                slot_id = fallback_slot
+            self._poured_mould_ids.add(tracker_id)
+            self._poured_mould_durations[tracker_id] = float(record.duration_seconds)
+            self._tracker_slot_by_id[tracker_id] = slot_id
+            self._tracker_pour_records[tracker_id] = {
+                'slot_id': slot_id,
+                'ladle_track_id': restored_ladle_id,
+                'start_time_wall': record.start_time,
+                'start_datetime_obj': record.start_datetime,
+                'end_time_wall': record.end_time,
+                'end_datetime_obj': record.end_datetime,
+                'duration_s': float(record.duration_seconds),
+            }
+        if self._tracker_pour_records:
+            logger.info(
+                "[mould-tracker] restored %d distinct mould aggregates from active heat",
+                len(self._tracker_pour_records),
+            )
 
     # =========================================================================
     # Trolley targeting (locking)
@@ -1473,6 +1720,37 @@ class PouringProcessor:
         if not self.heat_cycle_manager:
             return
 
+        if self.mould_count_mode == 'tracker' and self.mould_gie_enabled:
+            upsert = getattr(
+                self.heat_cycle_manager,
+                'upsert_completed_mould_pouring',
+                None,
+            )
+            if not callable(upsert):
+                raise RuntimeError(
+                    "HeatCycleManager lacks tracker mould upsert support"
+                )
+            for tracker_id, record in sorted(
+                self._tracker_pour_records.items(),
+                key=lambda item: item[1]['slot_id'],
+            ):
+                ladle_track_id = int(record.get('ladle_track_id') or 0)
+                if ladle_track_id <= 0:
+                    continue
+                upsert(
+                    ladle_track_id=ladle_track_id,
+                    mould_id=f"MOULD_C{record['slot_id']}",
+                    mould_track_id=int(tracker_id),
+                    start_time=record['start_time_wall'],
+                    start_datetime=record['start_datetime_obj'],
+                    end_time=record['end_time_wall'],
+                    end_datetime=record['end_datetime_obj'],
+                    duration_seconds=record['duration_s'],
+                    sync_id=self.pour_sync_id or "",
+                    slno=self.pour_slno or 0,
+                )
+            return
+
         # Group segments by spatial cluster — one MouldPouringRecord per cluster.
         by_cluster = defaultdict(list)
         for record in self.mould_records:
@@ -1614,6 +1892,7 @@ class PouringProcessor:
             self.completed_segments.append(self._active_segment)
 
         self._active_segment = None
+        self._active_tracked_mould_id = None
         self._materialize_mould_records(include_active=False)
         self._sync_mould_records_to_heat_cycle()
         return self.mould_records[-1] if self.mould_records else None
@@ -1631,6 +1910,7 @@ class PouringProcessor:
         self.active_mould_start_datetime = None
         self.active_mould_start_norm = None
         self._active_segment = None
+        self._active_tracked_mould_id = None
         self.brightness_above_since = None
         self.brightness_below_since = None
         self.pour_on_count = 0
@@ -1644,6 +1924,15 @@ class PouringProcessor:
         # Set mould anchor on pour start (mouth position relative to trolley)
         if target_trolley and best_mouth:
             self._set_anchor_on_pour_start(best_mouth, target_trolley)
+            self._active_tracked_mould_id = self._select_tracked_mould_for_pour(
+                best_mouth,
+                target_trolley,
+            )
+            logger.info(
+                "[mould-tracker] pour start assignment=%s visible=%d",
+                self._active_tracked_mould_id,
+                len(self._tracked_mould_observations),
+            )
 
         # Placement detector: capture pre-pour snapshot, detect new mould blob
         if self.placement_detector is not None and target_trolley is not None:
@@ -1732,6 +2021,7 @@ class PouringProcessor:
             self.active_mould_start_time = None
             self.active_mould_start_datetime = None
             self.active_mould_start_norm = None
+            self._active_tracked_mould_id = None
             self._materialize_mould_records(include_active=False)
             self.displacement_hold_frames = None
             self.split_hold_quadrant = None
@@ -1742,6 +2032,52 @@ class PouringProcessor:
             return
 
         self.last_pour_duration = duration
+
+        committed_tracker_id = self._active_tracked_mould_id
+        if committed_tracker_id is not None and committed_tracker_id >= 0:
+            committed_tracker_id = int(committed_tracker_id)
+            self._poured_mould_ids.add(committed_tracker_id)
+            self._poured_mould_durations[committed_tracker_id] += float(duration)
+            slot_id = self._tracker_slot_by_id.setdefault(
+                committed_tracker_id,
+                len(self._tracker_slot_by_id) + 1,
+            )
+            ladle_track_id = 0
+            if self._active_segment is not None:
+                ladle_track_id = int(self._active_segment.get('ladle_track_id') or 0)
+            if ladle_track_id <= 0:
+                ladle_track_id = int(self.locked_trolley_id or 0)
+            prior = self._tracker_pour_records.get(committed_tracker_id)
+            start_dt = self.pour_start_datetime or effective_end_dt
+            if prior is None:
+                self._tracker_pour_records[committed_tracker_id] = {
+                    'slot_id': slot_id,
+                    'ladle_track_id': ladle_track_id,
+                    'start_time_wall': start_dt.timestamp(),
+                    'start_datetime_obj': start_dt,
+                    'end_time_wall': effective_end_dt.timestamp(),
+                    'end_datetime_obj': effective_end_dt,
+                    'duration_s': float(duration),
+                }
+            else:
+                prior['end_time_wall'] = effective_end_dt.timestamp()
+                prior['end_datetime_obj'] = effective_end_dt
+                prior['duration_s'] = float(
+                    self._poured_mould_durations[committed_tracker_id]
+                )
+                if ladle_track_id > 0:
+                    prior['ladle_track_id'] = ladle_track_id
+            logger.info(
+                "[mould-tracker] committed pour %.1fs to mould_id=%d total_ids=%d",
+                duration,
+                committed_tracker_id,
+                self.tracker_mould_count,
+            )
+        elif self.mould_gie_enabled:
+            logger.warning(
+                "[mould-tracker] valid pour %.1fs had no mould assignment; legacy count retained",
+                duration,
+            )
 
         bm = best_mouth
         if bm is None and mouths:
@@ -1813,7 +2149,7 @@ class PouringProcessor:
                     predictive_count, self.mould_count,
                 )
 
-        # Tracking-mode-aware effective mould count:
+        # Placement-mode-aware legacy count remains available as the immediate rollback.
         #   reactive (default) → existing cluster-based count (no change)
         #   predictive         → placement-based count
         #   hybrid             → placement-based if detected; reactive otherwise
@@ -1826,10 +2162,32 @@ class PouringProcessor:
             elif tracking_mode == 'hybrid' and predictive_count > 0:
                 effective_mould_count = predictive_count
 
+        legacy_effective_count = effective_mould_count
+        if self.mould_count_mode == 'tracker' and self.mould_gie_enabled:
+            effective_mould_count = self.tracker_mould_count
+        elif self.mould_count_mode == 'shadow':
+            effective_mould_count = legacy_effective_count
+
+        logger.info(
+            "[mould-count] mode=%s official=%d tracker=%d legacy=%d clustered=%d",
+            self.mould_count_mode,
+            effective_mould_count,
+            self.tracker_mould_count,
+            legacy_effective_count,
+            self.clustered_mould_count,
+        )
+
         # DB update
         try:
             mould_wise = {
                 "mould_count": effective_mould_count,
+                "mould_count_mode": self.mould_count_mode,
+                "tracker_mould_count": self.tracker_mould_count,
+                "tracker_mould_ids": sorted(self._poured_mould_ids),
+                "tracker_mould_durations": {
+                    str(mould_id): round(duration_s, 2)
+                    for mould_id, duration_s in sorted(self._poured_mould_durations.items())
+                },
                 "reactive_mould_count": self.mould_count,
                 "predictive_mould_count": predictive_count,
                 "clustered_mould_count": self.clustered_mould_count,
@@ -1851,7 +2209,10 @@ class PouringProcessor:
             "POUR END", mouths, trolleys, frame, effective_end_dt,
             probe_point=probe_base,
             probe_brightness=self._last_probe_brightness,
-            extra_info=f"Duration: {duration:.1f}s  Moulds: {self.mould_count}"
+            extra_info=(
+                f"Duration: {duration:.1f}s  Moulds: {effective_mould_count} "
+                f"(tracker={self.tracker_mould_count}, legacy={legacy_effective_count})"
+            )
         )
 
         self.pour_start_time = None
@@ -1861,6 +2222,7 @@ class PouringProcessor:
         self.active_mould_start_time = None
         self.active_mould_start_datetime = None
         self.active_mould_start_norm = None
+        self._active_tracked_mould_id = None
         self.displacement_hold_frames = None
         self.split_hold_quadrant = None
         self.split_rearm_required = False
@@ -1926,7 +2288,12 @@ class PouringProcessor:
                 )
                 self._last_mould_disp_log_ts = timestamp
 
-        self._materialize_mould_records(include_active=True)
+        if (
+            self._last_active_materialize_ts is None
+            or (timestamp - self._last_active_materialize_ts) >= 0.5
+        ):
+            self._materialize_mould_records(include_active=True)
+            self._last_active_materialize_ts = timestamp
 
     def _recompute_clusters(self):
         """Recompute clustered mould records from completed raw segments."""
@@ -2027,6 +2394,17 @@ class PouringProcessor:
         self.next_mould_id = 1
         self.last_split_time = None
         self._last_mould_disp_log_ts = None
+        self._last_active_materialize_ts = None
+        self._tracked_mould_observations.clear()
+        self._active_tracked_mould_id = None
+        self._poured_mould_ids.clear()
+        self._poured_mould_durations.clear()
+        self._tracker_pour_records.clear()
+        self._tracker_slot_by_id.clear()
+        self._seen_mould_ids.clear()
+        self._mould_peak_visible = 0
+        self._last_mould_observations_by_id.clear()
+        self._mould_id_switches = 0
         self.mouth_last_seen_in_trolley = None
         self.cycle_start_time = None
         self.cycle_start_datetime = None

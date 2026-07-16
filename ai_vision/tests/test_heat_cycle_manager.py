@@ -222,6 +222,49 @@ def test_tapping_zone_sets_cycle_furnace_label(tmp_path):
     assert manager.active_cycle.furnace_label == "Furnace2"
 
 
+def test_tracker_mould_upsert_keeps_one_api_record_per_distinct_id(tmp_path):
+    manager = HeatCycleManager(_make_db(tmp_path), ladle_absence_timeout=300.0)
+    start = datetime(2026, 7, 16, 10, 0, 0)
+
+    manager.upsert_completed_mould_pouring(
+        ladle_track_id=7,
+        mould_id="MOULD_C1",
+        mould_track_id=41,
+        start_time=100.0,
+        start_datetime=start,
+        end_time=103.0,
+        end_datetime=start + timedelta(seconds=3),
+        duration_seconds=3.0,
+    )
+    manager.upsert_completed_mould_pouring(
+        ladle_track_id=7,
+        mould_id="MOULD_C1",
+        mould_track_id=41,
+        start_time=100.0,
+        start_datetime=start,
+        end_time=108.0,
+        end_datetime=start + timedelta(seconds=8),
+        duration_seconds=6.0,
+    )
+    manager.upsert_completed_mould_pouring(
+        ladle_track_id=7,
+        mould_id="MOULD_C2",
+        mould_track_id=99,
+        start_time=109.0,
+        start_datetime=start + timedelta(seconds=9),
+        end_time=112.0,
+        end_datetime=start + timedelta(seconds=12),
+        duration_seconds=3.0,
+    )
+
+    cycle = manager.active_cycle
+    assert cycle is not None
+    assert len(cycle.mould_pourings) == 2
+    assert cycle.mould_pourings[0].duration_seconds == 6.0
+    manager._finalize_cycle(cycle, 112.0, start + timedelta(seconds=12))
+    assert len(cycle.mould_wise_pouring_time) == 2
+
+
 def test_backfill_preserves_zone_name_and_sets_cycle_furnace(tmp_path):
     db = _make_db(tmp_path)
     manager = HeatCycleManager(

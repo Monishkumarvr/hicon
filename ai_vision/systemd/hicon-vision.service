@@ -2,6 +2,8 @@
 Description=HiCon AI Vision Pipeline (DeepStream 7.1)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,8 +15,16 @@ WorkingDirectory=/home/hicon/hicon/ai_vision
 Environment=PATH=/usr/local/cuda-12.6/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib:/usr/local/cuda-12.6/lib64
 Environment=GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream-7.1/lib/gst-plugins
+Environment=GST_REGISTRY=/var/cache/hicon-vision/registry.aarch64.bin
 Environment=GST_DEBUG=1
+Environment=CUDA_MODULE_LOADING=LAZY
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=PYTHONUNBUFFERED=1
 Environment=SENTRY_DSN=https://088af9f4d42ff7ec125d741387f0f4ac@o4509393361043456.ingest.de.sentry.io/4511313799544912
+CacheDirectory=hicon-vision
 
 ExecStart=/bin/bash -lc 'set -o pipefail; python3 hicon_pipeline.py 2>&1 | grep --line-buffered -v "ErrorType="; exit ${PIPESTATUS[0]}'
 

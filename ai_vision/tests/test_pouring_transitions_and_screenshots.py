@@ -23,6 +23,12 @@ class DummyConfig:
     CAMERA_ID_STREAM_0 = "Cam-0"
     MOUTH_CONFIDENCE = 0.4
     TROLLEY_CONFIDENCE = 0.25
+    MOULD_GIE_ENABLED = True
+    MOULD_GIE_UNIQUE_ID = 4
+    MOULD_TRACKER_CLASS_ID = 2
+    MOULD_MIN_AREA_PX = 400
+    MOULD_COUNT_MODE = "shadow"
+    STREAM_0_TRACKER_MAX_TARGETS = 64
     SESSION_START_DURATION = 1.0
     SESSION_END_DURATION = 1.5
     POUR_REF_WIDTH = 1920
@@ -117,6 +123,98 @@ def test_runtime_geometry_dedupes_offsets_after_rounding(tmp_path):
     proc._update_runtime_geometry(80, 45)
     assert proc.probe_offsets == [(0, 0), (1, 0), (-1, 0)]
     assert len(proc.probe_offsets) == len(set(proc.probe_offsets))
+
+
+def test_tracker_mould_assignment_uses_containment_then_nearest(tmp_path):
+    proc = _make_proc(tmp_path)
+    proc._update_runtime_geometry(1920, 1080)
+    trolley = {"track_id": 11, "bbox": (100, 100, 600, 400), "confidence": 0.9}
+    moulds = [
+        {"track_id": 41, "bbox": (220, 230, 300, 310), "center": (260, 270)},
+        {"track_id": 42, "bbox": (420, 230, 500, 310), "center": (460, 270)},
+    ]
+    proc._update_tracked_mould_observations(moulds, trolley)
+
+    contained_mouth = {"bottom_center": (260, 200)}
+    assert proc._select_tracked_mould_for_pour(contained_mouth, trolley) == 41
+
+    nearest_mouth = {"bottom_center": (390, 120)}
+    assert proc._select_tracked_mould_for_pour(nearest_mouth, trolley) == 42
+
+
+def test_valid_pour_commits_tracker_id_and_short_pour_does_not(tmp_path):
+    proc = _make_proc(tmp_path)
+    proc._save_event_screenshot = lambda *args, **kwargs: None
+    now = datetime.now()
+
+    proc.pour_active = True
+    proc.pour_start_time = 0.0
+    proc.pour_start_datetime = now
+    proc._active_tracked_mould_id = 42
+    proc._end_pour(3.0, now, [], [], None)
+    assert proc.tracker_mould_count == 1
+    assert proc._poured_mould_durations[42] > 2.0
+
+    proc.pour_active = True
+    proc.pour_start_time = 10.0
+    proc.pour_start_datetime = now
+    proc._active_tracked_mould_id = 43
+    proc._end_pour(11.5, now, [], [], None)
+    assert proc.tracker_mould_count == 1
+
+
+def test_tracker_telemetry_counts_spatially_continuous_id_switch(tmp_path):
+    proc = _make_proc(tmp_path)
+    trolley = {"track_id": 11, "bbox": (100, 100, 600, 400), "confidence": 0.9}
+    proc._update_tracked_mould_observations(
+        [{"track_id": 41, "bbox": (220, 230, 300, 310), "center": (260, 270)}],
+        trolley,
+    )
+    proc._update_tracked_mould_observations(
+        [{"track_id": 99, "bbox": (224, 232, 304, 312), "center": (264, 272)}],
+        trolley,
+    )
+
+    assert proc._mould_id_switches == 1
+
+
+def test_tracker_mode_syncs_distinct_moulds_to_heat_cycle(tmp_path):
+    class CaptureHeatCycle:
+        def __init__(self):
+            self.records = {}
+
+        def upsert_completed_mould_pouring(self, **kwargs):
+            self.records[kwargs["mould_id"]] = kwargs
+
+    proc = _make_proc(tmp_path)
+    proc.mould_count_mode = "tracker"
+    proc.heat_cycle_manager = CaptureHeatCycle()
+    now = datetime.now()
+    proc._tracker_pour_records = {
+        41: {
+            "slot_id": 1,
+            "ladle_track_id": 7,
+            "start_time_wall": now.timestamp(),
+            "start_datetime_obj": now,
+            "end_time_wall": now.timestamp() + 3,
+            "end_datetime_obj": now,
+            "duration_s": 3.0,
+        },
+        99: {
+            "slot_id": 2,
+            "ladle_track_id": 7,
+            "start_time_wall": now.timestamp() + 4,
+            "start_datetime_obj": now,
+            "end_time_wall": now.timestamp() + 7,
+            "end_datetime_obj": now,
+            "duration_s": 3.0,
+        },
+    }
+
+    proc._sync_mould_records_to_heat_cycle()
+
+    assert set(proc.heat_cycle_manager.records) == {"MOULD_C1", "MOULD_C2"}
+    assert proc.heat_cycle_manager.records["MOULD_C1"]["mould_track_id"] == 41
 
 
 def test_session_start_end_and_cycle_timeout(tmp_path):

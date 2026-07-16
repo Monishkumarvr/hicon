@@ -31,6 +31,29 @@ def _get_rtsp_protocol(env_name: str, default: str) -> str:
     return value
 
 
+def _get_nvinfer_interval(env_name: str, config_filename: str, default: int) -> int:
+    """Use an explicit env override, otherwise mirror the deployed nvinfer config."""
+    env_value = os.getenv(env_name)
+    if env_value is not None:
+        return int(env_value)
+
+    config_dir = Path(
+        os.getenv('HICON_CONFIG_DIR', str(Path(__file__).parent / 'configs'))
+    )
+    try:
+        for raw_line in (config_dir / config_filename).read_text().splitlines():
+            line = raw_line.strip()
+            if line.startswith('interval='):
+                return int(line.split('=', 1)[1].strip())
+    except (OSError, ValueError):
+        logger.warning(
+            "Could not read interval from %s; using fallback %d",
+            config_filename,
+            default,
+        )
+    return int(default)
+
+
 # =============================================================================
 # API CONFIGURATION
 # =============================================================================
@@ -71,6 +94,7 @@ BATCH_SIZE = int(os.getenv('HICON_BATCH_SIZE', '50'))
 SCREENSHOT_MAX_WIDTH = int(os.getenv('HICON_SCREENSHOT_MAX_WIDTH', '1280'))
 SCREENSHOT_JPEG_QUALITY = int(os.getenv('HICON_SCREENSHOT_JPEG_QUALITY', '75'))
 SCREENSHOT_RETENTION_DAYS = int(os.getenv('HICON_SCREENSHOT_RETENTION_DAYS', '7'))
+SAVE_RAW_SCREENSHOTS = os.getenv('HICON_SAVE_RAW_SCREENSHOTS', 'false').lower() == 'true'
 
 # Maximum retry attempts for failed API requests
 MAX_RETRY_ATTEMPTS = int(os.getenv('HICON_MAX_RETRIES', '3'))
@@ -103,7 +127,11 @@ POUR_MIN_DURATION = float(os.getenv('HICON_POUR_MIN_DURATION', '2.0'))
 # nvinfer interval for pouring model — mirrors the `interval=N` value in config_pouring*.txt.
 # 0 = every frame (25fps inference); 1 = every 2nd frame (12.5fps inference).
 # Affects frame-count thresholds that only accumulate on inference frames.
-POUR_NVINFER_INTERVAL = int(os.getenv('HICON_POUR_NVINFER_INTERVAL', '1'))
+POUR_NVINFER_INTERVAL = _get_nvinfer_interval(
+    'HICON_POUR_NVINFER_INTERVAL',
+    'config_pouring_pgie.txt',
+    0,
+)
 
 # Mould counting: anchor-based trolley motion + spatial clustering
 MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15'))
@@ -379,6 +407,16 @@ VIDEO_DIR = Path(os.getenv('HICON_VIDEO_DIR', str(BASE_DIR / 'output/videos')))
 CONFIG_POURING = str(CONFIG_DIR / 'config_pouring_pgie.txt')
 CONFIG_PYROMETER = str(CONFIG_DIR / 'config_pyrometer_pgie.txt')
 CONFIG_POURING_2 = str(CONFIG_DIR / 'config_pouring2_pgie.txt')  # GIE-3: Stream 2 pouring
+CONFIG_MOULD = os.getenv(
+    'HICON_CONFIG_MOULD',
+    str(CONFIG_DIR / 'config_mould_pgie.txt'),
+)
+MOULD_GIE_ENABLED = os.getenv('HICON_MOULD_GIE_ENABLED', 'false').lower() == 'true'
+MOULD_GIE_INTERVAL = int(os.getenv('HICON_MOULD_GIE_INTERVAL', '11'))
+MOULD_COUNT_MODE = os.getenv('HICON_MOULD_COUNT_MODE', 'shadow').strip().lower()
+MOULD_MIN_AREA_PX = int(os.getenv('HICON_MOULD_MIN_AREA_PX', '400'))
+MOULD_TRACKER_CLASS_ID = int(os.getenv('HICON_MOULD_TRACKER_CLASS_ID', '2'))
+MOULD_GIE_UNIQUE_ID = int(os.getenv('HICON_MOULD_GIE_UNIQUE_ID', '4'))
 
 # =============================================================================
 # DATABASE CONFIGURATION
@@ -402,7 +440,10 @@ TRACKER_CONFIG = os.getenv(
 
 STREAM_0_TRACKER_CONFIG = os.getenv(
     'HICON_STREAM_0_TRACKER_CONFIG',
-    TRACKER_CONFIG
+    str(CONFIG_DIR / 'config_tracker_stream0.yml')
+)
+STREAM_0_TRACKER_MAX_TARGETS = int(
+    os.getenv('HICON_STREAM0_TRACKER_MAX_TARGETS', '64')
 )
 
 STREAM_2_TRACKER_WIDTH = int(os.getenv('HICON_STREAM_2_TRACKER_WIDTH', '640'))
@@ -426,7 +467,13 @@ ENABLE_LIVE_STREAM = os.getenv('HICON_ENABLE_LIVE_STREAM', 'false').lower() == '
 LIVE_STREAM_HOST = os.getenv('HICON_LIVE_STREAM_HOST', '0.0.0.0')
 LIVE_STREAM_PORT = int(os.getenv('HICON_LIVE_STREAM_PORT', '8080'))
 LIVE_STREAM_QUALITY = int(os.getenv('HICON_LIVE_STREAM_QUALITY', '85'))  # JPEG quality 0-100
-LIVE_STREAM_FPS = int(os.getenv('HICON_LIVE_STREAM_FPS', '15'))  # Max FPS for stream
+LIVE_STREAM_FPS = int(os.getenv('HICON_LIVE_STREAM_FPS', '10'))  # Max FPS for stream
+LIVE_STREAM_DEMAND_DRIVEN = os.getenv(
+    'HICON_LIVE_STREAM_DEMAND_DRIVEN', 'true'
+).lower() == 'true'
+LIVE_STREAM_IDLE_GRACE_SEC = float(
+    os.getenv('HICON_LIVE_STREAM_IDLE_GRACE_SEC', '5')
+)
 LIVE_STREAM_TIMESTAMP_OVERLAY = os.getenv(
     'HICON_LIVE_STREAM_TIMESTAMP_OVERLAY',
     'false',
@@ -462,6 +509,29 @@ def validate_config():
 
     if BATCH_SIZE < 1:
         raise ValueError("BATCH_SIZE must be at least 1")
+
+    if POUR_NVINFER_INTERVAL < 0 or MOULD_GIE_INTERVAL < 0:
+        raise ValueError("nvinfer intervals must be >= 0")
+
+    if MOULD_COUNT_MODE not in {'legacy', 'shadow', 'tracker'}:
+        raise ValueError("HICON_MOULD_COUNT_MODE must be legacy, shadow, or tracker")
+
+    if MOULD_COUNT_MODE == 'tracker' and not MOULD_GIE_ENABLED:
+        raise ValueError(
+            "HICON_MOULD_COUNT_MODE=tracker requires HICON_MOULD_GIE_ENABLED=true"
+        )
+
+    if STREAM_0_TRACKER_MAX_TARGETS < 1:
+        raise ValueError("HICON_STREAM0_TRACKER_MAX_TARGETS must be >= 1")
+
+    if not 1 <= SCREENSHOT_JPEG_QUALITY <= 100:
+        raise ValueError("HICON_SCREENSHOT_JPEG_QUALITY must be between 1 and 100")
+
+    if SCREENSHOT_MAX_WIDTH < 1 or LIVE_STREAM_FPS < 0:
+        raise ValueError("screenshot width must be >= 1 and live stream FPS >= 0")
+
+    if LIVE_STREAM_IDLE_GRACE_SEC < 0:
+        raise ValueError("HICON_LIVE_STREAM_IDLE_GRACE_SEC must be >= 0")
 
     if RTSP_TCP_TIMEOUT_US < 0:
         raise ValueError("RTSP_TCP_TIMEOUT_US must be >= 0")
@@ -580,7 +650,14 @@ def get_config_summary():
         'enable_live_stream_0': ENABLE_LIVE_STREAM_0,
         'enable_live_stream_1': ENABLE_LIVE_STREAM_1,
         'enable_live_stream_2': ENABLE_LIVE_STREAM_2,
+        'live_stream_fps': LIVE_STREAM_FPS,
+        'live_stream_demand_driven': LIVE_STREAM_DEMAND_DRIVEN,
+        'live_stream_idle_grace_sec': LIVE_STREAM_IDLE_GRACE_SEC,
         'live_stream_timestamp_overlay': LIVE_STREAM_TIMESTAMP_OVERLAY,
+        'mould_gie_enabled': MOULD_GIE_ENABLED,
+        'mould_gie_interval': MOULD_GIE_INTERVAL,
+        'mould_count_mode': MOULD_COUNT_MODE,
+        'stream_0_tracker_max_targets': STREAM_0_TRACKER_MAX_TARGETS,
         'inference_video_fps': INFERENCE_VIDEO_FPS,
         'inference_video_width': INFERENCE_VIDEO_WIDTH,
         'inference_video_height': INFERENCE_VIDEO_HEIGHT,
