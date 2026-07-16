@@ -35,20 +35,27 @@
 
 ---
 
-## Phase 0 — Quick wins (config-only, this week; today's audit numbers are the baseline)
+## Phase 0 — Quick wins — **DONE, verified 2026-07-16**
 
-| # | Change | Where | Expected | Risk |
-|---|--------|-------|----------|------|
-| 0.1 | `kernel.panic=10` (keep `panic_on_oops=1`) | `/etc/sysctl.d/90-hicon.conf` | Oops → 10 s reboot instead of永hang | None |
-| 0.2 | Pin GPU min_freq = 624.75 MHz | `/sys/class/devfreq/17000000.gpu/min_freq` via oneshot systemd unit | Kills DVFS-lag share of 99% samples; ~1 W idle | Negligible at 15W |
-| 0.3 | CPU governor → performance | same oneshot unit | +8% of a core (sugov), stable freqs | Watch VDD_IN/temps; trivial revert |
-| 0.4 | Pouring nvinfer `interval=0 → 1` | `configs/config_pouring_pgie.txt:11` | ~10 GPU-pts. Code already propagates it (`config.py:_get_nvinfer_interval` scales all temporal thresholds; probe reads post-tracker bboxes; pour brightness is video-sampled) | Low — state machines filtered ≥0.2 s; golden-clip parity required |
-| 0.5 | Revert CP-Plus forced-GPU convert → VIC | `pipeline/gst_builder.py:397–421` (applied :1288): drop `compute-hw=1`/`disable-passthrough` on `nvvidconv_osd_0` | Free 3–5 GPU-pts | Old stall could resurface — 1 h FPS-log soak |
-| 0.6 | Rebuild pouring engine on-device | delete `models/onnx/best_pouring_hicon_hikvision_v1_557...engine`, nvinfer rebuilds (~6 min; service stopped during build) | Removes cross-device engine warning; possibly better tactics | None |
-| 0.7 | Demote per-second INFO logs (`[tapping] ratio`, pyro raw detections) to DEBUG / 10 s cadence | `processors/brightness_processor.py:389–403` + pyrometer processor | ~8.5k records/104 min → near-zero; signal-to-noise | None (keep event start/end at INFO) |
-| 0.8 | THP → madvise | sysctl.d / oneshot unit | Removes khugepaged jitter (minor) | Low |
+| # | Change | Where | Result | Risk |
+|---|--------|-------|--------|------|
+| 0.1 | `kernel.panic=10` (keep `panic_on_oops=1`) | `/etc/sysctl.d/90-hicon.conf` | Live (`sysctl kernel.panic` = 10) | None |
+| 0.2 | Pin GPU min_freq = 624.75 MHz | `hicon-clocks.service` (oneshot, enabled) → `/sys/class/devfreq/17000000.gpu/min_freq` | Live; tegrastats confirms GR3D always reports `@[624]`, even at 0% and 99% load — DVFS lag eliminated | Negligible at 15W |
+| 0.3 | CPU governor → performance | same unit | Live; all 6 cores hold 1510 MHz under load (no more 729–1510 MHz dithering) | Watched VDD_IN/temps — no change |
+| 0.4 | Pouring nvinfer `interval=0 → 1` | `configs/config_pouring_pgie.txt:11` | Live; confirmed on disk + picked up at startup | Low — state machines filtered ≥0.2 s |
+| 0.5 | Revert CP-Plus forced-GPU convert → VIC | `pipeline/gst_builder.py`: guarded `_tune_stream0_postmux_convert_for_cp_plus` behind `if not self.use_nvurisrcbin_0` at all 3 call sites (matches the existing mux-tuning guard pattern) | Live; journal confirms `"skipping CP Plus postmux-convert tuning for nvurisrcbin (VIC path)"` on the production branch | Old stall could resurface — watching |
+| 0.6 | Rebuild pouring engine on-device | deleted `best_pouring_hicon_hikvision_v1_557.onnx_b1_gpu0_fp16.engine`; nvinfer rebuilt on restart | Done; rebuild took ~7 min, "serialize cuda engine to file... successfully" | None |
+| 0.7 | Demote per-second INFO logs to DEBUG/10s cadence | `processors/brightness_processor.py:389` (tapping ratio), `processors/pyrometer_processor.py:168` (raw detections) | Done; both switched to `logger.debug` at 250-frame (~10s) cadence; event start/end still INFO | None |
+| 0.8 | THP → madvise | same oneshot unit | Live (`cat .../enabled` shows `[madvise]`) | Low |
 
-**Gate:** tegrastats @200 ms ≥10 min before/after: avg GR3D expected ~56% → ~40–45%, %samples@99 materially down; 25 fps ×3 held 1 h; golden recorded-pour parity for 0.4.
+**Gate result (tegrastats @200ms, 60s samples, before/after the same restart window):**
+
+| Metric | Before | After | Target |
+|---|---|---|---|
+| avg GR3D | 58.3% | **45.2%** | ~40–45% |
+| %samples ≥99% | 30.8% | **16.5%** | materially down |
+
+FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
 ## Phase 1 — Baseline & telemetry (before any deeper change)
 

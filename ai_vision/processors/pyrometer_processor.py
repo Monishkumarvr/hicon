@@ -165,17 +165,19 @@ class PyrometerProcessor:
                 self._last_frame = frame.copy()
             self._last_detections = detections
 
-            # Periodic raw detection log — shows all confidences regardless of threshold
+            # Periodic raw detection log — shows all confidences regardless of threshold.
+            # ~10s cadence, DEBUG (Edge_Optimization_Plan.md Phase 0.7; event start/end
+            # below stays at INFO).
             if not hasattr(self, '_pyro_log_counter'):
                 self._pyro_log_counter = 0
             self._pyro_log_counter += 1
-            if self._pyro_log_counter >= 25:
+            if self._pyro_log_counter >= 250:
                 self._pyro_log_counter = 0
                 if raw_confs:
-                    logger.info("[pyrometer] raw detections: %s (threshold=%.2f passed=%d)",
+                    logger.debug("[pyrometer] raw detections: %s (threshold=%.2f passed=%d)",
                                 raw_confs, self.confidence_threshold, len(detections))
                 else:
-                    logger.info("[pyrometer] no detections this frame (threshold=%.2f)",
+                    logger.debug("[pyrometer] no detections this frame (threshold=%.2f)",
                                 self.confidence_threshold)
 
             # Check each zone independently

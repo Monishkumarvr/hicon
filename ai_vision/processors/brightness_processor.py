@@ -385,14 +385,15 @@ class BrightnessProcessor:
         white_ratio = white_pixels / pixel_count if pixel_count > 0 else 0.0
         self._last_white_ratios[tracker.name] = white_ratio
 
-        # Periodic per-frame tapping diagnostic log (~1s interval at 25fps)
+        # Periodic tapping diagnostic log (~10s interval at 25fps; DEBUG — see
+        # Edge_Optimization_Plan.md Phase 0.7, event start/end stay at INFO)
         if tracker.name == "tapping":
             if not hasattr(self, '_tap_log_counter'):
                 self._tap_log_counter = 0
             self._tap_log_counter += 1
-            if self._tap_log_counter >= 25:
+            if self._tap_log_counter >= 250:
                 self._tap_log_counter = 0
-                logger.info(
+                logger.debug(
                     "[tapping] ratio=%.3f (need>=%.2f) thresh=Y>%d on=%d/%d state=%s",
                     white_ratio,
                     tracker.start_white_ratio,

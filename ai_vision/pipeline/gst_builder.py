@@ -1093,7 +1093,10 @@ class DeepStreamPipelineBuilder:
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
                 self._configure_leaky_queue(self.elements['postmuxq0'], max_buffers=64)
                 self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-0")
-                self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
+                else:
+                    logger.info("Stream 0: skipping CP Plus postmux-convert tuning for nvurisrcbin (VIC path)")
                 self.elements['postconv_sink_0'] = Gst.ElementFactory.make("fakesink", "postconv-sink-0")
                 self.elements['postconv_sink_0'].set_property('sync', 0)
                 self.elements['postconv_sink_0'].set_property('async', False)
@@ -1116,7 +1119,10 @@ class DeepStreamPipelineBuilder:
                 self.elements['postmuxq0'] = Gst.ElementFactory.make("queue", "postmuxq0")
                 self._configure_leaky_queue(self.elements['postmuxq0'], max_buffers=64)
                 self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv-osd-0")
-                self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
+                else:
+                    logger.info("Stream 0: skipping CP Plus postmux-convert tuning for nvurisrcbin (VIC path)")
                 self.elements['caps_osd_0'] = Gst.ElementFactory.make("capsfilter", "caps-osd-0")
                 self.elements['caps_osd_0'].set_property(
                     'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
@@ -1285,7 +1291,13 @@ class DeepStreamPipelineBuilder:
                     self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make(
                         "nvvideoconvert", "nvvidconv-osd-0"
                     )
-                    self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
+                    if not self.use_nvurisrcbin_0:
+                        self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
+                    else:
+                        logger.info(
+                            "Stream 0: skipping CP Plus postmux-convert tuning for nvurisrcbin "
+                            "(VIC path — Edge_Optimization_Plan.md Phase 0.5)"
+                        )
                     self.elements['caps_osd_0'] = Gst.ElementFactory.make("capsfilter", "caps-osd-0")
                     self.elements['caps_osd_0'].set_property(
                         'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
