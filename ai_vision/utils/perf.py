@@ -19,12 +19,19 @@ def timed_section(
     logger: logging.Logger | None = None,
     level: int = logging.DEBUG,
 ) -> Iterator[None]:
-    """Log sections that exceed the requested duration threshold."""
+    """Log sections that exceed the requested duration threshold, and always
+    record the elapsed time into utils.metrics.REGISTRY for periodic p50/p95/p99
+    reporting (Edge_Optimization_Plan.md Phase 1). The registry write is a bounded
+    deque append — cheap enough for every probe frame.
+    """
     active_logger = logger or _LOGGER
     start = time.perf_counter()
     try:
         yield
     finally:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        from utils.metrics import REGISTRY  # local import: avoids a hard import-time cycle
+
+        REGISTRY.record_latency(name, elapsed_ms)
         if elapsed_ms >= threshold_ms and active_logger.isEnabledFor(level):
             active_logger.log(level, "[PERF] %s: %.1f ms", name, elapsed_ms)

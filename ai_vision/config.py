@@ -484,6 +484,9 @@ ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_S
 ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 ENABLE_LIVE_STREAM_2 = os.getenv('HICON_ENABLE_LIVE_STREAM_2', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 
+# === Telemetry (Edge_Optimization_Plan.md Phase 1) ===
+METRICS_INTERVAL_SEC = float(os.getenv('HICON_METRICS_INTERVAL_SEC', '60'))
+
 
 # =============================================================================
 # CONFIGURATION VALIDATION

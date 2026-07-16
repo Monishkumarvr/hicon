@@ -57,14 +57,22 @@
 
 FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
-## Phase 1 — Baseline & telemetry (before any deeper change)
+## Phase 1 — Baseline & telemetry — **landed 2026-07-17 (app-level + sidecar); soak/NVTX still open**
 
-- Stop on-device dev tooling (VS Code server, agent CLIs, Node — ~1.5–2 GB RSS, 30–50% of a core) during every benchmark window.
-- Add allocation-light aggregate telemetry (60 s cadence, `HICON_METRICS_INTERVAL_SEC`): per-probe p50/p95/p99/max latency; surface map/copy counts+duration; queue depth/age/high-water/drops; per-GIE TRT+parser latency; tracker occupancy; DB/screenshot/log/preview queue depths; GPU saturation frequency; per-thread CPU; RSS/PSS; zram; **cgroup `memory.events`+`memory.stat` (NOT PSI — unavailable on this kernel)**; VIC/NVDEC/EMC; power; temps; reconnects.
-- Enable DeepStream component-latency measurement + NVTX ranges (probes, parsers, native analysis, screenshot extraction, event dispatch).
-- Record four 30-min baselines: idle analytics (0 preview clients); 1 and 3 preview clients; active pour+tapping+deslagging+pyrometer events; screenshot/DB/cloud-sync burst.
-- Nsight Systems 20–30 s traces only during an approved outage with `hicon-vision` otherwise stopped. Never attach heavy profilers to live production.
-- Observe (never modify) `/proc/interrupts`, softnet, context switches, reclaim, CMA, NIC counters.
+Implemented:
+- `ai_vision/utils/metrics.py` — `MetricsRegistry` (bounded per-name latency deques, counters, zero-arg gauge callables) + `MetricsReporter` background thread. Emits one structured `[METRICS]` JSON line per `HICON_METRICS_INTERVAL_SEC` (default 60s) via a dedicated `metrics` logger, then resets the latency window — a per-interval snapshot, not a running average.
+- `utils/perf.py: timed_section` now always records into the registry (previously only logged on threshold breach) — the 3 existing call sites (`probe.stream0.cpu_analysis`, `probe.stream1.pyrometer`, `probe.stream2.pouring`) get p50/p95/p99/max for free, no new hot-path instrumentation.
+- Queue-depth gauges registered for `AsyncDBWriter` (`_queue.qsize`, `_queue_full_count`) and `AsyncScreenshotWriter` (`_queue.qsize`) — read at report time, not pushed per-item.
+- Process RSS/threads, thermal zones, zram, and this process's own cgroup `memory.current`/`memory.stat`/`memory.events` (path resolved from `/proc/self/cgroup`, not hardcoded to a unit name) — all unprivileged-readable, verified on-device.
+- **GPU/NVDEC/VIC/EMC/power are deliberately NOT in the app process** — confirmed no unprivileged sysfs path exists for GR3D load% on this kernel (checked `/sys/devices/17000000.gpu`, `/sys/class/devfreq/17000000.gpu`, `/sys/kernel/debug`). Added a separate root-owned `hicon-tegrastats.service` (`tegrastats --interval 60000 --logfile /var/log/hicon/tegrastats.log`, weekly-rotated via `/etc/logrotate.d/hicon-tegrastats`) — live and logging, confirmed one line/60s with full GR3D/NVDEC/VIC/EMC/VDD_IN/temp coverage. Does not touch `hicon-vision.service`.
+- Tests: `tests/test_metrics.py` (8 cases — percentile correctness, reset vs. preserve, counters, gauges incl. exception handling, `timed_section` integration). Full suite: 103 passed, same 3 pre-existing unrelated failures, zero regressions.
+- **Not yet activated in the live process** — the code ships in this commit but `MetricsReporter` starts on the *next* `hicon-vision` restart (bundled with Phase 2, to avoid a second same-night restart after Phase 0's).
+
+Still open (deferred, not blocking Phase 2):
+- DeepStream native component-latency measurement + NVTX ranges.
+- The four 30-min labeled baselines (idle / 1-client / 3-client / active-event) — need real operating windows once the reporter is live.
+- Nsight Systems traces (only during an approved outage, service stopped) — schedule separately.
+- Passive `/proc/interrupts`/softnet/CMA observation — already covered by the earlier kernel/OS audit in this doc's evidence base; re-check only if Phase 2+ changes threading.
 
 ## Phase 2 — Remove continuous frame-processing waste
 

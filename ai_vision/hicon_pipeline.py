@@ -59,6 +59,7 @@ from processors.pyrometer_processor import PyrometerProcessor
 from state.heat_cycle_manager import HeatCycleManager
 from sync.api_client import APIClient
 from sync.sync_manager import SyncManager
+from utils.metrics import REGISTRY as metrics_registry, MetricsReporter
 from utils.perf import timed_section
 from utils.screenshot import AsyncScreenshotWriter
 from utils.zone_loader import load_zones_config
@@ -1347,6 +1348,14 @@ def main():
         save_raw=config.SAVE_RAW_SCREENSHOTS,
     )
 
+    # Telemetry (Edge_Optimization_Plan.md Phase 1): queue-depth gauges pull live
+    # state at report time — no per-item instrumentation added to the writers.
+    metrics_registry.register_gauge('db_writer.queue_depth', async_db_writer._queue.qsize)
+    metrics_registry.register_gauge('db_writer.queue_full_count', lambda: async_db_writer._queue_full_count)
+    metrics_registry.register_gauge('screenshot_writer.queue_depth', screenshot_writer._queue.qsize)
+    metrics_reporter = MetricsReporter(interval_sec=config.METRICS_INTERVAL_SEC)
+    metrics_reporter.start()
+
     # Load zone configuration
     zones_path = str(config.CONFIG_DIR / 'zones.json')
     zones_config = load_zones_config(zones_path)
@@ -2240,6 +2249,11 @@ def main():
                 async_db_writer.stop(timeout=5.0, drain=True)
             except Exception as e:
                 logger.error(f"Error stopping async DB writer: {e}", exc_info=True)
+        if metrics_reporter:
+            try:
+                metrics_reporter.stop()
+            except Exception as e:
+                logger.error(f"Error stopping metrics reporter: {e}", exc_info=True)
         pipeline.set_state(Gst.State.NULL)
         builder.terminate_ffmpeg_procs()
         logger.info("Pipeline stopped")
