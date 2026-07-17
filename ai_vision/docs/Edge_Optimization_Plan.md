@@ -57,6 +57,60 @@
 
 FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
+## Update 2026-07-17 — 12h telemetry findings, interval rebalance, canonical mould registry
+
+**Telemetry correction:** tegrastats `GR3D_FREQ %` is a short-window point sample, NOT an
+interval average — "saturated minutes" in earlier drafts actually meant "samples landing
+inside a burst". 12h analysis (733 samples): avg GR3D 42%, burst residency 19%,
+**uncorrelated with all activity** (P(sat|pour)=P(sat|idle)=0.19) — and **zero pours occurred
+in the whole window**, so every mould-GIE inference (the 60–90 ms monolith, unconditional at
+interval 11) was wasted on an empty bay. Phase 0 pins held all night (only 624 MHz seen,
+CPU floor 1510); tj ≤61.9 °C, VDD_IN ≤10.1 W, no leak, no GPU-caused frame loss.
+
+**Mould jitter root-caused and fixed (hicon-7kk):** 819 distinct NvDCF mould IDs in 13h vs
+peak 25 visible; old diagnostics ran post-trolley-filter and reported `visible=0
+id_switches=0` all day. Landed:
+1. **Interval rebalance:** pyro 2→4 (`config_pyrometer_pgie.txt`, with interval-derived
+   temporal scaling in `pyrometer_processor.py`: `effective_out=12`, `idle_grace=0.8s`) funded
+   mould 11→**7** (`config_mould_pgie.txt` + `.env`). Gate result (5 min @200 ms):
+   **avg GR3D 34.5%, burst residency 15.3%** — 1.7× mould cadence for −10.7 GPU points net.
+   Stage 2 (mould →5) allowed once a pouring shift of jitter data confirms.
+2. **Canonical mould registry** (`pouring_processor.py`): moulds latch after ≥3 matches over
+   ≥1 s at a stable trolley-relative position, then hold a stable `canonical_id` + EMA
+   position matched **by position, not tracker ID** — churn-immune ("freeze unless moved /
+   new mould placed", ported from the C++ CanonicalMould concept). Pour assignment + shadow
+   `tracker_mould_count` use canonical IDs; raw-ID count kept as `raw_tracker_mould_count`
+   diagnostic. Raw churning rects suppressed on OSD; stable canonical boxes drawn on the
+   MJPEG overlay (no trolley ⇒ no mould boxes by design; `HICON_MOULD_RAW_OVERLAY=true`
+   shows raw ghosts). Confidence hysteresis: latch ≥0.35, refresh ≥0.20. Rollback:
+   `HICON_MOULD_CANONICAL_ENABLED=false`.
+3. **Max logging:** `[mould-raw]` (pre-filter count/conf/area ~5 s), trolley-independent
+   lifecycle (births/deaths/lifespan p50/global ID-switches) in the extended
+   `[mould-tracker]` line + `[METRICS]` counters/gauges, per-frame CSV
+   (`HICON_MOULD_DIAG_CSV=true` → `output/csv/mould_diag_*.csv`, bounded async writer),
+   canonical latch/expiry events at INFO. First live data: mould confidences 0.62–0.88
+   (solid — flicker is tracker churn, not detector noise).
+4. Tests: `tests/test_mould_canonical_registry.py` (10 cases); suite 113 pass / same 3
+   pre-existing unrelated failures.
+
+**Solution space evaluated (recorded for posterity):** canonical registry (chosen);
+interval rebalance (chosen, staged); confidence hysteresis in registry (chosen);
+NvDCF probation/termination tuning (pending CSV data — params shared with mouth/trolley);
+INT8 mould engine (Phase 4, needs calibration set); adaptive per-state scheduling
+(deferred until registry data in); overlay-only smoothing (subsumed by registry);
+960² re-export (banned: no resolution-altered models); mux/letterbox review (only if
+CSV shows small-area flicker).
+
+**RTSP outage storm is a NEW fault, not the June gateway bug (hicon-b22):** June fix
+verified intact (camera 0 gw 28.8 alive; cams 1&2 gw 28.200 alive, MAC c8:4f:86:a2:62:44;
+ARP entries match camera MACs; keepalive applied every startup). New signature: onset
+Jul 15, **diurnal** (~50/hr 08:00–17:00, ~3/hr overnight), ~300 s per-stream periodicity,
+52 all-stream-simultaneous clusters/day, TCP connect-phase failures, local side proven
+clean. `hicon-rtsp-probe.service` (ffmpeg TCP control puller on cam 1 sub-stream →
+`/var/log/hicon/rtsp_probe.log`) now running to prove external-vs-internal. **Site
+hand-off: identify 192.168.28.200, what changed on the camera VLAN ~Jul 15, switch port
+counters during a storm hour.**
+
 ## Phase 1 — Baseline & telemetry — **landed 2026-07-17 (app-level + sidecar); soak/NVTX still open**
 
 Implemented:

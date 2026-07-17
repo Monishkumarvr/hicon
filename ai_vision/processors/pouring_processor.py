@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pyds
 
+from utils.metrics import REGISTRY as METRICS_REGISTRY
+from utils.mould_diag import MouldDiagWriter
 from utils.utils import generate_sync_id
 from utils.screenshot import (prepare_frame, add_header, add_footer,
                                save as save_screenshot, _to_coco_bbox)
@@ -239,6 +241,50 @@ class PouringProcessor:
         self._mould_peak_visible = 0
         self._last_mould_observations_by_id: Dict[int, Dict[str, Any]] = {}
         self._mould_id_switches = 0
+
+        # --- Canonical mould registry ("freeze unless moved / new mould placed") ---
+        # Latched moulds keep a stable canonical_id + EMA position in trolley-relative
+        # coordinates, matched by POSITION (not tracker ID) so NvDCF ID churn cannot
+        # flicker the overlay or inflate counts. Concept ported from the C++ reference
+        # (deepstream_pouring_app.cpp CanonicalMould/OverlayLedger).
+        self.canonical_enabled = bool(getattr(config, 'MOULD_CANONICAL_ENABLED', True))
+        self.canonical_match_radius = float(getattr(config, 'MOULD_CANONICAL_MATCH_RADIUS', 0.08))
+        self.canonical_latch_hits = int(getattr(config, 'MOULD_CANONICAL_LATCH_HITS', 3))
+        self.canonical_latch_min_age_s = float(getattr(config, 'MOULD_CANONICAL_LATCH_MIN_AGE_S', 1.0))
+        self.canonical_candidate_ttl_s = float(getattr(config, 'MOULD_CANONICAL_CANDIDATE_TTL_S', 6.0))
+        self.canonical_ttl_s = float(getattr(config, 'MOULD_CANONICAL_TTL_S', 30.0))
+        self.canonical_ema_alpha = float(getattr(config, 'MOULD_CANONICAL_EMA_ALPHA', 0.2))
+        self.canonical_latch_conf = float(getattr(config, 'MOULD_CANONICAL_LATCH_CONF', 0.35))
+        self.canonical_refresh_conf = float(getattr(config, 'MOULD_CANONICAL_REFRESH_CONF', 0.20))
+        self.raw_mould_overlay = bool(getattr(config, 'MOULD_RAW_OVERLAY', False))
+        self._canonical_moulds: Dict[int, Dict[str, Any]] = {}
+        self._canonical_candidates: List[Dict[str, Any]] = []
+        self._next_canonical_id = 1
+        self._canonical_latched_total = 0
+        self._canonical_expired_total = 0
+        self._active_raw_tracked_mould_id: Optional[int] = None
+        self._poured_raw_mould_ids = set()
+
+        # --- Trolley-independent mould track lifecycle (jitter diagnostics) ---
+        # Tracks ALL mould tracker IDs (pre trolley-filter) so churn is measurable even
+        # with no locked trolley — the blind spot that hid the 819-IDs-in-13h churn.
+        self._mould_life_first_seen: Dict[int, Tuple[int, float]] = {}  # id -> (frame, ts)
+        self._mould_life_last_seen: Dict[int, Tuple[int, float]] = {}
+        self._mould_life_births = 0
+        self._mould_life_deaths = 0
+        self._mould_lifespan_samples: List[float] = []  # seconds, bounded
+        self._mould_global_switches = 0
+        self._last_global_mould_centroids: Dict[int, Tuple[float, float]] = {}
+        self._last_mould_raw_log_ts = 0.0
+
+        self._mould_diag_writer: Optional[MouldDiagWriter] = None
+        if bool(getattr(config, 'MOULD_DIAG_CSV', False)) and self.mould_gie_enabled:
+            csv_dir = Path(getattr(config, 'SCREENSHOT_DIR', Path('output/screenshots'))).parent / 'csv'
+            try:
+                self._mould_diag_writer = MouldDiagWriter(csv_dir)
+            except Exception:
+                logger.exception("Mould diag CSV writer failed to start; continuing without")
+
         self._restore_tracker_state_from_heat_cycle()
 
         # --- Last known probe state (for screenshot annotations) ---
@@ -480,7 +526,7 @@ class PouringProcessor:
 
         # 2. Find the relevant trolley (locked or best candidate)
         target_trolley = self._get_target_trolley(trolleys, timestamp, mouths)
-        self._update_tracked_mould_observations(moulds, target_trolley)
+        self._update_tracked_mould_observations(moulds, target_trolley, timestamp)
 
         # 3. Check mouth-in-trolley (with EDGE_EXPAND)
         mouth_in_trolley = False
@@ -610,6 +656,14 @@ class PouringProcessor:
                 and track_id != _UNTRACKED_OBJECT_ID
             ):
                 moulds.append(det)
+                if self.canonical_enabled and not self.raw_mould_overlay:
+                    # Freeze layer owns the mould display: hide the churning raw
+                    # rects so nvosd/MJPEG only show stable canonical boxes.
+                    try:
+                        obj_meta.rect_params.border_width = 0
+                        obj_meta.text_params.display_text = ""
+                    except Exception:
+                        pass
             elif class_id == CLASS_MOUTH and conf >= self.mouth_conf:
                 mouths.append(det)
             elif class_id == CLASS_TROLLEY and conf >= self.trolley_conf:
@@ -626,8 +680,236 @@ class PouringProcessor:
     def _bboxes_overlap(a, b) -> bool:
         return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
 
-    def _update_tracked_mould_observations(self, moulds, target_trolley) -> None:
+    def _update_mould_lifecycle(self, moulds, timestamp: float) -> None:
+        """Trolley-independent mould track birth/death/switch accounting.
+
+        Runs on ALL tracked mould objects (pre trolley-filter) so ID churn is
+        measurable even without a locked trolley. Deaths are detected lazily: an ID
+        unseen for >2s is considered dead and its lifespan recorded.
+        """
+        if not self.mould_gie_enabled:
+            return
+
+        frame_w = max(float(self._frame_w or 1600), 1.0)
+        frame_h = max(float(self._frame_h or 900), 1.0)
+        current_centroids: Dict[int, Tuple[float, float]] = {}
+        for mould in moulds:
+            mould_id = int(mould.get('track_id', -1))
+            if mould_id < 0:
+                continue
+            bbox = mould.get('bbox', (0, 0, 0, 0))
+            cx, cy = mould.get('center', ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2))
+            current_centroids[mould_id] = (cx / frame_w, cy / frame_h)
+            if mould_id not in self._mould_life_first_seen:
+                self._mould_life_first_seen[mould_id] = (self._frame_count, timestamp)
+                self._mould_life_births += 1
+                METRICS_REGISTRY.increment('mould.track_births')
+            self._mould_life_last_seen[mould_id] = (self._frame_count, timestamp)
+
+        # Global ID-switch heuristic: a dead ID replaced by a new ID at nearly the
+        # same frame-normalized position (~<3% of frame diagonal) within one frame.
+        previous_ids = set(self._last_global_mould_centroids)
+        appeared = set(current_centroids) - previous_ids
+        disappeared = previous_ids - set(current_centroids)
+        unmatched = set(appeared)
+        for old_id in disappeared:
+            if not unmatched:
+                break
+            old_pos = self._last_global_mould_centroids[old_id]
+            new_id = min(
+                unmatched,
+                key=lambda cand: math.hypot(
+                    old_pos[0] - current_centroids[cand][0],
+                    old_pos[1] - current_centroids[cand][1],
+                ),
+            )
+            if math.hypot(
+                old_pos[0] - current_centroids[new_id][0],
+                old_pos[1] - current_centroids[new_id][1],
+            ) <= 0.03:
+                self._mould_global_switches += 1
+                unmatched.remove(new_id)
+        self._last_global_mould_centroids = current_centroids
+
+        # Lazy death sweep (throttled): unseen >2s => dead, record lifespan.
+        if self._frame_count % 50 == 0 and self._mould_life_last_seen:
+            dead = [
+                mould_id for mould_id, (_, last_ts) in self._mould_life_last_seen.items()
+                if timestamp - last_ts > 2.0
+            ]
+            for mould_id in dead:
+                _, first_ts = self._mould_life_first_seen.pop(mould_id, (0, timestamp))
+                _, last_ts = self._mould_life_last_seen.pop(mould_id)
+                self._mould_life_deaths += 1
+                METRICS_REGISTRY.increment('mould.track_deaths')
+                self._mould_lifespan_samples.append(max(0.0, last_ts - first_ts))
+                if len(self._mould_lifespan_samples) > 500:
+                    del self._mould_lifespan_samples[:250]
+
+        # Raw-detection visibility, throttled ~5s while moulds are in view.
+        if moulds and (timestamp - self._last_mould_raw_log_ts) >= 5.0:
+            self._last_mould_raw_log_ts = timestamp
+            confs = sorted(float(m.get('confidence', 0.0)) for m in moulds)
+            areas = [
+                max(0, m['bbox'][2] - m['bbox'][0]) * max(0, m['bbox'][3] - m['bbox'][1])
+                for m in moulds
+                if m.get('bbox')
+            ]
+            logger.info(
+                "[mould-raw] n=%d conf min/med/max=%.2f/%.2f/%.2f min_area=%d "
+                "births=%d deaths=%d global_switches=%d",
+                len(moulds),
+                confs[0],
+                confs[len(confs) // 2],
+                confs[-1],
+                min(areas) if areas else 0,
+                self._mould_life_births,
+                self._mould_life_deaths,
+                self._mould_global_switches,
+            )
+        if moulds:
+            METRICS_REGISTRY.increment('mould.det_frames')
+            METRICS_REGISTRY.increment('mould.dets', len(moulds))
+
+    def _lifespan_p50(self) -> float:
+        samples = self._mould_lifespan_samples
+        if not samples:
+            return 0.0
+        ordered = sorted(samples)
+        return ordered[len(ordered) // 2]
+
+    def _update_canonical_moulds(self, observations, timestamp: float) -> None:
+        """Canonical registry: latch stable moulds, freeze their position/ID.
+
+        Matching is by trolley-normalized position (radius = canonical_match_radius),
+        never by tracker ID — so NvDCF churn refreshes existing entries instead of
+        creating new boxes. New physical placements appear as candidates and latch
+        after canonical_latch_hits matches over >= canonical_latch_min_age_s.
+        """
+        if not self.canonical_enabled:
+            return
+
+        def _dist(a, b) -> float:
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        alpha = self.canonical_ema_alpha
+        for obs in observations:
+            conf = float(obs.get('confidence', 0.0))
+            if conf < self.canonical_refresh_conf:
+                continue
+            pos = obs['centroid_rel']
+
+            matched_cid = None
+            best_d = self.canonical_match_radius
+            for cid, entry in self._canonical_moulds.items():
+                d = _dist(pos, entry['centroid_rel'])
+                if d <= best_d:
+                    best_d = d
+                    matched_cid = cid
+            if matched_cid is not None:
+                entry = self._canonical_moulds[matched_cid]
+                entry['centroid_rel'] = (
+                    (1 - alpha) * entry['centroid_rel'][0] + alpha * pos[0],
+                    (1 - alpha) * entry['centroid_rel'][1] + alpha * pos[1],
+                )
+                entry['bbox'] = obs['bbox']
+                entry['last_seen_ts'] = timestamp
+                entry['hits'] += 1
+                entry['tracker_ids'].add(int(obs['track_id']))
+                continue
+
+            # No canonical match: feed candidates (a NEW mould being placed).
+            matched_cand = None
+            best_d = self.canonical_match_radius
+            for cand in self._canonical_candidates:
+                d = _dist(pos, cand['centroid_rel'])
+                if d <= best_d:
+                    best_d = d
+                    matched_cand = cand
+            if matched_cand is None:
+                if conf >= self.canonical_latch_conf:
+                    self._canonical_candidates.append({
+                        'centroid_rel': pos,
+                        'bbox': obs['bbox'],
+                        'first_ts': timestamp,
+                        'last_seen_ts': timestamp,
+                        'hits': 1,
+                        'tracker_ids': {int(obs['track_id'])},
+                    })
+                continue
+            matched_cand['centroid_rel'] = (
+                (1 - alpha) * matched_cand['centroid_rel'][0] + alpha * pos[0],
+                (1 - alpha) * matched_cand['centroid_rel'][1] + alpha * pos[1],
+            )
+            matched_cand['bbox'] = obs['bbox']
+            matched_cand['last_seen_ts'] = timestamp
+            matched_cand['hits'] += 1
+            matched_cand['tracker_ids'].add(int(obs['track_id']))
+            if (
+                matched_cand['hits'] >= self.canonical_latch_hits
+                and timestamp - matched_cand['first_ts'] >= self.canonical_latch_min_age_s
+            ):
+                cid = self._next_canonical_id
+                self._next_canonical_id += 1
+                self._canonical_moulds[cid] = {
+                    'cid': cid,
+                    'centroid_rel': matched_cand['centroid_rel'],
+                    'bbox': matched_cand['bbox'],
+                    'first_ts': matched_cand['first_ts'],
+                    'last_seen_ts': timestamp,
+                    'hits': matched_cand['hits'],
+                    'tracker_ids': set(matched_cand['tracker_ids']),
+                }
+                self._canonical_candidates.remove(matched_cand)
+                self._canonical_latched_total += 1
+                logger.info(
+                    "[mould-canonical] LATCHED cid=%d at rel=(%.3f,%.3f) hits=%d "
+                    "tracker_ids=%d total_canonical=%d",
+                    cid,
+                    matched_cand['centroid_rel'][0],
+                    matched_cand['centroid_rel'][1],
+                    matched_cand['hits'],
+                    len(matched_cand['tracker_ids']),
+                    len(self._canonical_moulds),
+                )
+
+        # Throttled expiry sweep.
+        if self._frame_count % 25 == 0:
+            self._canonical_candidates = [
+                cand for cand in self._canonical_candidates
+                if timestamp - cand['last_seen_ts'] <= self.canonical_candidate_ttl_s
+            ]
+            expired = [
+                cid for cid, entry in self._canonical_moulds.items()
+                if timestamp - entry['last_seen_ts'] > self.canonical_ttl_s
+                and cid not in self._poured_mould_ids
+            ]
+            for cid in expired:
+                entry = self._canonical_moulds.pop(cid)
+                self._canonical_expired_total += 1
+                logger.info(
+                    "[mould-canonical] EXPIRED cid=%d after %.1fs unseen (moved/removed) "
+                    "remaining=%d",
+                    cid,
+                    timestamp - entry['last_seen_ts'],
+                    len(self._canonical_moulds),
+                )
+
+    def _canonical_observation_list(self) -> List[Dict[str, Any]]:
+        """Canonical entries shaped like observations for pour assignment."""
+        return [
+            {
+                'track_id': cid,
+                'bbox': entry['bbox'],
+                'centroid_rel': entry['centroid_rel'],
+            }
+            for cid, entry in self._canonical_moulds.items()
+        ]
+
+    def _update_tracked_mould_observations(self, moulds, target_trolley, timestamp=None) -> None:
         """Filter tracked mould boxes to the active/target trolley like the C++ reference."""
+        ts = timestamp if timestamp is not None else time.time()
+        self._update_mould_lifecycle(moulds, ts)
         observations = []
         if target_trolley is not None:
             trolley_bbox = target_trolley['bbox']
@@ -701,12 +983,28 @@ class PouringProcessor:
         self._seen_mould_ids.update(current_ids)
         self._mould_peak_visible = max(self._mould_peak_visible, len(observations))
 
+        self._update_canonical_moulds(observations, ts)
+
+        if self._mould_diag_writer is not None and (moulds or observations or self.session_active):
+            self._mould_diag_writer.write_row(
+                frame=self._frame_count,
+                ts=ts,
+                n_raw=len(moulds),
+                n_tracked=len(current_ids),
+                n_filtered=len(observations),
+                n_canonical=len(self._canonical_moulds),
+                track_ids=sorted(int(m.get('track_id', -1)) for m in moulds),
+                confs=[float(m.get('confidence', 0.0)) for m in moulds],
+            )
+
         if self._frame_count % 250 == 0 and self.mould_gie_enabled:
             cap_pressure = len(observations) / max(self.tracker_max_targets, 1)
             log = logger.warning if cap_pressure >= 0.75 else logger.info
             log(
                 "[mould-tracker] visible=%d peak=%d seen_ids=%d poured_ids=%d "
-                "active_ids=%s cap=%d pressure=%.1f%% id_switches=%d",
+                "active_ids=%s cap=%d pressure=%.1f%% id_switches=%d "
+                "canonical=%d latched=%d expired=%d births=%d deaths=%d "
+                "lifespan_p50=%.1fs global_switches=%d",
                 len(observations),
                 self._mould_peak_visible,
                 len(self._seen_mould_ids),
@@ -715,11 +1013,35 @@ class PouringProcessor:
                 self.tracker_max_targets,
                 cap_pressure * 100.0,
                 self._mould_id_switches,
+                len(self._canonical_moulds),
+                self._canonical_latched_total,
+                self._canonical_expired_total,
+                self._mould_life_births,
+                self._mould_life_deaths,
+                self._lifespan_p50(),
+                self._mould_global_switches,
             )
 
     def _select_tracked_mould_for_pour(self, mouth, trolley) -> Optional[int]:
-        """Assign a pour using 30/50px containment, then nearest centroid."""
-        observations = self._tracked_mould_observations
+        """Assign a pour to a mould (canonical registry when enabled, else raw tracks).
+
+        With the registry enabled the returned ID is a stable canonical_id — immune
+        to NvDCF ID churn. The raw-track selection is still computed and stashed for
+        shadow diagnostics. Returns None while the registry has nothing latched yet
+        (the caller retries every frame; latch takes ~1s from first sighting).
+        """
+        self._active_raw_tracked_mould_id = self._select_mould_from_entries(
+            self._tracked_mould_observations, mouth, trolley
+        )
+        if self.canonical_enabled:
+            selected = self._select_mould_from_entries(
+                self._canonical_observation_list(), mouth, trolley
+            )
+            return None if selected is None else int(selected)
+        return self._active_raw_tracked_mould_id
+
+    def _select_mould_from_entries(self, observations, mouth, trolley) -> Optional[int]:
+        """30/50px probe containment, then nearest centroid, over entry dicts."""
         if not observations or mouth is None or trolley is None:
             return None
 
@@ -1911,6 +2233,7 @@ class PouringProcessor:
         self.active_mould_start_norm = None
         self._active_segment = None
         self._active_tracked_mould_id = None
+        self._active_raw_tracked_mould_id = None
         self.brightness_above_since = None
         self.brightness_below_since = None
         self.pour_on_count = 0
@@ -1929,9 +2252,11 @@ class PouringProcessor:
                 target_trolley,
             )
             logger.info(
-                "[mould-tracker] pour start assignment=%s visible=%d",
+                "[mould-tracker] pour start assignment=%s raw=%s visible=%d canonical=%d",
                 self._active_tracked_mould_id,
+                self._active_raw_tracked_mould_id,
                 len(self._tracked_mould_observations),
+                len(self._canonical_moulds),
             )
 
         # Placement detector: capture pre-pour snapshot, detect new mould blob
@@ -2034,6 +2359,8 @@ class PouringProcessor:
         self.last_pour_duration = duration
 
         committed_tracker_id = self._active_tracked_mould_id
+        if self._active_raw_tracked_mould_id is not None:
+            self._poured_raw_mould_ids.add(int(self._active_raw_tracked_mould_id))
         if committed_tracker_id is not None and committed_tracker_id >= 0:
             committed_tracker_id = int(committed_tracker_id)
             self._poured_mould_ids.add(committed_tracker_id)
@@ -2187,6 +2514,16 @@ class PouringProcessor:
                 "tracker_mould_durations": {
                     str(mould_id): round(duration_s, 2)
                     for mould_id, duration_s in sorted(self._poured_mould_durations.items())
+                },
+                "raw_tracker_mould_count": len(self._poured_raw_mould_ids),
+                "canonical_mould_count": len(self._canonical_moulds),
+                "mould_lifecycle": {
+                    "births": self._mould_life_births,
+                    "deaths": self._mould_life_deaths,
+                    "lifespan_p50_s": round(self._lifespan_p50(), 2),
+                    "global_id_switches": self._mould_global_switches,
+                    "canonical_latched": self._canonical_latched_total,
+                    "canonical_expired": self._canonical_expired_total,
                 },
                 "reactive_mould_count": self.mould_count,
                 "predictive_mould_count": predictive_count,
@@ -2397,7 +2734,9 @@ class PouringProcessor:
         self._last_active_materialize_ts = None
         self._tracked_mould_observations.clear()
         self._active_tracked_mould_id = None
+        self._active_raw_tracked_mould_id = None
         self._poured_mould_ids.clear()
+        self._poured_raw_mould_ids.clear()
         self._poured_mould_durations.clear()
         self._tracker_pour_records.clear()
         self._tracker_slot_by_id.clear()
@@ -2405,6 +2744,8 @@ class PouringProcessor:
         self._mould_peak_visible = 0
         self._last_mould_observations_by_id.clear()
         self._mould_id_switches = 0
+        self._canonical_moulds.clear()
+        self._canonical_candidates.clear()
         self.mouth_last_seen_in_trolley = None
         self.cycle_start_time = None
         self.cycle_start_datetime = None
@@ -2767,6 +3108,18 @@ class PouringProcessor:
                 ex2 = int(x2 + self.edge_expand_x_px)
                 ey2 = int(y2 + self.edge_expand_y_px)
                 cv2.rectangle(frame_bgr, (ex1, ey1), (ex2, ey2), (0, 255, 0), 1)
+
+            # Canonical mould boxes (stable freeze layer; raw churning rects are
+            # suppressed at extraction time). Poured moulds render brighter + 'P'.
+            if self.canonical_enabled and self._canonical_moulds:
+                for cid, entry in list(self._canonical_moulds.items()):
+                    bx1, by1, bx2, by2 = (int(v) for v in entry['bbox'])
+                    poured = cid in self._poured_mould_ids
+                    color = (0, 220, 0) if poured else (0, 170, 255)
+                    cv2.rectangle(frame_bgr, (bx1, by1), (bx2, by2), color, 2)
+                    label = f"M{cid}" + ("*" if poured else "")
+                    cv2.putText(frame_bgr, label, (bx1, max(12, by1 - 4)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         except Exception as exc:
             logger.debug("[cpu-overlay] pouring draw error: %s", exc)
 
@@ -2791,7 +3144,14 @@ class PouringProcessor:
         )
 
     def close(self):
-        """Compatibility no-op. DS-native recording is managed by pipeline/RecordingManager."""
+        """Flush/stop the diagnostics writer. DS-native recording is managed by
+        pipeline/RecordingManager."""
+        if self._mould_diag_writer is not None:
+            try:
+                self._mould_diag_writer.stop()
+            except Exception:
+                logger.exception("Mould diag writer stop failed")
+            self._mould_diag_writer = None
         return None
 
     def __del__(self):

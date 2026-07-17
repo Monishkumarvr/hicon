@@ -127,6 +127,9 @@ def test_runtime_geometry_dedupes_offsets_after_rounding(tmp_path):
 
 def test_tracker_mould_assignment_uses_containment_then_nearest(tmp_path):
     proc = _make_proc(tmp_path)
+    # Exercise the raw-track selection path (canonical registry has its own tests
+    # in test_mould_canonical_registry.py and is bypassed here).
+    proc.canonical_enabled = False
     proc._update_runtime_geometry(1920, 1080)
     trolley = {"track_id": 11, "bbox": (100, 100, 600, 400), "confidence": 0.9}
     moulds = [

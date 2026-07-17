@@ -1481,6 +1481,19 @@ def main():
                 placement_detector=_placement_detector,
             )
             logger.info("Stream 0: Pouring processor initialized")
+            _pp = pouring_processor
+            metrics_registry.register_gauge(
+                'mould.visible', lambda: len(_pp._tracked_mould_observations))
+            metrics_registry.register_gauge(
+                'mould.seen_ids', lambda: len(_pp._seen_mould_ids))
+            metrics_registry.register_gauge(
+                'mould.canonical_count', lambda: len(_pp._canonical_moulds))
+            metrics_registry.register_gauge(
+                'mould.global_id_switches', lambda: _pp._mould_global_switches)
+            metrics_registry.register_gauge(
+                'mould.lifespan_p50_s', _pp._lifespan_p50)
+            metrics_registry.register_gauge(
+                'mould.gie_interval', lambda: int(config.MOULD_GIE_INTERVAL))
         except Exception as e:
             logger.warning(f"Stream 0: Pouring processor not available: {e}")
             pouring_processor = None

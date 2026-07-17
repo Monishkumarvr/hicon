@@ -75,6 +75,17 @@ class PyrometerProcessor:
         self.temporal_in_frames = zone_config.get('temporal_in_frames', 10)
         self.temporal_out_frames = zone_config.get('temporal_out_frames', 10)
 
+        # nvinfer interval-aware scaling: with interval=N the detector only refreshes
+        # every N+1 frames, but this probe runs every frame. The IDLE counter-reset
+        # grace and the ACTIVE out-counter must both tolerate skipped-inference frames
+        # (and one missed detection cycle) or interval changes silently break events.
+        nvinfer_interval = max(0, int(getattr(config, 'PYRO_NVINFER_INTERVAL', 2)))
+        cycle_frames = nvinfer_interval + 1
+        self._idle_reset_grace_s = max(0.5, 4.0 * cycle_frames / 25.0)
+        self.temporal_out_frames_effective = max(
+            int(self.temporal_out_frames), 2 * cycle_frames + 2
+        )
+
         # Build zone states — multi-zone or legacy single-zone fallback
         self.zone_states: Dict[str, PyroZoneState] = {}
         zones_data = zone_config.get('zones', {})
@@ -102,7 +113,10 @@ class PyrometerProcessor:
         logger.info(
             f"PyrometerProcessor initialized: {len(self.zone_states)} zones ({zone_names}), "
             f"conf>={self.confidence_threshold}, min_area={self.min_area_px2}px², "
-            f"temporal_in={self.temporal_in_frames}, temporal_out={self.temporal_out_frames}"
+            f"temporal_in={self.temporal_in_frames}, temporal_out={self.temporal_out_frames} "
+            f"(effective_out={self.temporal_out_frames_effective}, "
+            f"idle_grace={self._idle_reset_grace_s:.2f}s, "
+            f"nvinfer_interval={getattr(config, 'PYRO_NVINFER_INTERVAL', 2)})"
         )
 
     @property
@@ -238,15 +252,14 @@ class PyrometerProcessor:
             else:
                 # With nvinfer interval>0, skipped frames produce no detections and would
                 # instantly reset the counter. Only reset after the rod has been absent
-                # long enough for multiple inference cycles to have run (~0.5s covers
-                # 4 inference cycles at interval=2, 25fps).
-                if zs.in_zone_counter > 0 and (now_wall - zs.last_in_zone_time) > 0.5:
+                # long enough for ~4 inference cycles to have run (interval-derived).
+                if zs.in_zone_counter > 0 and (now_wall - zs.last_in_zone_time) > self._idle_reset_grace_s:
                     zs.in_zone_counter = 0
 
         elif zs.state == "ACTIVE":
             if not rod_in_zone:
                 zs.out_zone_counter += 1
-                if zs.out_zone_counter >= self.temporal_out_frames:
+                if zs.out_zone_counter >= self.temporal_out_frames_effective:
                     end_time = now_wall
                     end_datetime = now_dt
                     duration = end_time - zs.event_start_time

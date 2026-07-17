@@ -131,7 +131,9 @@ def _read_thermal_zones() -> dict:
                 with open(f"{base}/{entry}/temp") as f:
                     milli_c = int(f.read().strip())
                 out[zone_type] = round(milli_c / 1000.0, 1)
-            except OSError:
+            except (OSError, ValueError, TypeError):
+                # Some tegra thermal nodes intermittently fail reads with odd
+                # errors (TypeError from codecs on a None raw read) — skip zone.
                 continue
     except OSError:
         pass

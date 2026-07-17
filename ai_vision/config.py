@@ -418,6 +418,34 @@ MOULD_MIN_AREA_PX = int(os.getenv('HICON_MOULD_MIN_AREA_PX', '400'))
 MOULD_TRACKER_CLASS_ID = int(os.getenv('HICON_MOULD_TRACKER_CLASS_ID', '2'))
 MOULD_GIE_UNIQUE_ID = int(os.getenv('HICON_MOULD_GIE_UNIQUE_ID', '4'))
 
+# Pyrometer nvinfer interval (mirrors the value in config_pyrometer_pgie.txt); used
+# to scale the pyro temporal-filter grace windows so wall-clock semantics survive
+# interval changes.
+PYRO_NVINFER_INTERVAL = _get_nvinfer_interval(
+    'HICON_PYRO_NVINFER_INTERVAL', 'config_pyrometer_pgie.txt', 2
+)
+
+# --- Canonical mould registry (freeze layer over churning NvDCF mould IDs) ---
+# A mould "latches" after being matched LATCH_HITS times over >= LATCH_MIN_AGE_S at a
+# stable trolley-relative position; latched entries keep a stable canonical id and an
+# EMA position regardless of tracker-ID churn. Match radius is trolley-normalized
+# (same space as CLUSTER_R_CLUSTER).
+MOULD_CANONICAL_ENABLED = os.getenv('HICON_MOULD_CANONICAL_ENABLED', 'true').lower() == 'true'
+MOULD_CANONICAL_MATCH_RADIUS = float(os.getenv('HICON_MOULD_CANONICAL_MATCH_RADIUS', '0.08'))
+MOULD_CANONICAL_LATCH_HITS = int(os.getenv('HICON_MOULD_CANONICAL_LATCH_HITS', '3'))
+MOULD_CANONICAL_LATCH_MIN_AGE_S = float(os.getenv('HICON_MOULD_CANONICAL_LATCH_MIN_AGE_S', '1.0'))
+MOULD_CANONICAL_CANDIDATE_TTL_S = float(os.getenv('HICON_MOULD_CANONICAL_CANDIDATE_TTL_S', '6.0'))
+MOULD_CANONICAL_TTL_S = float(os.getenv('HICON_MOULD_CANONICAL_TTL_S', '30.0'))
+MOULD_CANONICAL_EMA_ALPHA = float(os.getenv('HICON_MOULD_CANONICAL_EMA_ALPHA', '0.2'))
+# Confidence hysteresis: latch requires a solid detection; refresh accepts weaker ones.
+MOULD_CANONICAL_LATCH_CONF = float(os.getenv('HICON_MOULD_CANONICAL_LATCH_CONF', '0.35'))
+MOULD_CANONICAL_REFRESH_CONF = float(os.getenv('HICON_MOULD_CANONICAL_REFRESH_CONF', '0.20'))
+# Hide the raw (churning) mould rects on the OSD; canonical boxes render instead.
+MOULD_RAW_OVERLAY = os.getenv('HICON_MOULD_RAW_OVERLAY', 'false').lower() == 'true'
+
+# Per-frame mould diagnostics CSV (output/csv/mould_diag_YYYYMMDD.csv).
+MOULD_DIAG_CSV = os.getenv('HICON_MOULD_DIAG_CSV', 'false').lower() == 'true'
+
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
