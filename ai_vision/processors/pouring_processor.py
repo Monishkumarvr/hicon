@@ -262,6 +262,12 @@ class PouringProcessor:
         self._next_canonical_id = 1
         self._canonical_latched_total = 0
         self._canonical_expired_total = 0
+        self._canonical_merges_total = 0
+        # EMA-smoothed trolley bbox used for mould normalization: trolley detection
+        # wobble otherwise shifts ALL rel coords at once, spawning duplicate latches.
+        self._trolley_norm_ema: Optional[Tuple[float, float, float, float]] = None
+        self._trolley_norm_ema_tid: Optional[int] = None
+        self._last_trolley_norm_w: float = 0.0
         self._active_raw_tracked_mould_id: Optional[int] = None
         self._poured_raw_mould_ids = set()
 
@@ -827,54 +833,132 @@ class PouringProcessor:
         ordered = sorted(samples)
         return ordered[len(ordered) // 2]
 
+    def _canonical_adaptive_radius(self, entry) -> float:
+        """Match radius scaled to the entry's own width (detection-variant offsets
+        on one mould shift its center by up to ~half its width), clamped so
+        adjacent moulds (spacing ~0.25 rel) stay distinct."""
+        rel_w = 0.0
+        bbox = entry.get('bbox')
+        if bbox and self._last_trolley_norm_w > 0:
+            rel_w = max(0, bbox[2] - bbox[0]) / self._last_trolley_norm_w
+        return min(max(self.canonical_match_radius, 0.5 * rel_w), 0.12)
+
+    @staticmethod
+    def _rel_dist(a, b) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def _canonical_same_mould(self, entry_a, entry_b) -> bool:
+        """Duplicate test for the merge sweep / latch guard."""
+        if self._bbox_iou(entry_a.get('bbox') or (0, 0, 0, 0),
+                          entry_b.get('bbox') or (0, 0, 0, 0)) > 0.4:
+            return True
+        return self._rel_dist(entry_a['centroid_rel'], entry_b['centroid_rel']) < 0.06
+
+    def _refresh_canonical(self, cid, obs, timestamp) -> None:
+        alpha = self.canonical_ema_alpha
+        entry = self._canonical_moulds[cid]
+        pos = obs['centroid_rel']
+        entry['centroid_rel'] = (
+            (1 - alpha) * entry['centroid_rel'][0] + alpha * pos[0],
+            (1 - alpha) * entry['centroid_rel'][1] + alpha * pos[1],
+        )
+        entry['bbox'] = obs['bbox']
+        entry['last_seen_ts'] = timestamp
+        entry['hits'] += 1
+        entry['tracker_ids'].add(int(obs.get('track_id', -1)))
+
+    def _merge_canonical(self, keep_cid: int, drop_cid: int) -> None:
+        """Collapse a duplicate canonical entry into the kept one, transferring
+        pour aggregates so counted moulds are never lost by the merge."""
+        keep = self._canonical_moulds[keep_cid]
+        drop = self._canonical_moulds.pop(drop_cid)
+        keep['tracker_ids'].update(drop['tracker_ids'])
+        keep['hits'] += drop['hits']
+        keep['first_ts'] = min(keep['first_ts'], drop['first_ts'])
+        keep['last_seen_ts'] = max(keep['last_seen_ts'], drop['last_seen_ts'])
+
+        if drop_cid in self._poured_mould_ids:
+            self._poured_mould_ids.discard(drop_cid)
+            self._poured_mould_ids.add(keep_cid)
+            self._poured_mould_durations[keep_cid] += self._poured_mould_durations.pop(drop_cid, 0.0)
+            drop_rec = self._tracker_pour_records.pop(drop_cid, None)
+            keep_rec = self._tracker_pour_records.get(keep_cid)
+            if drop_rec is not None and keep_rec is None:
+                self._tracker_pour_records[keep_cid] = drop_rec
+            elif drop_rec is not None and keep_rec is not None:
+                keep_rec['duration_s'] = float(self._poured_mould_durations[keep_cid])
+                if drop_rec['end_time_wall'] > keep_rec['end_time_wall']:
+                    keep_rec['end_time_wall'] = drop_rec['end_time_wall']
+                    keep_rec['end_datetime_obj'] = drop_rec['end_datetime_obj']
+            drop_slot = self._tracker_slot_by_id.pop(drop_cid, None)
+            if drop_slot is not None and keep_cid not in self._tracker_slot_by_id:
+                self._tracker_slot_by_id[keep_cid] = drop_slot
+        if self._active_tracked_mould_id == drop_cid:
+            self._active_tracked_mould_id = keep_cid
+
+        self._canonical_merges_total += 1
+        METRICS_REGISTRY.increment('mould.canonical_merges')
+        logger.info(
+            "[mould-canonical] MERGED cid=%d -> cid=%d (duplicate) remaining=%d",
+            drop_cid, keep_cid, len(self._canonical_moulds),
+        )
+
     def _update_canonical_moulds(self, observations, timestamp: float) -> None:
         """Canonical registry: latch stable moulds, freeze their position/ID.
 
-        Matching is by trolley-normalized position (radius = canonical_match_radius),
-        never by tracker ID — so NvDCF churn refreshes existing entries instead of
-        creating new boxes. New physical placements appear as candidates and latch
-        after canonical_latch_hits matches over >= canonical_latch_min_age_s.
+        Matching is scale-aware (bbox IoU >= 0.30 OR adaptive rel-distance) and
+        strictly one-to-one per frame: each observation refreshes at most one
+        entry and each entry accepts at most one observation — so detection
+        variants of one mould cannot spawn or feed duplicates. A throttled sweep
+        merges any duplicates that still form and expires stale entries.
         """
         if not self.canonical_enabled:
             return
 
-        def _dist(a, b) -> float:
-            return math.hypot(a[0] - b[0], a[1] - b[1])
-
-        alpha = self.canonical_ema_alpha
-        for obs in observations:
-            conf = float(obs.get('confidence', 0.0))
-            if conf < self.canonical_refresh_conf:
+        # --- One-to-one obs <-> canonical assignment (best pairs first) ---
+        pairs = []
+        eligible = []
+        for oi, obs in enumerate(observations):
+            if float(obs.get('confidence', 0.0)) < self.canonical_refresh_conf:
                 continue
+            eligible.append(oi)
+            for cid, entry in self._canonical_moulds.items():
+                d = self._rel_dist(obs['centroid_rel'], entry['centroid_rel'])
+                iou = self._bbox_iou(obs.get('bbox') or (0, 0, 0, 0),
+                                     entry.get('bbox') or (0, 0, 0, 0))
+                if iou >= 0.30 or d <= self._canonical_adaptive_radius(entry):
+                    pairs.append((-iou, d, oi, cid))
+        pairs.sort()
+        matched_obs = set()
+        matched_cids = set()
+        for _neg_iou, _d, oi, cid in pairs:
+            if oi in matched_obs or cid in matched_cids:
+                continue
+            matched_obs.add(oi)
+            matched_cids.add(cid)
+            self._refresh_canonical(cid, observations[oi], timestamp)
+
+        # --- Unmatched observations feed candidates (a NEW mould being placed) ---
+        alpha = self.canonical_ema_alpha
+        used_cands = set()
+        for oi in eligible:
+            if oi in matched_obs:
+                continue
+            obs = observations[oi]
+            conf = float(obs.get('confidence', 0.0))
             pos = obs['centroid_rel']
 
-            matched_cid = None
-            best_d = self.canonical_match_radius
-            for cid, entry in self._canonical_moulds.items():
-                d = _dist(pos, entry['centroid_rel'])
-                if d <= best_d:
-                    best_d = d
-                    matched_cid = cid
-            if matched_cid is not None:
-                entry = self._canonical_moulds[matched_cid]
-                entry['centroid_rel'] = (
-                    (1 - alpha) * entry['centroid_rel'][0] + alpha * pos[0],
-                    (1 - alpha) * entry['centroid_rel'][1] + alpha * pos[1],
-                )
-                entry['bbox'] = obs['bbox']
-                entry['last_seen_ts'] = timestamp
-                entry['hits'] += 1
-                entry['tracker_ids'].add(int(obs['track_id']))
-                continue
-
-            # No canonical match: feed candidates (a NEW mould being placed).
             matched_cand = None
             best_d = self.canonical_match_radius
-            for cand in self._canonical_candidates:
-                d = _dist(pos, cand['centroid_rel'])
-                if d <= best_d:
-                    best_d = d
-                    matched_cand = cand
+            for ci, cand in enumerate(self._canonical_candidates):
+                if ci in used_cands:
+                    continue
+                iou = self._bbox_iou(obs.get('bbox') or (0, 0, 0, 0),
+                                     cand.get('bbox') or (0, 0, 0, 0))
+                d = self._rel_dist(pos, cand['centroid_rel'])
+                if iou >= 0.30 or d <= best_d:
+                    best_d = min(best_d, d)
+                    matched_cand = ci
             if matched_cand is None:
                 if conf >= self.canonical_latch_conf:
                     self._canonical_candidates.append({
@@ -883,47 +967,77 @@ class PouringProcessor:
                         'first_ts': timestamp,
                         'last_seen_ts': timestamp,
                         'hits': 1,
-                        'tracker_ids': {int(obs['track_id'])},
+                        'tracker_ids': {int(obs.get('track_id', -1))},
                     })
                 continue
-            matched_cand['centroid_rel'] = (
-                (1 - alpha) * matched_cand['centroid_rel'][0] + alpha * pos[0],
-                (1 - alpha) * matched_cand['centroid_rel'][1] + alpha * pos[1],
+            used_cands.add(matched_cand)
+            cand = self._canonical_candidates[matched_cand]
+            cand['centroid_rel'] = (
+                (1 - alpha) * cand['centroid_rel'][0] + alpha * pos[0],
+                (1 - alpha) * cand['centroid_rel'][1] + alpha * pos[1],
             )
-            matched_cand['bbox'] = obs['bbox']
-            matched_cand['last_seen_ts'] = timestamp
-            matched_cand['hits'] += 1
-            matched_cand['tracker_ids'].add(int(obs['track_id']))
+            cand['bbox'] = obs['bbox']
+            cand['last_seen_ts'] = timestamp
+            cand['hits'] += 1
+            cand['tracker_ids'].add(int(obs.get('track_id', -1)))
             if (
-                matched_cand['hits'] >= self.canonical_latch_hits
-                and timestamp - matched_cand['first_ts'] >= self.canonical_latch_min_age_s
+                cand['hits'] >= self.canonical_latch_hits
+                and timestamp - cand['first_ts'] >= self.canonical_latch_min_age_s
             ):
+                # Latch guard: if the matured candidate overlaps an existing
+                # canonical (merge rule), refresh that entry instead of
+                # latching a duplicate.
+                guard_cid = None
+                for cid, entry in self._canonical_moulds.items():
+                    if self._canonical_same_mould(cand, entry):
+                        guard_cid = cid
+                        break
+                self._canonical_candidates.remove(cand)
+                if guard_cid is not None:
+                    self._refresh_canonical(guard_cid, obs, timestamp)
+                    continue
                 cid = self._next_canonical_id
                 self._next_canonical_id += 1
                 self._canonical_moulds[cid] = {
                     'cid': cid,
-                    'centroid_rel': matched_cand['centroid_rel'],
-                    'bbox': matched_cand['bbox'],
-                    'first_ts': matched_cand['first_ts'],
+                    'centroid_rel': cand['centroid_rel'],
+                    'bbox': cand['bbox'],
+                    'first_ts': cand['first_ts'],
                     'last_seen_ts': timestamp,
-                    'hits': matched_cand['hits'],
-                    'tracker_ids': set(matched_cand['tracker_ids']),
+                    'hits': cand['hits'],
+                    'tracker_ids': set(cand['tracker_ids']),
                 }
-                self._canonical_candidates.remove(matched_cand)
                 self._canonical_latched_total += 1
                 logger.info(
                     "[mould-canonical] LATCHED cid=%d at rel=(%.3f,%.3f) hits=%d "
                     "tracker_ids=%d total_canonical=%d",
                     cid,
-                    matched_cand['centroid_rel'][0],
-                    matched_cand['centroid_rel'][1],
-                    matched_cand['hits'],
-                    len(matched_cand['tracker_ids']),
+                    cand['centroid_rel'][0],
+                    cand['centroid_rel'][1],
+                    cand['hits'],
+                    len(cand['tracker_ids']),
                     len(self._canonical_moulds),
                 )
 
-        # Throttled expiry sweep.
+        # --- Throttled sweep: merge duplicates, expire candidates + stale entries ---
         if self._frame_count % 25 == 0:
+            cids = sorted(self._canonical_moulds)
+            removed = set()
+            for i, ca in enumerate(cids):
+                if ca in removed:
+                    continue
+                for cb in cids[i + 1:]:
+                    if cb in removed:
+                        continue
+                    if self._canonical_same_mould(
+                        self._canonical_moulds[ca], self._canonical_moulds[cb]
+                    ):
+                        keep, drop = ca, cb
+                        if cb in self._poured_mould_ids and ca not in self._poured_mould_ids:
+                            keep, drop = cb, ca
+                        self._merge_canonical(keep, drop)
+                        removed.add(drop)
+
             self._canonical_candidates = [
                 cand for cand in self._canonical_candidates
                 if timestamp - cand['last_seen_ts'] <= self.canonical_candidate_ttl_s
@@ -961,7 +1075,20 @@ class PouringProcessor:
         self._update_mould_lifecycle(moulds, ts)
         observations = []
         if target_trolley is not None:
-            trolley_bbox = target_trolley['bbox']
+            raw_bbox = target_trolley['bbox']
+            trolley_tid = int(target_trolley.get('track_id', -1))
+            if (
+                self._trolley_norm_ema is not None
+                and self._trolley_norm_ema_tid == trolley_tid
+            ):
+                prev = self._trolley_norm_ema
+                trolley_bbox = tuple(
+                    0.7 * prev[i] + 0.3 * float(raw_bbox[i]) for i in range(4)
+                )
+            else:
+                trolley_bbox = tuple(float(v) for v in raw_bbox)
+            self._trolley_norm_ema = trolley_bbox
+            self._trolley_norm_ema_tid = trolley_tid
             tx1, ty1, tx2, ty2 = trolley_bbox
             padded_bbox = (
                 tx1 - self.edge_expand_x_px,
@@ -971,6 +1098,7 @@ class PouringProcessor:
             )
             tw = max(float(tx2 - tx1), 1.0)
             th = max(float(ty2 - ty1), 1.0)
+            self._last_trolley_norm_w = tw
 
             for mould in moulds:
                 x1, y1, x2, y2 = mould['bbox']
@@ -1044,6 +1172,7 @@ class PouringProcessor:
                 n_canonical=len(self._canonical_moulds),
                 track_ids=sorted(int(m.get('track_id', -1)) for m in moulds),
                 confs=[float(m.get('confidence', 0.0)) for m in moulds],
+                bboxes=[m['bbox'] for m in moulds if m.get('bbox')],
             )
 
         if self._frame_count % 250 == 0 and self.mould_gie_enabled:
@@ -1052,7 +1181,7 @@ class PouringProcessor:
             log(
                 "[mould-tracker] visible=%d peak=%d seen_ids=%d poured_ids=%d "
                 "active_ids=%s cap=%d pressure=%.1f%% id_switches=%d "
-                "canonical=%d latched=%d expired=%d births=%d deaths=%d "
+                "canonical=%d latched=%d expired=%d merges=%d births=%d deaths=%d "
                 "lifespan_p50=%.1fs global_switches=%d",
                 len(observations),
                 self._mould_peak_visible,
@@ -1065,6 +1194,7 @@ class PouringProcessor:
                 len(self._canonical_moulds),
                 self._canonical_latched_total,
                 self._canonical_expired_total,
+                self._canonical_merges_total,
                 self._mould_life_births,
                 self._mould_life_deaths,
                 self._lifespan_p50(),
@@ -2583,6 +2713,7 @@ class PouringProcessor:
                     "global_id_switches": self._mould_global_switches,
                     "canonical_latched": self._canonical_latched_total,
                     "canonical_expired": self._canonical_expired_total,
+                    "canonical_merges": self._canonical_merges_total,
                 },
                 "reactive_mould_count": self.mould_count,
                 "predictive_mould_count": predictive_count,
@@ -2805,6 +2936,8 @@ class PouringProcessor:
         self._mould_id_switches = 0
         self._canonical_moulds.clear()
         self._canonical_candidates.clear()
+        self._trolley_norm_ema = None
+        self._trolley_norm_ema_tid = None
         self.mouth_last_seen_in_trolley = None
         self.cycle_start_time = None
         self.cycle_start_datetime = None

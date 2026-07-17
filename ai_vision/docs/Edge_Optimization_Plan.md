@@ -101,6 +101,35 @@ INT8 mould engine (Phase 4, needs calibration set); adaptive per-state schedulin
 960² re-export (banned: no resolution-altered models); mux/letterbox review (only if
 CSV shows small-area flicker).
 
+**P0 regression found & fixed same day (hicon-75h):** pouring `interval=1` (Phase 0.4) broke
+pour capture entirely — tracker-propagated frames carry `obj_meta.confidence = -0.1`, the
+mouth/trolley conf gates emptied every other frame, and the session accumulator reset each
+time → **zero pours recorded Jul 16 23:26 → Jul 17 17:28** (unrecoverable; expect a gap vs
+the foundry report for that window). Fix: interval-derived confidence bridge in
+`_extract_detections` (below-threshold dets pass if their track was confidently detected
+within `bridge_s`; disabled at interval=0) + gap-tolerant session accumulator. 6 regression
+tests incl. the end-to-end missed-pour scenario. **Lesson recorded: any nvinfer interval
+change must be audited against every conf-gated consumer of obj_meta, not just frame-count
+thresholds.**
+
+**Duplicate canonical boxes fixed (same day):** live pours showed overlapping canonical
+entries (up to 21 for ≤8 physical moulds; 22.5% of frames had more canonicals than raw
+dets). Causes: centroid-only matching (radius 0.08 vs mould rel-width ~0.23 — detection
+variants escaped), no canonical↔canonical dedup, trolley-bbox wobble shifting all rel
+coords, and detector NMS at 0.5 passing offset duplicates. Fixes: scale-aware matching
+(bbox IoU ≥ 0.30 OR adaptive radius clamp(0.5×rel_width, 0.08, 0.12)), strict one-to-one
+obs↔entry assignment per frame, throttled merge sweep (IoU>0.4 or dist<0.06 → keep
+older/poured id, transfer pour aggregates), latch guard, EMA-smoothed trolley bbox for
+normalization, `nms-iou-threshold 0.5→0.30` + `pre-cluster-threshold 0.25→0.30` in
+`config_mould_pgie.txt` (post-processing only, no engine rebuild), CSV gains a `bboxes`
+column. Gates: canonical count ≤ physical mould count during trolley visits; `MERGED`
+events rare after warm-up.
+
+**Known model blind spot (needs training data, not code):** the trolley detector misses the
+glowing post-pour trolley at the bottom transit position (15:49 frame: mould model saw 6/6,
+trolley 0 → no anchor, no boxes). Pour counting is unaffected (pours happen up-frame), but
+collect these frames as a training-gap set alongside the INT8 calibration set.
+
 **RTSP outage storm is a NEW fault, not the June gateway bug (hicon-b22):** June fix
 verified intact (camera 0 gw 28.8 alive; cams 1&2 gw 28.200 alive, MAC c8:4f:86:a2:62:44;
 ARP entries match camera MACs; keepalive applied every startup). New signature: onset

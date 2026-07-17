@@ -18,7 +18,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_HEADER = "frame,ts,n_raw,n_tracked,n_filtered,n_canonical,track_ids,confs\n"
+_HEADER = "frame,ts,n_raw,n_tracked,n_filtered,n_canonical,track_ids,confs,bboxes\n"
 _FLUSH_EVERY = 100
 
 
@@ -44,13 +44,18 @@ class MouldDiagWriter:
         return self._dropped
 
     def write_row(self, frame: int, ts: float, n_raw: int, n_tracked: int,
-                  n_filtered: int, n_canonical: int, track_ids, confs) -> None:
+                  n_filtered: int, n_canonical: int, track_ids, confs,
+                  bboxes=()) -> None:
         """Enqueue one row; never blocks the caller."""
         if self._stopped:
             return
         ids_txt = ' '.join(str(i) for i in track_ids)
         confs_txt = ' '.join(f"{c:.2f}" for c in confs)
-        row = f"{frame},{ts:.3f},{n_raw},{n_tracked},{n_filtered},{n_canonical},{ids_txt},{confs_txt}\n"
+        bboxes_txt = ' '.join(
+            f"{int(b[0])}:{int(b[1])}:{int(b[2])}:{int(b[3])}" for b in bboxes
+        )
+        row = (f"{frame},{ts:.3f},{n_raw},{n_tracked},{n_filtered},{n_canonical},"
+               f"{ids_txt},{confs_txt},{bboxes_txt}\n")
         try:
             self._queue.put_nowait(row)
         except queue.Full:

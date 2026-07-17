@@ -19,9 +19,9 @@ parse-bbox-func-name=NvDsInferParseYoloCuda
 custom-lib-path=../custom_parsers/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 
 [class-attrs-all]
-nms-iou-threshold=0.5
-pre-cluster-threshold=0.25
+nms-iou-threshold=0.30
+pre-cluster-threshold=0.30
 topk=300
 
 [class-attrs-0]
-pre-cluster-threshold=0.25
+pre-cluster-threshold=0.30
