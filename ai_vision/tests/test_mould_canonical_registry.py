@@ -338,3 +338,33 @@ def test_latch_guard_refreshes_existing_instead_of_duplicate_latch(tmp_path):
     # candidate matched+matured; guard compares against canonicals via merge rule —
     # canonical moved away, so a genuine latch is correct here.
     assert proc._canonical_latched_total == before_latched + 1
+
+
+# ---------------------------------------------------------------------------
+# Display staleness gating (ghost-overlay fix, 2026-07-17 evening)
+# ---------------------------------------------------------------------------
+
+
+def test_display_filter_hides_stale_entries_but_keeps_counting(tmp_path):
+    proc = _make_proc(tmp_path)
+    cid_a = _latch_one(proc, track_id=1, cx=500, cy=400)
+    _latch_one(proc, track_id=2, cx=900, cy=620, t=1010.0)
+    cid_b = next(c for c in proc._canonical_moulds if c != cid_a)
+    proc._poured_mould_ids.add(cid_a)
+
+    # cid_a last seen long ago; cid_b fresh.
+    proc._canonical_moulds[cid_a]["last_seen_ts"] = 1000.0
+    proc._canonical_moulds[cid_b]["last_seen_ts"] = 1099.0
+    shown = proc._canonical_entries_for_display(now=1100.0)
+    assert [e["cid"] for e in shown] == [cid_b]
+    # Counting state untouched: both entries exist, poured id intact.
+    assert set(proc._canonical_moulds) == {cid_a, cid_b}
+    assert cid_a in proc._poured_mould_ids
+
+
+def test_trolley_visibility_predicate(tmp_path):
+    proc = _make_proc(tmp_path)
+    assert proc._trolley_visible_for_display(now=1000.0) is False  # never detected
+    proc.trolley_last_detected_time = 998.0
+    assert proc._trolley_visible_for_display(now=1000.0) is True   # 2s ago < 5s window
+    assert proc._trolley_visible_for_display(now=1004.0) is False  # 6s ago > 5s window

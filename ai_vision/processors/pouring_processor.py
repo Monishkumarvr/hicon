@@ -257,6 +257,7 @@ class PouringProcessor:
         self.canonical_latch_conf = float(getattr(config, 'MOULD_CANONICAL_LATCH_CONF', 0.35))
         self.canonical_refresh_conf = float(getattr(config, 'MOULD_CANONICAL_REFRESH_CONF', 0.20))
         self.raw_mould_overlay = bool(getattr(config, 'MOULD_RAW_OVERLAY', False))
+        self.overlay_stale_s = float(getattr(config, 'MOULD_OVERLAY_STALE_S', 3.0))
         self._canonical_moulds: Dict[int, Dict[str, Any]] = {}
         self._canonical_candidates: List[Dict[str, Any]] = []
         self._next_canonical_id = 1
@@ -3240,15 +3241,33 @@ class PouringProcessor:
             if display_meta is not None:
                 pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
+    def _canonical_entries_for_display(self, now: float) -> List[Dict[str, Any]]:
+        """Registry entries fresh enough to DRAW (counting state is unaffected —
+        poured entries persist for the heat cycle even when hidden)."""
+        return [
+            entry for entry in self._canonical_moulds.values()
+            if now - entry['last_seen_ts'] <= self.overlay_stale_s
+        ]
+
+    def _trolley_visible_for_display(self, now: float) -> bool:
+        """True while the locked trolley was actually detected within the phantom
+        window — the lock itself persists for the whole heat cycle."""
+        return (
+            self.trolley_last_detected_time is not None
+            and now - self.trolley_last_detected_time <= self.phantom_trolley_timeout
+        )
+
     def draw_cpu_overlay(self, frame_bgr: np.ndarray) -> None:
         """Draw pouring panel, probe dot, and trolley bbox onto a BGR frame.
 
         Called from the MJPEG streaming probe as a CPU replacement for nvosd GPU rendering.
         Reads cached internal state — safe to call after analysis branch has populated it.
+        Boxes are gated on recent visibility so departed trolleys/moulds don't ghost.
         """
         if not self.enable_display_meta:
             return
         try:
+            now = time.time()
             h, w = frame_bgr.shape[:2]
             panel_w = max(340, int(w * 0.38))
             px = max(8, w - panel_w - 8)
@@ -3267,7 +3286,16 @@ class PouringProcessor:
                 f"M:{self.mould_count} B:{brightness_txt} T:{lock_tid}",
             ]
             if self.trolley_locked and self.locked_trolley_id is not None:
-                rows.append(f"Trolley #{self.locked_trolley_id} [LOCKED]  Moulds: {self.mould_count}")
+                away_txt = ""
+                if not self._trolley_visible_for_display(now):
+                    away_s = (
+                        now - self.trolley_last_detected_time
+                        if self.trolley_last_detected_time is not None else 0.0
+                    )
+                    away_txt = f" (away {away_s:.0f}s)"
+                rows.append(
+                    f"Trolley #{self.locked_trolley_id} [LOCKED]{away_txt}  Moulds: {self.mould_count}"
+                )
                 for mid, frames in list(self.mould_completed_times.items())[-6:]:
                     rows.append(f"  M#{mid}: {frames / self.fps:.1f}s")
                 if self.pour_active and self._pour_start_time_wall is not None:
@@ -3285,15 +3313,24 @@ class PouringProcessor:
                 cv2.putText(frame_bgr, row, (px + 6, py + 36 + i * 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # Probe dot
-            if self._last_probe_base is not None:
+            # Probe dot — only while the session is live or a mouth was seen recently.
+            mouth_recent = (
+                self.mouth_last_seen_in_trolley is not None
+                and now - self.mouth_last_seen_in_trolley <= self.phantom_trolley_timeout
+            )
+            if self._last_probe_base is not None and (self.session_active or mouth_recent):
                 cx, cy = int(self._last_probe_base[0]), int(self._last_probe_base[1])
                 color = (0, 255, 0) if self.pour_active else (0, 0, 255)
                 cv2.circle(frame_bgr, (cx, cy), 6, color, -1)
                 cv2.circle(frame_bgr, (cx, cy), 6, (255, 255, 255), 1)
 
-            # Expanded trolley bbox
-            if self.trolley_locked and self.locked_trolley_bbox:
+            # Expanded trolley bbox — only while the trolley is actually visible
+            # (lock persists for the heat cycle; drawing must not).
+            if (
+                self.trolley_locked
+                and self.locked_trolley_bbox
+                and self._trolley_visible_for_display(now)
+            ):
                 x1, y1, x2, y2 = self.locked_trolley_bbox
                 ex1 = max(0, int(x1 - self.edge_expand_x_px))
                 ey1 = max(0, int(y1 - self.edge_expand_y_px))
@@ -3302,9 +3339,12 @@ class PouringProcessor:
                 cv2.rectangle(frame_bgr, (ex1, ey1), (ex2, ey2), (0, 255, 0), 1)
 
             # Canonical mould boxes (stable freeze layer; raw churning rects are
-            # suppressed at extraction time). Poured moulds render brighter + 'P'.
-            if self.canonical_enabled and self._canonical_moulds:
-                for cid, entry in list(self._canonical_moulds.items()):
+            # suppressed at extraction time). Poured moulds render brighter + '*'.
+            # Only recently-seen entries are drawn — departed moulds keep counting
+            # internally but stop ghosting on screen.
+            if self.canonical_enabled:
+                for entry in self._canonical_entries_for_display(now):
+                    cid = entry['cid']
                     bx1, by1, bx2, by2 = (int(v) for v in entry['bbox'])
                     poured = cid in self._poured_mould_ids
                     color = (0, 220, 0) if poured else (0, 170, 255)

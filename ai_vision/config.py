@@ -442,6 +442,10 @@ MOULD_CANONICAL_LATCH_CONF = float(os.getenv('HICON_MOULD_CANONICAL_LATCH_CONF',
 MOULD_CANONICAL_REFRESH_CONF = float(os.getenv('HICON_MOULD_CANONICAL_REFRESH_CONF', '0.20'))
 # Hide the raw (churning) mould rects on the OSD; canonical boxes render instead.
 MOULD_RAW_OVERLAY = os.getenv('HICON_MOULD_RAW_OVERLAY', 'false').lower() == 'true'
+# Max age (s) of a canonical entry's last sighting for it to be DRAWN on the
+# overlay. Counting state is unaffected — poured entries persist for the heat
+# cycle regardless; this only stops ghost boxes after the trolley leaves frame.
+MOULD_OVERLAY_STALE_S = float(os.getenv('HICON_MOULD_OVERLAY_STALE_S', '3.0'))
 
 # Per-frame mould diagnostics CSV (output/csv/mould_diag_YYYYMMDD.csv).
 MOULD_DIAG_CSV = os.getenv('HICON_MOULD_DIAG_CSV', 'false').lower() == 'true'
