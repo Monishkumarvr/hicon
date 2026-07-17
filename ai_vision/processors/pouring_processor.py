@@ -277,6 +277,18 @@ class PouringProcessor:
         self._last_global_mould_centroids: Dict[int, Tuple[float, float]] = {}
         self._last_mould_raw_log_ts = 0.0
 
+        # --- Tracker-propagated detection bridge (P0 fix, hicon-75h) ---
+        # With pouring nvinfer interval>0, non-inference frames carry tracker-
+        # propagated objects with obj_meta.confidence == -0.1. The raw conf gates
+        # (mouth>=0.4, trolley>=0.25) emptied those frames, resetting the session
+        # accumulator every other frame -> zero pours recorded. Bridge: accept a
+        # below-threshold det when its track_id had a confident detection within
+        # the last few inference cycles.
+        pour_interval = max(0, int(getattr(config, 'POUR_NVINFER_INTERVAL', 0)))
+        self._det_bridge_s = max(0.5, 4.0 * (pour_interval + 1) / 25.0) if pour_interval > 0 else 0.0
+        self._recent_confident_mouths: Dict[int, float] = {}
+        self._recent_confident_trolleys: Dict[int, float] = {}
+
         self._mould_diag_writer: Optional[MouldDiagWriter] = None
         if bool(getattr(config, 'MOULD_DIAG_CSV', False)) and self.mould_gie_enabled:
             csv_dir = Path(getattr(config, 'SCREENSHOT_DIR', Path('output/screenshots'))).parent / 'csv'
@@ -326,6 +338,12 @@ class PouringProcessor:
         logger.info("PouringProcessor initialized (aligned with standalone doc)")
         logger.info(f"  Mouth conf: {self.mouth_conf}, Trolley conf: {self.trolley_conf}")
         logger.info(f"  Session: start={self.session_start_dur}s, end={self.session_end_dur}s")
+        logger.info(
+            "  Detection bridge: pour_nvinfer_interval=%d bridge_s=%.2f "
+            "(tracker-propagated conf=-0.1 frames pass conf gates within this window)",
+            max(0, int(getattr(config, 'POUR_NVINFER_INTERVAL', 0))),
+            self._det_bridge_s,
+        )
         logger.info(
             "  Pour geometry ref-space: %dx%d",
             self.pour_ref_width,
@@ -512,7 +530,7 @@ class PouringProcessor:
         self._update_runtime_geometry(frame_w, frame_h)
 
         # 1. Extract detections
-        detections = self._extract_detections(frame_meta)
+        detections = self._extract_detections(frame_meta, timestamp)
         if len(detections) == 2:  # Backward-compatible processor/test adapters.
             mouths, trolleys = detections
             moulds = []
@@ -615,14 +633,22 @@ class PouringProcessor:
     # Detection extraction
     # =========================================================================
 
-    def _extract_detections(self, frame_meta):
-        """Extract pouring and dedicated mould detections from NvDsObjectMeta."""
+    def _extract_detections(self, frame_meta, timestamp=None):
+        """Extract pouring and dedicated mould detections from NvDsObjectMeta.
+
+        Applies the tracker-propagated confidence bridge (see __init__): dets below
+        the conf gate still pass if their track was confidently detected within
+        self._det_bridge_s (covers interval>0 frames where confidence == -0.1).
+        """
         mouths = []
         trolleys = []
         moulds = []
 
         if frame_meta is None:
             return mouths, trolleys, moulds
+
+        ts = timestamp if timestamp is not None else time.time()
+        bridge = self._det_bridge_s
 
         l_obj = getattr(frame_meta, 'obj_meta_list', None)
         while l_obj is not None:
@@ -664,15 +690,38 @@ class PouringProcessor:
                         obj_meta.text_params.display_text = ""
                     except Exception:
                         pass
-            elif class_id == CLASS_MOUTH and conf >= self.mouth_conf:
-                mouths.append(det)
-            elif class_id == CLASS_TROLLEY and conf >= self.trolley_conf:
-                trolleys.append(det)
+            elif class_id == CLASS_MOUTH:
+                if conf >= self.mouth_conf:
+                    self._recent_confident_mouths[track_id] = ts
+                    mouths.append(det)
+                elif (
+                    bridge > 0.0
+                    and track_id != _UNTRACKED_OBJECT_ID
+                    and ts - self._recent_confident_mouths.get(track_id, -1e18) <= bridge
+                ):
+                    mouths.append(det)
+            elif class_id == CLASS_TROLLEY:
+                if conf >= self.trolley_conf:
+                    self._recent_confident_trolleys[track_id] = ts
+                    trolleys.append(det)
+                elif (
+                    bridge > 0.0
+                    and track_id != _UNTRACKED_OBJECT_ID
+                    and ts - self._recent_confident_trolleys.get(track_id, -1e18) <= bridge
+                ):
+                    trolleys.append(det)
 
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
+
+        # Periodic purge of stale bridge entries (bounded memory).
+        if bridge > 0.0 and self._frame_count % 250 == 0:
+            for table in (self._recent_confident_mouths, self._recent_confident_trolleys):
+                stale = [tid for tid, seen in table.items() if ts - seen > 10.0 * bridge]
+                for tid in stale:
+                    del table[tid]
 
         return mouths, trolleys, moulds
 
@@ -1336,8 +1385,18 @@ class PouringProcessor:
                 self.mouth_inside_since = timestamp
 
         else:
-            # Mouth NOT inside (expanded) trolley
-            self.mouth_inside_since = None
+            # Mouth NOT inside (expanded) trolley.
+            # Interval-tolerant accumulator (P0 fix, hicon-75h): a brief detection
+            # gap (skipped-inference frames, single missed cycle) must not reset the
+            # session-start accumulation — only a gap beyond the bridge window does.
+            if self.mouth_inside_since is not None:
+                gap = (
+                    timestamp - self.mouth_last_seen_in_trolley
+                    if self.mouth_last_seen_in_trolley is not None
+                    else float('inf')
+                )
+                if gap > max(self._det_bridge_s, 0.0) or self._det_bridge_s == 0.0:
+                    self.mouth_inside_since = None
 
             if self.session_active:
                 # Reference: end session if out_count >= N_EXIT (session_end_dur of consecutive

@@ -410,7 +410,7 @@ def test_pouring_processor_refreshes_heat_cycle_only_after_session_is_active(tmp
     trolley = {"track_id": 7, "bbox": (100, 100, 200, 220), "confidence": 0.9}
     frame_meta = SimpleNamespace(source_frame_width=1280, source_frame_height=720)
 
-    processor._extract_detections = lambda _frame_meta: ([mouth], [trolley])
+    processor._extract_detections = lambda _frame_meta, _ts=None: ([mouth], [trolley])
     processor._get_target_trolley = lambda _trolleys, _timestamp=None, _mouths=None: trolley
     processor._select_best_mouth_for_trolley = lambda _mouths, _trolley: mouth
     processor._check_cycle_timeout = lambda *args, **kwargs: None
