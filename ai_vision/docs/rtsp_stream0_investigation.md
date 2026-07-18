@@ -2026,3 +2026,62 @@ the cycle: the camera position stayed on 28.x with the same dead gateway.
 2. Change camera RTSP port 554→8554 (external-prober test)
 3. Firmware update beyond V5.7.23 build 260320
 4. Swap camera units 0↔2 (unit vs position differential)
+
+---
+
+## 2026-07-18 Addendum: July Storm Root-Caused — Per-Camera Firmware Network-Stack Restart Cycle (June Conclusion Revised)
+
+### Summary
+The Jul-15-onset outage storms (all 3 streams, ~every 5 min, working hours only) are caused by
+**each camera independently restarting its own network stack on a free-running ~299.4–299.9 s
+firmware timer**, active only during factory production hours. This is a camera-internal
+firmware defect (DS-2CD2043G2-LI2U, V5.7.23 build 260320 = latest available). Every external
+cause was systematically falsified at the packet level.
+
+### Proven mechanism (packet capture /tmp/hicon_kill.pcap, 5 kill events)
+- Camera data stops mid-second; 30–65 s total blackout: no data, no ACKs, SYNs unanswered, ICMP dead.
+- On recovery: new TCP accepted instantly; old sessions answered with RST (TCP state wiped) —
+  identical June-12 signature, now on all three cameras.
+- Timer is per-camera and free-running: cam1's reboot at 14:26 rephased its series to
+  14:31:47 + n·299.8 s while cams 0/2 kept their phases. Phase lock observed earlier in the day
+  traced to all three cameras rebooting simultaneously 2026-07-12 02:00 IST (uptime 560,28x s).
+- ffmpeg observers exit rc=0 ~78 s after data stop (their FIN is Jetson-side; the earlier
+  "clean 297 s session TTL" reading was this give-up lag, not a middlebox TTL).
+
+### Falsified by direct experiment (2026-07-18)
+| Theory | Test | Result |
+|---|---|---|
+| Gateway health check (June model) | cam1 gateway 28.200→28.44 (Jetson) + reboot | bounces continued |
+| Motion detection / event load | VMD disabled on cam1 | bounces continued (17:06–17:51 series) |
+| Switch/uplink segment cut | established TCP kept flowing through ICMP-dead windows | falsified |
+| Sophos session TTL | UDP-transport RTSP survived 400 s+; TCP kills are camera-side | falsified |
+| Cloud/ISUP, NTP, HTTP notification | disabled / manual / inert (0.0.0.0) | not present |
+| External prober (SADP unicast, NVR mgmt, Sophos scan) | full non-RTSP capture across 2 bounces (/tmp/cam1_mgmt.pcap) | ZERO packets — nothing talks to the camera |
+
+### June-12 conclusion revised
+The June "dead gateway" fix was verified 19:09–19:35 — outside the (now-known) diurnal storm
+window. The apparent cure is likely coincidental; the gateway-ARP mechanism did not survive
+today's controlled test. The June observation that only camera 0 cycled (cams 1&2 then on
+192.168.27.x) remains unexplained but consistent with an environment-dependent arming condition.
+
+### Remaining arming-condition candidates (diurnal, camera-internal)
+1. **Encoder/SoC load** — VBR main-stream bitrate spikes during high-motion production scenes
+   (all three cameras' main streams are recorded by NVRs 24/7; scene activity is diurnal).
+2. **Thermal** — furnace-bay heat during melts.
+3. **Power quality** — PoE/mains disturbance from induction furnace operation (argues against:
+   period is second-precise over hours, which favors a firmware timer).
+
+### Next actions
+- Site (morning, during storm): stop SADP/iVMS on 192.168.175.25/.30 (15-min watch, cheap);
+  temporarily stop NVR main-stream recording of one camera (encoder-load discriminator);
+  bench-isolate one camera (separate PoE + isolated switch port + laptop RTSP pull) to split
+  power/network/scene variables.
+- Escalate to Hikvision with pcap evidence: model, V5.7.23 b260320, per-camera ~299.8 s netd
+  restart loop during high-activity hours, no logs possible (no storage).
+- State changes made 2026-07-18 (revert notes): cam1 gateway now 28.44 (was 28.200); cam1 VMD
+  currently disabled (re-enable: ISAPI PUT motionDetection enabled=true).
+- Separate issue: SSH drops are WAN/Tailscale evening degradation (UDP blocked → DERP relay
+  resets), unrelated to camera LAN. Historical Jul 5–8 unclean reboots: r8168 NIC transmit-queue
+  hang + CPU0 RCU stall (pstore console-ramoops-0), single event family, not recurring.
+
+Tracked in beads: hicon-b22.
