@@ -57,6 +57,55 @@
 
 FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
+## Update 2026-07-21 (3) — trolley-bbox EMA continuity fix, confirmed via video + DB + journal review
+
+**Found by cross-referencing raw NVR footage (`stream0_20260717_180000-190000_IST.mkv`) against
+the DB's shadow diagnostics and the journal for the same session** (18:09–18:21, the first
+heat with real pour data): rows 1–6 showed `official`/`tracker`/`canonical`/`clustered`
+climbing in perfect lockstep 1→6, matching the video exactly (one clean manual ladle pour
+per mould, workers hand-carrying the ladle on a pole between compartments). Then at
+**18:16:28**, `tracker` collapsed **10→4** and `canonical` **13→6** — six already-poured
+moulds lost their distinct identity in one step.
+
+Journal confirms the mechanism precisely:
+```
+18:16:15  poured_ids=9
+18:16:15–18:16:20  8x MERGED (cascading)
+18:16:25  poured_ids=3
+18:16:27  [trolley] RELOCK T...271 -> T...327 (missing_locked_id)
+```
+This is **not** the cross-trolley-identity bug fixed in Update (2) above — computed IoU
+between the pre/post-relock bboxes `(514,84,808,348)` vs `(520,140,805,294)` is **~0.57**,
+well above the 0.25 "same physical trolley" threshold, so that fix correctly does NOT reset
+the registry here (as designed). The actual bug: the trolley-bbox EMA smoothing
+(`_update_tracked_mould_observations`) that damps bbox noise before it can distort
+trolley-relative mould coordinates was gated on **tracker-ID equality**
+(`_trolley_norm_ema_tid == trolley_tid`) — so it **snapped straight to the raw, undamped
+bbox** at the exact moment the ID changed on relock, which is precisely when re-detection
+noise (here: bbox height shrank 348→294, ~15%, likely partial occlusion during the brief
+tracking loss) is most likely. The feature built to prevent this failure mode shut itself
+off at the one moment it mattered.
+
+**Fix:** gate the EMA continuation on spatial continuity (`_is_same_physical_trolley`,
+reusing the same IoU check from the handoff fix) instead of tracker-ID equality. Composes
+correctly with the existing handoff logic: a genuine handoff already clears
+`_trolley_norm_ema` to `None` in `_handle_trolley_handoff`, so it still falls through to the
+raw-bbox branch for real trolley changes — only the same-physical-relock case now keeps
+smoothing through the ID change.
+
+Tests: +3, replaying the exact bboxes from the 18:16 collapse (`test_mould_canonical_registry.py`)
+— EMA blends rather than snaps across a same-physical relock; still snaps for a genuinely
+different trolley; a mould observed at the same pixel position before/after the relock keeps
+matching its existing canonical entry end-to-end. 132 pass (full suite), same 3 pre-existing
+unrelated failures. Deployed 21:05, zero open heat cycles at restart, streams steady at 25fps.
+
+**Answering "does the current logic suffice?":** the core pour-detection logic (session
+start/end, brightness threshold, mouth-in-trolley) is solid — verified directly against
+video. The mould-counting layer needed two independent fixes to be trustworthy across a
+whole heat's worth of relocks (cross-trolley identity confusion, and same-trolley bbox-noise
+propagation) — both are now in place, and this specific historical failure is the concrete,
+retrospective proof the second one was real, not theoretical.
+
 ## Update 2026-07-21 (2) — trolley-handoff fix for the canonical registry
 
 **Root cause of the canonical count churn** (13→14→16→...→5→6→...→9→5→5 seen on HEAT_1353):

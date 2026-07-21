@@ -1079,9 +1079,19 @@ class PouringProcessor:
         if target_trolley is not None:
             raw_bbox = target_trolley['bbox']
             trolley_tid = int(target_trolley.get('track_id', -1))
+            # Gate smoothing on SPATIAL continuity, not tracker-ID equality. A
+            # same-physical-trolley relock (common: brief occlusion, new NvDCF
+            # id, same trolley) must keep smoothing through the id change --
+            # gating on id alone snapped straight to the raw, undamped bbox at
+            # exactly the moment bbox noise is most likely, which measurably
+            # corrupted rel-coordinates and cascaded into merges that collapsed
+            # 6 already-poured moulds within 10s on a live heat (2026-07-17
+            # 18:16). A genuinely different physical trolley already gets
+            # _trolley_norm_ema cleared by _handle_trolley_handoff, so it falls
+            # through to the raw-bbox branch below as before.
             if (
                 self._trolley_norm_ema is not None
-                and self._trolley_norm_ema_tid == trolley_tid
+                and self._is_same_physical_trolley(self._trolley_norm_ema, raw_bbox)
             ):
                 prev = self._trolley_norm_ema
                 trolley_bbox = tuple(

@@ -1,5 +1,6 @@
 """Canonical mould registry: latch/freeze/churn-immunity/expiry/selection tests."""
 
+import pytest
 from pathlib import Path
 
 from processors.pouring_processor import PouringProcessor
@@ -437,3 +438,68 @@ def test_handoff_prevents_new_trolley_mould_merging_into_old_poured_entry(tmp_pa
     assert old_cid not in proc._canonical_moulds  # cleared by the handoff
     assert new_cid in proc._canonical_moulds
     assert new_cid not in proc._poured_mould_ids  # not yet poured on the new trolley
+
+
+# ---------------------------------------------------------------------------
+# Trolley-bbox EMA continuity across a same-physical relock (2026-07-21 (3)):
+# replays the exact bboxes from the 2026-07-17 18:16 live collapse (poured_ids
+# 9->3 via an 8-merge cascade within 10s of a same-trolley relock). The EMA
+# used to gate smoothing on tracker-ID equality, so it snapped to the raw,
+# undamped bbox exactly when a relock happened -- the one moment bbox noise
+# is most likely. Fixed to gate on spatial continuity instead.
+# ---------------------------------------------------------------------------
+
+OLD_TROLLEY_BBOX = (514, 84, 808, 348)   # locked bbox just before the 18:16 relock
+NEW_TROLLEY_BBOX = (520, 140, 805, 294)  # bbox at RELOCK T...271 -> T...327 (IoU ~0.57)
+DIFFERENT_TROLLEY_BBOX = (2000, 2000, 2600, 2400)  # for contrast: genuinely different unit
+
+
+def test_ema_smooths_through_same_physical_trolley_relock(tmp_path):
+    proc = _make_proc(tmp_path)
+    old_trolley = {**TROLLEY, "track_id": 271, "bbox": OLD_TROLLEY_BBOX}
+    new_trolley = {**TROLLEY, "track_id": 327, "bbox": NEW_TROLLEY_BBOX}
+
+    proc._update_tracked_mould_observations([], old_trolley, 1000.0)
+    assert proc._trolley_norm_ema == tuple(float(v) for v in OLD_TROLLEY_BBOX)
+
+    proc._update_tracked_mould_observations([], new_trolley, 1000.5)
+    blended = proc._trolley_norm_ema
+    # Must be a blend (0.7*old + 0.3*new), NOT a snap straight to the raw new bbox.
+    assert blended != tuple(float(v) for v in NEW_TROLLEY_BBOX)
+    expected = tuple(0.7 * OLD_TROLLEY_BBOX[i] + 0.3 * NEW_TROLLEY_BBOX[i] for i in range(4))
+    assert blended == pytest.approx(expected)
+
+
+def test_ema_still_snaps_for_a_genuinely_different_trolley(tmp_path):
+    proc = _make_proc(tmp_path)
+    old_trolley = {**TROLLEY, "track_id": 271, "bbox": OLD_TROLLEY_BBOX}
+    different_trolley = {**TROLLEY, "track_id": 999, "bbox": DIFFERENT_TROLLEY_BBOX}
+
+    proc._update_tracked_mould_observations([], old_trolley, 1000.0)
+    proc._update_tracked_mould_observations([], different_trolley, 1000.5)
+    # No spatial continuity -> snap to the raw bbox, no blending with the stale one.
+    assert proc._trolley_norm_ema == tuple(float(v) for v in DIFFERENT_TROLLEY_BBOX)
+
+
+def test_mould_position_stable_across_same_physical_relock_end_to_end(tmp_path):
+    """The actual failure mode: a mould observed at the same absolute pixel
+    position before and after a same-physical relock must keep matching its
+    existing canonical entry, not drift into spurious churn/merges."""
+    proc = _make_proc(tmp_path)
+    old_trolley = {**TROLLEY, "track_id": 271, "bbox": OLD_TROLLEY_BBOX}
+    new_trolley = {**TROLLEY, "track_id": 327, "bbox": NEW_TROLLEY_BBOX}
+
+    cx, cy = 650, 200  # inside both bboxes
+    for i in range(4):
+        proc._update_tracked_mould_observations([_mould(1, cx, cy)], old_trolley, 1000.0 + i * 0.5)
+    assert len(proc._canonical_moulds) == 1
+    cid = next(iter(proc._canonical_moulds))
+    proc._poured_mould_ids.add(cid)
+
+    # Relock happens; same physical mould, same pixel position, new trolley id.
+    for i in range(4):
+        proc._update_tracked_mould_observations([_mould(50 + i, cx, cy)], new_trolley, 1002.0 + i * 0.5)
+
+    assert len(proc._canonical_moulds) == 1  # still one mould, not split/duplicated
+    assert cid in proc._canonical_moulds      # same identity preserved
+    assert cid in proc._poured_mould_ids       # poured status intact
