@@ -57,6 +57,46 @@
 
 FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
+## Update 2026-07-21 (2) — trolley-handoff fix for the canonical registry
+
+**Root cause of the canonical count churn** (13→14→16→...→5→6→...→9→5→5 seen on HEAT_1353):
+one heat cycle sees **multiple physical trolleys** pass through sequentially (confirmed —
+this is normal foundry operation, not a tracking bug). `_should_relock_trolley` already
+allows relocking onto a candidate for three reasons: `same_physical` (IoU≥0.25 with the old
+bbox), `moved` (candidate far from the old bbox), or simply `new_trolley_present` (2+
+trolleys visible) — the last two say nothing about whether the candidate is actually the
+same physical unit. The canonical mould registry had no idea a handoff to a *different*
+trolley had happened, so it kept matching new detections against the departed trolley's
+entries — **including already-poured ones, which are TTL-exempt and never expire.** A new
+trolley's mould landing near an old, already-poured entry's position would be silently
+absorbed into it instead of counted — directly undercounting `tracker_mould_count`, the
+metric just promoted to official.
+
+**Fix** (`pouring_processor.py`): `_relock_trolley` now tests spatial continuity
+(`_is_same_physical_trolley`, IoU≥0.25 against the *previous* locked bbox — same threshold
+`_should_relock_trolley` already uses, for consistency) before completing the relock. When
+continuity fails (relock only via `moved`/`new_trolley_present` — a genuine handoff),
+`_handle_trolley_handoff` clears **only** the canonical registry's position-matching state
+(`_canonical_moulds`, `_canonical_candidates`, trolley-bbox EMA) — heat-cumulative state
+(`_poured_mould_ids`, durations, pour records, lifecycle diagnostics) is untouched, since
+that represents "moulds poured this heat," not "moulds visible on the current trolley."
+Logged as `[mould-canonical] TROLLEY HANDOFF T{old} -> T{new}`, counted in
+`[mould-tracker]`'s `handoffs=`, the DB's `mould_lifecycle.trolley_handoffs`, and a new
+`mould.trolley_handoffs` metrics gauge.
+
+**Effect on the churn pattern:** `canonical_mould_count` will now cleanly reset to 0 at each
+genuine trolley handoff and climb as the new trolley's moulds latch — it becomes a readable
+"moulds currently visible on this trolley" gauge instead of a confusing mix of expiring-old +
+growing-new. It is still not a running total across a whole *heat* (multiple trolleys) — that
+job belongs to `tracker_mould_count` (heat-cumulative poured count), which this fix makes
+correct in the presence of multiple trolleys per heat.
+
+Tests: +3 (same-physical-trolley relock preserves registry; different-physical-trolley
+relock resets it while preserving poured state; the exact failure mode — a new trolley's
+mould landing on an old poured entry's position — no longer merges). 129 pass (full suite),
+same 3 pre-existing unrelated failures. Deployed 17:48, zero open heat cycles at restart
+(safe boundary), streams steady at 25fps.
+
 ## Update 2026-07-21 — official count promoted to tracker mode; unrelated outage found & fixed
 
 **Live analysis of HEAT_1353** (first heat with real pour data since the P0 fix) showed the

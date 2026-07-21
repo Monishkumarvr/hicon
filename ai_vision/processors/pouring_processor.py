@@ -263,6 +263,7 @@ class PouringProcessor:
         self._next_canonical_id = 1
         self._canonical_latched_total = 0
         self._canonical_expired_total = 0
+        self._canonical_handoffs_total = 0
         self._canonical_merges_total = 0
         # EMA-smoothed trolley bbox used for mould normalization: trolley detection
         # wobble otherwise shifts ALL rel coords at once, spawning duplicate latches.
@@ -1182,7 +1183,7 @@ class PouringProcessor:
             log(
                 "[mould-tracker] visible=%d peak=%d seen_ids=%d poured_ids=%d "
                 "active_ids=%s cap=%d pressure=%.1f%% id_switches=%d "
-                "canonical=%d latched=%d expired=%d merges=%d births=%d deaths=%d "
+                "canonical=%d latched=%d expired=%d merges=%d handoffs=%d births=%d deaths=%d "
                 "lifespan_p50=%.1fs global_switches=%d",
                 len(observations),
                 self._mould_peak_visible,
@@ -1196,6 +1197,7 @@ class PouringProcessor:
                 self._canonical_latched_total,
                 self._canonical_expired_total,
                 self._canonical_merges_total,
+                self._canonical_handoffs_total,
                 self._mould_life_births,
                 self._mould_life_deaths,
                 self._lifespan_p50(),
@@ -1435,18 +1437,64 @@ class PouringProcessor:
         new_trolley_present = len(trolleys) >= 2
         return same_physical or moved or new_trolley_present
 
+    # IoU gate for "is this the same physical trolley re-identified" — matches
+    # _should_relock_trolley's same_physical threshold so the two stay in sync.
+    _TROLLEY_HANDOFF_IOU_THRESHOLD = 0.25
+
+    def _is_same_physical_trolley(self, bbox_a, bbox_b) -> bool:
+        if not bbox_a or not bbox_b:
+            return False
+        return self._bbox_iou(bbox_a, bbox_b) >= self._TROLLEY_HANDOFF_IOU_THRESHOLD
+
+    def _handle_trolley_handoff(self, prev_id, new_id) -> None:
+        """A relock with no spatial continuity to the previous locked bbox is
+        very likely a genuinely different physical trolley taking over mid-heat
+        (one heat can see several trolleys pass through), not the same trolley
+        re-identified after a brief tracking loss.
+
+        Clears only the canonical registry's POSITION-MATCHING state, so the
+        new trolley's moulds can never be confused with — or silently merged
+        into — the departed trolley's entries (including already-poured ones,
+        which are TTL-exempt and would otherwise sit in the live match pool
+        forever). Heat-level cumulative state (poured ids/durations/records,
+        lifecycle diagnostics) is untouched: it means "moulds poured this
+        heat", not "moulds visible on the current trolley".
+        """
+        stale_canonical = len(self._canonical_moulds)
+        stale_candidates = len(self._canonical_candidates)
+        self._canonical_moulds.clear()
+        self._canonical_candidates.clear()
+        self._trolley_norm_ema = None
+        self._trolley_norm_ema_tid = None
+        self._canonical_handoffs_total += 1
+        METRICS_REGISTRY.increment('mould.trolley_handoffs')
+        logger.info(
+            "[mould-canonical] TROLLEY HANDOFF T%s -> T%s: cleared %d canonical + "
+            "%d candidate entries (heat-cumulative poured count unaffected, "
+            "currently %d)",
+            prev_id, new_id, stale_canonical, stale_candidates,
+            len(self._poured_mould_ids),
+        )
+
     def _relock_trolley(self, trolley, timestamp, reason=""):
-        """Re-lock to a new trolley (e.g., tracker ID switched)."""
+        """Re-lock to a new trolley (e.g., tracker ID switched, or a genuinely
+        different physical trolley taking over — see _handle_trolley_handoff)."""
         prev_id = self.locked_trolley_id
+        prev_bbox = self.locked_trolley_bbox
+        is_handoff = self.canonical_enabled and not self._is_same_physical_trolley(
+            prev_bbox, trolley['bbox']
+        )
         self.locked_trolley_id = trolley['track_id']
         self.locked_trolley_bbox = trolley['bbox']
         self.trolley_locked = True
         self.mouth_last_seen_in_trolley = timestamp
         if self.heat_cycle_manager:
             self.heat_cycle_manager.lock_trolley(trolley['track_id'])
+        if is_handoff:
+            self._handle_trolley_handoff(prev_id, trolley['track_id'])
         logger.info(
             f"[trolley] RELOCK T{prev_id} -> T{trolley['track_id']} "
-            f"at bbox {trolley['bbox']} ({reason})"
+            f"at bbox {trolley['bbox']} ({reason})" + (" [HANDOFF]" if is_handoff else "")
         )
 
     def _is_mouth_in_expanded_trolley(self, mouth, trolley):
@@ -2715,6 +2763,7 @@ class PouringProcessor:
                     "canonical_latched": self._canonical_latched_total,
                     "canonical_expired": self._canonical_expired_total,
                     "canonical_merges": self._canonical_merges_total,
+                    "trolley_handoffs": self._canonical_handoffs_total,
                 },
                 "reactive_mould_count": self.mould_count,
                 "predictive_mould_count": predictive_count,

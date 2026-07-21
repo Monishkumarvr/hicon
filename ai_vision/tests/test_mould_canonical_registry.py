@@ -368,3 +368,72 @@ def test_trolley_visibility_predicate(tmp_path):
     proc.trolley_last_detected_time = 998.0
     assert proc._trolley_visible_for_display(now=1000.0) is True   # 2s ago < 5s window
     assert proc._trolley_visible_for_display(now=1004.0) is False  # 6s ago > 5s window
+
+
+# ---------------------------------------------------------------------------
+# Trolley handoff: reset position-matching state on a genuinely different
+# physical trolley, without touching heat-cumulative poured counts
+# (2026-07-21 — multiple trolleys per heat can otherwise merge moulds across
+# trolleys, silently undercounting the now-official tracker count).
+# ---------------------------------------------------------------------------
+
+
+def test_relock_same_physical_trolley_preserves_registry(tmp_path):
+    proc = _make_proc(tmp_path)
+    proc.trolley_locked = True
+    proc.locked_trolley_id = 1
+    proc.locked_trolley_bbox = TROLLEY["bbox"]
+    cid = _latch_one(proc)
+    proc._poured_mould_ids.add(cid)
+
+    # New trolley candidate strongly overlaps the old bbox -> same physical unit.
+    same_trolley = {**TROLLEY, "track_id": 2, "bbox": (410, 305, 1005, 705)}
+    proc._relock_trolley(same_trolley, timestamp=2000.0, reason="missing_locked_id")
+
+    assert cid in proc._canonical_moulds
+    assert proc._canonical_handoffs_total == 0
+    assert proc.locked_trolley_id == 2
+
+
+def test_relock_different_physical_trolley_resets_registry_but_keeps_count(tmp_path):
+    proc = _make_proc(tmp_path)
+    proc.trolley_locked = True
+    proc.locked_trolley_id = 1
+    proc.locked_trolley_bbox = TROLLEY["bbox"]
+    cid = _latch_one(proc)
+    proc._poured_mould_ids.add(cid)
+    proc._poured_mould_durations[cid] = 8.0
+
+    # New trolley candidate has near-zero overlap -> a different physical unit.
+    different_trolley = {**TROLLEY, "track_id": 99, "bbox": (2000, 2000, 2600, 2400)}
+    proc._relock_trolley(different_trolley, timestamp=2000.0, reason="missing_locked_id")
+
+    assert not proc._canonical_moulds
+    assert not proc._canonical_candidates
+    assert proc._canonical_handoffs_total == 1
+    # Heat-cumulative poured state must survive the handoff untouched.
+    assert cid in proc._poured_mould_ids
+    assert proc._poured_mould_durations[cid] == 8.0
+    assert proc.locked_trolley_id == 99
+
+
+def test_handoff_prevents_new_trolley_mould_merging_into_old_poured_entry(tmp_path):
+    """The exact failure mode this fix targets: a new trolley's mould landing
+    at a similar rel-position as an old, already-poured entry must NOT be
+    absorbed into it once a handoff has cleared the registry."""
+    proc = _make_proc(tmp_path)
+    proc.trolley_locked = True
+    proc.locked_trolley_id = 1
+    proc.locked_trolley_bbox = TROLLEY["bbox"]
+    old_cid = _latch_one(proc, track_id=1, cx=500, cy=400)
+    proc._poured_mould_ids.add(old_cid)
+
+    different_trolley = {**TROLLEY, "track_id": 99, "bbox": (2000, 2000, 2600, 2400)}
+    proc._relock_trolley(different_trolley, timestamp=2000.0, reason="missing_locked_id")
+
+    # New trolley's mould at the SAME pixel position the old one occupied.
+    new_cid = _latch_one(proc, track_id=201, cx=500, cy=400, t=2001.0)
+    assert new_cid != old_cid
+    assert old_cid not in proc._canonical_moulds  # cleared by the handoff
+    assert new_cid in proc._canonical_moulds
+    assert new_cid not in proc._poured_mould_ids  # not yet poured on the new trolley

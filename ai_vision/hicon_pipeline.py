@@ -1493,6 +1493,8 @@ def main():
             metrics_registry.register_gauge(
                 'mould.lifespan_p50_s', _pp._lifespan_p50)
             metrics_registry.register_gauge(
+                'mould.trolley_handoffs', lambda: _pp._canonical_handoffs_total)
+            metrics_registry.register_gauge(
                 'mould.gie_interval', lambda: int(config.MOULD_GIE_INTERVAL))
         except Exception as e:
             logger.warning(f"Stream 0: Pouring processor not available: {e}")
