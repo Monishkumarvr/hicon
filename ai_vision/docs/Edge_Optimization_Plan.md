@@ -57,6 +57,35 @@
 
 FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
+## Update 2026-07-21 — official count promoted to tracker mode; unrelated outage found & fixed
+
+**Live analysis of HEAT_1353** (first heat with real pour data since the P0 fix) showed the
+legacy and registry-based counts diverging meaningfully in production, not just in shadow
+theory: for the same trolley, `official(legacy)=12` vs `canonical=9` (matches the operator's
+visual count exactly) vs `tracker=6` (distinct physical moulds that actually received a
+committed pour). The merge-dedup mechanism (Jul 17) was observed firing correctly live —
+5 duplicate entries collapsed within seconds of a trolley re-identification event.
+
+**Decision (user, informed risk):** `HICON_MOULD_COUNT_MODE` promoted `shadow → tracker`.
+Official count is now the canonical-registry poured-ID count, not the old spatial-cluster
+count. **Not yet validated against foundry ground truth** — accepted knowingly pending the
+HEAT_1266–1277 report. Rollback: `HICON_MOULD_COUNT_MODE=shadow`, but only at a heat-cycle
+boundary (`PouringProcessor._restore_tracker_state_from_heat_cycle` raises if flipped mid-
+cycle against legacy-sourced `mould_pourings`) — restarted with zero open heat cycles, the
+safe boundary.
+
+**Unrelated production outage found and fixed during the same restart:** `hicon-vision.service`
+was crash-looping (`HICON_RTSP_PROTOCOL_2=multi` — not a value `config.py`'s
+`_get_rtsp_protocol` validator accepts; someone's in-progress "Track-B UDP floor test," dated
+today) and had already hit systemd's `StartLimitBurst`, landing in `failed` state — **camera
+monitoring was fully down** for ~72s across 5 restart attempts before this was caught. Reverted
+`HICON_RTSP_PROTOCOL_2` to `tcp` (its documented-safe prior value); service healthy, streams
+at 25fps, zero open heat cycles were in progress during the window so no pour was lost. The
+Track-B experiment itself needs re-running with a value the validator accepts, or a
+`config.py` update if `multi` should map to a real nvurisrcbin transport mode — separate from
+this doc's scope (see the RTSP-storm root-cause work in `c040b35`/`6f9386f`, done independently
+of this session).
+
 ## Update 2026-07-17 — 12h telemetry findings, interval rebalance, canonical mould registry
 
 **Telemetry correction:** tegrastats `GR3D_FREQ %` is a short-window point sample, NOT an
