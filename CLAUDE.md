@@ -337,8 +337,8 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 | Stream | IP | Role | Firmware | Serial | MAC |
 |--------|-----|------|----------|--------|-----|
 | 0 | 192.168.28.119 | Process (POURING) | V5.7.23 (build 260320) | ...FW8319581 | bc:29:78:85:8a:85 |
-| 1 | 192.168.27.253 | Pyrometer (FURNACE) | V5.7.23 (build 260320) | ...FR7129271 | bc:29:78:53:27:40 |
-| 2 | 192.168.27.226 | Pouring2 | V5.7.23 (build 260320) | ...FR7128559 | bc:29:78:53:24:78 |
+| 1 | 192.168.28.172 | Pyrometer (FURNACE) | V5.7.23 (build 260320) | ...FR7129271 | bc:29:78:53:27:40 |
+| 2 | 192.168.28.174 | Pouring2 | V5.7.23 (build 260320) | ...FR7128559 | bc:29:78:53:24:78 |
 
 - **Credentials:** `admin` / `india@789` (URL-encoded: `india%40789`)
 - **RTSP URL (sub-stream):** `rtsp://admin:india%40789@{IP}:554/Streaming/Channels/102`
@@ -350,8 +350,8 @@ python3 hicon_pipeline.py --source0 test_process.mp4 --source1 test_pyro.mp4
 
 **Stream configs (confirmed via ISAPI 2026-05-04):**
 - Stream 0 CH101 (192.168.28.119): 2688×1520, 3072 kbps VBR (avg 1536), **audio OFF**, **SmartCodec OFF** — CH102 tested and showed identical reconnect delays; bottleneck is camera-side reconnect speed, not resolution
-- Stream 1 CH102 (192.168.27.253): 1280×720, 320 kbps VBR, audio ON, SmartCodec off
-- Stream 2 CH102 (192.168.27.226): 1280×720, 512 kbps VBR, audio OFF, SmartCodec off
+- Stream 1 CH102 (192.168.28.172): 1280×720, 320 kbps VBR, audio ON, SmartCodec off
+- Stream 2 CH102 (192.168.28.174): 1280×720, 512 kbps VBR, audio OFF, SmartCodec off
 
 **Previous cameras (replaced 2026-03-20):** 3× CP Plus (Dahua OEM):
 - 192.168.28.155: CP-UNC-TC41L5C-VMD-LQ (fw 2.860.00AT001.0.R)
@@ -455,3 +455,13 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

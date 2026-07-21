@@ -37,8 +37,8 @@ from pathlib import Path
 
 RTSP_URLS = {
     0: "rtsp://admin:india%40789@192.168.28.119:554/Streaming/Channels/102",
-    1: "rtsp://admin:india%40789@192.168.27.253:554/Streaming/Channels/102",
-    2: "rtsp://admin:india%40789@192.168.27.226:554/Streaming/Channels/102",
+    1: "rtsp://admin:india%40789@192.168.28.172:554/Streaming/Channels/102",
+    2: "rtsp://admin:india%40789@192.168.28.174:554/Streaming/Channels/102",
 }
 
 DEFAULT_OUTPUT_DIR = Path(__file__).parent.parent / "output" / "recordings"

@@ -2085,3 +2085,137 @@ today's controlled test. The June observation that only camera 0 cycled (cams 1&
   hang + CPU0 RCU stall (pstore console-ramoops-0), single event family, not recurring.
 
 Tracked in beads: hicon-b22.
+
+---
+
+## 2026-07-20 Addendum: June fix VINDICATED; storm is 24/7 (not diurnal); cam1 is the ~300s offender
+
+This addendum **corrects two errors** in the 2026-07-18 addendum, based on live evidence gathered
+2026-07-20 (ISAPI queries + fresh pipeline.log analysis).
+
+### Correction 1 — The June 12 gateway fix was NOT a coincidence; the retraction was invalid
+- cam0 (`192.168.28.119`) live config today: gateway `192.168.28.8` (alive), DNS `0.0.0.0` — the
+  exact June change, still intact.
+- The Jul-18 "falsification" changed **cam1's** gateway (a *different* camera, with DNS `8.8.8.8`
+  and gateway pointed at the Jetson, which is not equivalent to the NVR) and saw continued
+  bounces. You cannot disprove a fix on camera A by modifying camera B. The retraction is invalid
+  by construction. June fixed a real, cam0-specific reachability fault; July is a **different**
+  fault. (Caveat: Jun→mid-Jul logs have rotated away, so "stable for a month" rests on operator
+  report + a zero-RTSP-work commit gap Jun 13→Jul 16, not a replayable log.)
+
+### Correction 2 — The storm is 24/7, not business-hours-only
+Hourly outage histogram (2026-07-20, all streams): ~60–75/hr overnight (00–07h), ~150–174/hr
+business hours (09–17h). So there is a **24/7 base cycle + ~2.4× business-hours amplification**.
+A business-hours-only external scan (e.g. a Sophos policy) cannot explain the overnight base.
+
+### The 24/7 base cycle is dominated by cam1 — and cam1 is uniquely mis-gatewayed
+Per-camera config vs behaviour:
+
+| Camera | Gateway | DNS | Outages/day | Overnight 02:00–02:40 |
+|--------|---------|-----|-------------|------------------------|
+| cam0 `28.119` | 28.8 (NVR, alive) | none | 129 (mean dur 45.6s) | **0** |
+| cam1 `28.172` | **28.44 (Jetson)** | 8.8.8.8/8.8.4.4 | **425** (mean 23s) | **clean ~300s cycle all night** |
+| cam2 `28.174` | 28.200 (Sophos) | 8.8.8.8/8.8.4.4 | 171 (mean 23s) | 1 event |
+
+**Leading mechanism:** cam1 is the only camera whose gateway is the **Jetson (28.44)**. cam1 has
+public DNS (`8.8.8.8`) and routes off-subnet through the Jetson, which cannot cleanly route
+cam1→internet (it forwards out `175.200`/Sophos, likely without NAT → asymmetric/dropped). A
+periodic (~300s) DNS/off-subnet operation fails → net-stack bounce, around the clock. cam0 (no
+DNS) and cam2 (DNS via the real Sophos router) don't hit this overnight. This is the same
+"reachability" family as the June fault, and explains the cam1≫cam2>cam0 ordering. Business-hours
+amplification (extra bounces on all three) is a separate, load-dependent layer still to be
+characterised (capture during peak).
+
+Because cam1 bounces 24/7, the fix is verifiable overnight (no storm wait).
+
+### Verification-in-progress / handoff (Jetson has no sudo; ISAPI PUT blocked by CC classifier)
+Tools added in `ai_vision/tools/`: `camera_net_normalize.sh` (safe gateway/DNS change + rollback),
+`rtsp_multi_probe.sh` (6× TCP+UDP control probes — tests UDP-survival for a transport mitigation),
+`rtsp_storm_capture.sh` (promiscuous capture for the business-hours amplifier; needs sudo),
+`outage_report.sh` (before/after measurement). Priority experiment: `cam1 --dns-clear` (keep
+gateway) and watch cam1's overnight ~300s cycle — if it stops, the DNS-lookup-failure mechanism
+is confirmed, and the fix is to normalise cam1/cam2 to cam0's config (gateway `28.8`, DNS cleared).
+
+---
+
+## 2026-07-21 Addendum: ROOT CAUSE = periodic L2 forwarding break on the camera segment (NOT cameras/config/firmware)
+
+Both prior conclusions (per-camera firmware timer; cam1 mis-gateway/DNS) are **disproven by direct
+experiment today.** The outage is a **network-layer event** on the segment where the cameras + NVR
+attach — introduced by the **2026-06-27 "camera adjustment"** (foundry re-IP'd + re-cabled: cam1
+`27.253→28.172`, cam2 `27.226→28.174`, cam0 `28.119` unchanged). The "Jul-15 onset" was just when it
+was noticed; Jun→mid-Jul logs had rotated.
+
+### Experiments run (Jetson, 2026-07-21; sudo obtained for capture)
+1. **cam1 `--dns-clear`** (kept gateway): no effect — cam1 stayed on its clean ~298s cycle. DNS falsified.
+2. **cam1 gateway `28.44→28.8`** (now identical to stable cam0): still dropped. Gateway/config falsified.
+3. **Full TCP/UDP matrix** (`ffmpeg`, 400s): night-time cam0/cam2-TCP survived while cam1-TCP died →
+   *looked* cam1-specific; but day-time re-probe showed **cam0-TCP also killed (~233-311s)**. The
+   "cam1-specific/TCP-specific" reading was a **time-of-day + connectionless-UDP artifact**: UDP only
+   *rides through* the ~30-40s gap, so "UDP survives → camera-side" (Jul-18) is an invalid inference.
+4. **pipeline.log**: all 3 streams hit 0fps at the **same instant** (e.g. 11:09:47) and recover together.
+5. **ICMP blackout probe** (cam0/1/2 **+ NVR 28.8**): all four lose ping in the **same windows**
+   (11:14:38, 11:19:38, 11:39:34, 11:44:34 — exactly 300s apart), ~40s each. A different-vendor NVR
+   dropping in lockstep **kills the per-camera-firmware theory**.
+6. **NIC RX-rate during blackout**: rx_pps **doubles** (~1000→2000) and multicast jumps ~10× — packets
+   **flood in**, do not go silent → not a link-down, not a Jetson stall; it's the switch **flooding**
+   unknown-unicast because it stopped hearing the cameras.
+7. **`l2_blackout_autopsy.sh`** (sudo, 420s, 2 blackouts): local managed switch `44:5b:ed:fe:b0:23`
+   emits BPDUs **every 2.000s with 0 gaps and 0 Topology-Change flags** through both blackouts →
+   **not STP reconvergence, local switch healthy.** Multicast peaks only ~100 pps → **not a bandwidth
+   storm** (flood is a symptom). Blackout period **300s == default MAC-aging timer**.
+
+### Conclusion
+A **periodic (300s) L2 forwarding disruption beyond the healthy local switch**, on the uplink/segment
+where the 3 cameras + NVR physically connect — asymmetric path / unmanaged-switch loop / flaky uplink
+from the Jun-27 re-cabling. Our switch stays up and floods the Jetson's port each cycle. **Cameras,
+firmware, gateway, DNS, TCP↔UDP, the Jetson, and the pipeline are all cleared.**
+
+### Fix (network/physical)
+1. Inspect the Jun-27 camera aggregation point: added unmanaged switch / daisy-chain / cable loop /
+   failing uplink. Ask the crew what was re-cabled.
+2. **Isolate cameras (+NVR) on their own switch/VLAN**, off the ~50-device flat 27/28 broadcast domain
+   (robust fix).
+3. Managed switches in camera path: RSTP + portfast/edge + BPDU-guard + loopback-detection +
+   storm-control; verify IGMP snooping + MAC-aging.
+4. Unplug retired CP Plus cameras (`28.152/155/162`, still live).
+
+### State left / tooling
+- cam1 now gateway `28.8` + DNS cleared (== cam0; harmless, leave). Rollbacks in `.cam_net_backups/`.
+- `camera_net_normalize.sh` hardened: strips CRLF from ISAPI XML + retries fetch/PUT across the
+  camera's own bounce windows.
+- New: `tools/l2_blackout_autopsy.sh` (sudo; correlates blackout windows ↔ STP BPDUs / multicast to
+  name the culprit). Verify any network fix with it + `outage_report.sh` (success = no 300s all-device blackout).
+
+### 2026-07-21 (correction & remote diagnosis, later same day — SUPERSEDES the re-cabling attribution above)
+
+Two claims above are corrected; the L2-break conclusion itself stands.
+
+1. **Trigger is NOT the June-27 change.** The user confirmed **June-27 was IP-ONLY** (re-IP: cam1
+   `27.253→28.172`, cam2 `27.226→28.174`, cam0 unchanged) — **no re-cabling, no hardware added.** So the
+   "re-cabled uplink / added switch from Jun-27" attribution is withdrawn. Onset was **~mid-July**, which
+   never matched June-27 anyway. **The trigger is currently UNKNOWN** and must be located on-site.
+2. **The NVRs are NOT a different vendor.** `28.6` and `28.8` are **both Prama Hikvision** (`24:b1:05`).
+   The per-camera-firmware theory still fails, but for a better reason: the drop hits a **device group**
+   (3 cams + NVR-**28.6**) and **spares NVR-28.8** (2s vs ~46s) — a free-running per-device timer can't do
+   that. NVR-28.8 = healthy side, {cams + 28.6} = far side → the flap is on the link/switch between them.
+
+**Remote rule-outs done today (no downtime):**
+- **Duplicate-IP RULED OUT.** ARP cache: `28.119/172/174` each map to exactly one Hikvision MAC
+  (`bc:29:78:*`, REACHABLE). The only MACs holding multiple IPs are legit multi-homed hosts (an HP server
+  on `28.242/175.199/27.142`, etc.) and the Jetson (`4c:bb:47`, `27/28/175.44`). (Confirm with `arping -D`.)
+- **Segment inventory:** Sophos `28.200` (`c8:4f:86`) confirmed on the camera subnet; **~23 CP Plus/Dahua
+  cams** (`f8:20:97` + `5c:35:48`, `.135–.178`) share the flat 27/28/175 L2 — the "retired" `.152/.155/.162`
+  are just 3 of a large flock.
+
+**Impact quantified (Track C, today's pipeline.log, work hours 08:00–13:15):** stream 0 = 31 outages,
+~9.6% blind, median 50s; stream 1 = 39, 8.4%, median 35s; stream 2 = 60, 8.0%, median 30s. **30/32
+stream-0 outages synchronized** (both other streams drop within 15s); inter-outage gap median **300s**.
+≈ 1 in 10–12 short events at risk of landing in a blind window.
+
+**Next (on-site, user can touch the segment):** (A2) read the **upstream** switch's per-port flap /
+MAC-move / STP-TC / CRC counters — the port cycling every ~300s is the culprit; (A3) physical bisection
+during a live storm (unplug one suspect at a time — cheapest first the 3 retired CP+ cams — while
+`l2_blackout_autopsy.sh` timestamps blackouts) until the 300s drop disappears. Then isolate cams+NVR on
+their own switch/VLAN + RSTP/BPDU-guard/loopback-detect/storm-control. Software floor shipped in parallel:
+UDP transport (`HICON_RTSP_PROTOCOL_2=multi`) to drop the TCP reconnect tail.

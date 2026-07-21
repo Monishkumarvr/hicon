@@ -16,7 +16,7 @@ with open(zones_file) as f:
 
 # RTSP streams
 stream_0_url = "rtsp://admin:india%40789@192.168.28.119:554/Streaming/Channels/101"  # main stream 2688x1520
-stream_1_url = "rtsp://admin:india%40789@192.168.27.253:554/Streaming/Channels/102"   # sub stream 1280x720
+stream_1_url = "rtsp://admin:india%40789@192.168.28.172:554/Streaming/Channels/102"   # sub stream 1280x720
 
 def capture_frame(rtsp_url):
     """Capture one frame from RTSP stream using ffmpeg"""
