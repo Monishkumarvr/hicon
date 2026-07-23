@@ -1,0 +1,30 @@
+logLevel: info
+
+rtsp: yes
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:8555
+
+# Disable unused protocols to avoid port conflicts
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+
+# readTimeout must exceed HICON_TIMELINE_MAX_DELAY_SEC (the writer's max stall
+# tolerance before it gives up on a window and skips forward) — otherwise a
+# legitimate, in-design backfill stall drops the publish session anyway.
+readTimeout: 360s
+writeTimeout: 30s
+
+# Dedicated instance for hicon-timeline — isolated from mediamtx.stream0.yml
+# (port 8554, the production overlay relay) so nothing here can affect it.
+paths:
+  timeline0:
+    source: publisher
+    sourceOnDemand: no
+  timeline1:
+    source: publisher
+    sourceOnDemand: no
+  timeline2:
+    source: publisher
+    sourceOnDemand: no

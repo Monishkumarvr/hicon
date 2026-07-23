@@ -1,0 +1,22 @@
+[Unit]
+Description=HiCon Timeline (NVR gap-free delayed re-stream — additive, independent of hicon-vision)
+After=network-online.target hicon-timeline-mediamtx.service
+Wants=network-online.target
+Requires=hicon-timeline-mediamtx.service
+
+[Service]
+Type=simple
+User=hicon
+Group=hicon
+WorkingDirectory=/home/hicon/hicon/ai_vision
+ExecStart=/usr/bin/python3 /home/hicon/hicon/ai_vision/timeline_service.py
+Restart=always
+RestartSec=2
+MemoryHigh=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hicon-timeline
+
+[Install]
+WantedBy=multi-user.target
