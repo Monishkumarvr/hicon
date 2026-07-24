@@ -20,7 +20,8 @@ mkdir -p "$DIR" 2>/dev/null || DIR="$(dirname "$0")/../logs"; mkdir -p "$DIR"
 declare -A CAM=( [0]=192.168.28.119 [1]=192.168.28.172 [2]=192.168.28.174 )
 
 probe() {
-  local sid=$1 ip=$2 transport=$3 log="$DIR/probe_cam${sid}_${transport}.log"
+  local sid=$1 ip=$2 transport=$3
+  local log="$DIR/probe_cam${sid}_${transport}.log"
   local url="rtsp://${U}:${P}@${ip}:554/Streaming/Channels/102"
   echo "$(date '+%F %T') probe start cam$sid $transport $ip" >> "$log"
   while true; do

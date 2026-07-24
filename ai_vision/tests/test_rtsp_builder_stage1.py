@@ -24,7 +24,7 @@ class DummySource:
     def get_property(self, name):
         return self.props.get(name, 0)
 
-    def connect(self, signal, callback, stream_id):
+    def connect(self, signal, callback, stream_id=None):
         self.connected_signals.append((signal, callback, stream_id))
 
 
@@ -67,7 +67,7 @@ class FakeElement:
     def request_pad_simple(self, name):
         return FakeStaticPad(f"{self.name}:{name}")
 
-    def connect(self, signal, callback, stream_id):
+    def connect(self, signal, callback, stream_id=None):
         self.connected_signals.append((signal, callback, stream_id))
 
     def sync_state_with_parent(self):
@@ -303,3 +303,17 @@ def test_nvurisrcbin_stream0_honors_configured_tcp(monkeypatch, caplog):
     assert builder._create_nvurisrcbin_chain(0, "rtsp://example/stream0") is True
     assert builder.elements["source0"].props["select-rtp-protocol"] == 4
     assert "requested=tcp effective=tcp" in caplog.text
+
+
+def test_nvurisrcbin_auto_keeps_udp_first_multi_transport(monkeypatch, caplog):
+    def fake_make(factory_name, name):
+        return FakeElement(factory_name, name)
+
+    builder = _make_builder(rtsp_protocol_0="auto")
+    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
+    caplog.set_level(logging.INFO)
+
+    assert builder._create_nvurisrcbin_chain(0, "rtsp://example/stream0") is True
+    assert "select-rtp-protocol" not in builder.elements["source0"].props
+    assert "protocol=multi" in caplog.text
+    assert "requested=auto effective=auto" in caplog.text
