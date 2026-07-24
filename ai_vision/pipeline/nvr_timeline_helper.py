@@ -1,36 +1,50 @@
 #!/usr/bin/env python3
 """NVR-backed rolling-window timeline helper — gap-free delayed playback.
 
-Continuously requests sequential NVR RTSP-playback windows for one camera track
-and paces them into a local FIFO for downstream re-publishing (see
-timeline_service.py). Reuses the segment-file / FIFO / pacing conventions proven
-in pipeline/segment_buffer_helper.py, but instead of restarting the SAME live URL
-on a drop, this walks forward through capture TIME: each cycle requests
-[read_head, read_head + chunk) from the NVR and advances read_head regardless of
-transient fetch failures (retried within the delay budget).
+Requests sequential NVR RTSP-playback windows for one camera track and paces
+them into a local FIFO for downstream re-publishing (see timeline_service.py).
+Reuses the segment-file / FIFO / pacing conventions proven in
+pipeline/segment_buffer_helper.py, but instead of restarting the SAME live URL
+on a drop, this walks forward through capture TIME — and does so with several
+CONCURRENT lanes, because this NVR's RTSP *playback* (not live) delivery is
+structurally slower than real-time per session (measured ~0.45-0.5x, confirmed
+independent of decode/probe overhead and independent of concurrent-session
+contention — two concurrent fetches of the same track each still ran at
+~0.46x, meaning the cap is per-session, not shared bandwidth). A single
+sequential fetcher can therefore never keep up: lag would grow unboundedly.
+Running N lanes in parallel, each independently fetching a different window,
+recovers aggregate throughput close to or above 1x.
 
-Feasibility basis: docs/nvr_backfill_feasibility_2026-07-23.md confirmed NVR
-192.168.28.6 records all 3 HiCon cameras continuously (segment- and frame-level,
-25fps, 0 gaps) through the network outages this exists to cover — so there is no
-live/backfill switchover state machine: the NVR is the only source here, always
-played back at a lag behind wall-clock, and that lag absorbs transient NVR
-retrieval hiccups instead of needing them to succeed in real time.
+Window schedule is a fixed, deterministic timeline divided into windows of
+`chunk_seconds`, numbered k=0,1,2,... from a startup epoch t0. Lane `i` claims
+whichever window index is next unclaimed (self-balancing — a lane that
+finishes early claims the next one, so lanes don't need round-robin pinning).
+This means multiple lanes may be mid-fetch on DIFFERENT windows at once, but
+the FEEDER must still deliver them in strict k order — the shared
+`_window_status` table (protected by `_window_lock`) is what the feeder
+polls: it blocks/rebuffers on whichever k is next until that lane's fetch
+resolves to "done" (serve it) or "failed" (that window is unrecoverable
+after `max_delay_seconds` — skip forward and log the gap; this is the only
+path that can create an actual gap, and only after real, budgeted retries).
 
-Each NVR window is written as exactly ONE segment file per epoch (no internal
-segment-time splitting): the requested [start, end) duration is a lower bound —
-Hikvision playback rounds up to the next keyframe past `endtime`, so actual
-content is typically a little longer than requested (never shorter — the safe
-direction: a little overlap between consecutive windows, never a gap). The
-segment "epoch" doubles as capture-time metadata: epoch = the unix second of
-that window's absolute start, so capture_time(segment) = epoch exactly. Real
-per-window duration (frame_count / fps, not the nominal chunk length) is tracked
-separately and used for playback pacing and the capture-clock anchor, so anchor
-drift can't accumulate from the NVR's keyframe rounding.
+Each NVR window is written as exactly ONE segment file (no internal
+segment-time splitting): the requested [start, end) duration is a lower
+bound — Hikvision playback rounds up to the next keyframe past `endtime`, so
+actual content is typically a little longer than requested (never shorter).
+Real per-window duration is measured via packet count (NOT frame count/full
+decode — decoding was the original bottleneck before lanes were added: ~40x
+slower than demux-level counting for the same, exact count) and used for
+playback pacing and the capture-clock anchor, so anchor drift can't
+accumulate from the NVR's keyframe rounding or from concurrent lanes
+resolving windows out of submission order.
 
-The feeder publishes a capture-clock anchor (capture_epoch, host_monotonic, rate)
-to anchor.json as it paces bytes out, so a downstream consumer can map "now" to
-"capture time" without needing PTS:
+The feeder publishes a capture-clock anchor (capture_epoch, host_monotonic,
+rate) to anchor.json as it paces bytes out, so a downstream consumer can map
+"now" to "capture time" without needing PTS:
     capture_now = capture_epoch + (monotonic_now - host_monotonic) * rate
+The anchor is clamped to be non-decreasing at publish time as a defensive
+invariant — belt-and-suspenders against any residual scheduling edge case
+producing a value earlier than what's already been published.
 """
 
 from __future__ import annotations
@@ -59,6 +73,7 @@ SEGMENTS_DIR_NAME = "segments"
 POLL_INTERVAL_SEC = 0.25
 ANCHOR_PUBLISH_INTERVAL_SEC = 1.0
 NVR_TIME_FMT = "%Y%m%dT%H%M%SZ"  # NVR quirk: 'Z' suffix but digits are local IST wall-clock
+DEFAULT_LANE_COUNT = 3
 
 
 @dataclass(frozen=True, order=True)
@@ -79,32 +94,6 @@ def parse_segment_ref(path: Path) -> SegmentRef | None:
     return SegmentRef(epoch=epoch, index=index, path=path)
 
 
-def list_complete_segments(segments_root: Path, active_epoch: int | None) -> list[SegmentRef]:
-    """Segments in playback order; the active (still-being-written) epoch's
-    latest segment is withheld since ffmpeg may still be writing it."""
-    refs = []
-    for path in segments_root.glob("epoch_*/seg_*.*"):
-        ref = parse_segment_ref(path)
-        if ref is not None:
-            refs.append(ref)
-    refs.sort()
-    if active_epoch is None:
-        return refs
-    latest_active_index = None
-    for ref in refs:
-        if ref.epoch == active_epoch:
-            latest_active_index = ref.index
-    if latest_active_index is None:
-        return refs
-    return [r for r in refs if not (r.epoch == active_epoch and r.index == latest_active_index)]
-
-
-def should_rebuffer(pending_count: int, primed: bool, target_segments: int, low_watermark: int) -> bool:
-    if primed:
-        return pending_count < low_watermark
-    return pending_count < target_segments
-
-
 def build_playback_url(nvr_host: str, nvr_user: str, nvr_pass: str, track_id: int,
                         window_start: datetime, window_end: datetime) -> str:
     """rtsp://user:pass@host/Streaming/tracks/{track}/?starttime=..&endtime=..
@@ -122,13 +111,14 @@ def build_playback_url(nvr_host: str, nvr_user: str, nvr_pass: str, track_id: in
 
 
 class NvrTimelineHelper:
-    """Owns the rolling NVR pull (writer) and paced FIFO feed (feeder) for one stream."""
+    """Owns the concurrent-lane NVR pull (writer) and paced FIFO feed (feeder)
+    for one stream."""
 
     def __init__(self, *, stream_id: int, nvr_host: str, nvr_user: str, nvr_pass: str,
                  track_id: int, codec: str, fps: float, buffer_dir: str,
                  chunk_seconds: int, initial_delay_seconds: int,
                  min_delay_seconds: int, max_delay_seconds: int,
-                 retention_seconds: int):
+                 retention_seconds: int, lane_count: int = DEFAULT_LANE_COUNT):
         self.stream_id = stream_id
         self.nvr_host = nvr_host
         self.nvr_user = nvr_user
@@ -146,56 +136,73 @@ class NvrTimelineHelper:
         self.min_delay_seconds = max(self.chunk_seconds, int(min_delay_seconds))
         self.max_delay_seconds = max(self.min_delay_seconds, int(max_delay_seconds))
         self.retention_seconds = max(self.max_delay_seconds, int(retention_seconds))
-        self.target_segments = max(1, -(-self.initial_delay_seconds // self.chunk_seconds))
-        self.low_watermark_segments = max(1, self.target_segments // 4)
+        self.lane_count = max(1, int(lane_count))
+        self.target_windows = max(1, -(-self.initial_delay_seconds // self.chunk_seconds))
+        self.low_watermark_windows = max(1, self.target_windows // 4)
+        # Lanes may claim ahead of what the feeder has served; cap it so a
+        # stalled feeder/downstream doesn't let disk usage grow unbounded.
+        self.lookahead_cap = self.target_windows + self.lane_count * 3
 
         self._stop_event = threading.Event()
-        self._state_lock = threading.Lock()
-        self._active_epoch: int | None = None
-        self._read_head: datetime | None = None
-        self._ffmpeg_reader_proc: subprocess.Popen | None = None
-        self._last_fed: SegmentRef | None = None
-        self._writer_thread: threading.Thread | None = None
+        self._window_lock = threading.Lock()
+        self._t0: datetime | None = None
+        self._next_unassigned_k = 0
+        self._feeder_next_k = 0  # feeder's current position — bounds lane lookahead
+        self._window_status: dict[int, str] = {}    # k -> "done" | "failed"
+        self._window_duration: dict[int, float] = {}  # k -> real duration (only "done")
+        self._lane_reader_procs: dict[int, subprocess.Popen] = {}  # lane_id -> active reader
+        self._lane_threads: list[threading.Thread] = []
         self._feeder_thread: threading.Thread | None = None
-        # epoch -> actual content duration (frame_count / fps), NOT the nominal
-        # chunk length — NVR playback rounds up to the next keyframe past
-        # `endtime`, so real duration is typically a little longer than requested.
-        self._segment_durations: dict[int, float] = {}
+        self._last_published_capture_epoch: float | None = None
 
     def run(self) -> int:
         self._install_signal_handlers()
         self._prepare_buffer_dir()
-        self._writer_thread = threading.Thread(target=self._writer_loop, name="nvr-writer", daemon=True)
+        self._t0 = datetime.now() - timedelta(seconds=self.initial_delay_seconds)
+
         self._feeder_thread = threading.Thread(target=self._feeder_loop, name="nvr-feeder", daemon=True)
-        self._writer_thread.start()
         self._feeder_thread.start()
+        for lane_id in range(self.lane_count):
+            t = threading.Thread(target=self._lane_loop, args=(lane_id,),
+                                  name=f"nvr-lane-{lane_id}", daemon=True)
+            self._lane_threads.append(t)
+            t.start()
+
+        logger.info("Stream %s: %s lanes started (chunk=%ss, target_delay=%ss)",
+                    self.stream_id, self.lane_count, self.chunk_seconds, self.initial_delay_seconds)
         try:
             while not self._stop_event.is_set():
-                if self._writer_thread.is_alive() and self._feeder_thread.is_alive():
-                    time.sleep(0.5)
-                    continue
-                if not self._writer_thread.is_alive():
-                    logger.error("Stream %s: writer thread exited unexpectedly", self.stream_id)
                 if not self._feeder_thread.is_alive():
                     logger.error("Stream %s: feeder thread exited unexpectedly", self.stream_id)
-                self._stop_event.set()
+                    self._stop_event.set()
+                    break
+                dead_lanes = [t.name for t in self._lane_threads if not t.is_alive()]
+                if dead_lanes:
+                    logger.error("Stream %s: lane thread(s) exited unexpectedly: %s",
+                                 self.stream_id, dead_lanes)
+                    self._stop_event.set()
+                    break
+                time.sleep(0.5)
         finally:
             self.close()
         return 0
 
     def close(self) -> None:
         self._stop_event.set()
-        self._terminate_ffmpeg()
-        for t in (self._writer_thread, self._feeder_thread):
-            if t and t.is_alive():
+        for proc in list(self._lane_reader_procs.values()):
+            self._terminate_proc(proc)
+        threads = list(self._lane_threads) + ([self._feeder_thread] if self._feeder_thread else [])
+        for t in threads:
+            if t.is_alive():
                 t.join(timeout=5)
-        self._publish_state("stopped", pending_segments=0)
+        self._publish_state("stopped", pending_windows=0)
 
     def _install_signal_handlers(self) -> None:
         def _handler(signum, _frame):
             logger.info("Stream %s: helper received signal %s, shutting down", self.stream_id, signum)
             self._stop_event.set()
-            self._terminate_ffmpeg()
+            for proc in list(self._lane_reader_procs.values()):
+                self._terminate_proc(proc)
 
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, _handler)
@@ -206,17 +213,18 @@ class NvrTimelineHelper:
         if self.fifo_path.exists():
             self.fifo_path.unlink()
         os.mkfifo(self.fifo_path, 0o644)
-        self._publish_state("buffering", pending_segments=0)
+        self._publish_state("buffering", pending_windows=0)
         logger.info(
             "Stream %s: NVR timeline buffer ready (dir=%s, track=%s, target_delay=%ss, chunk=%ss)",
             self.stream_id, self.buffer_dir, self.track_id, self.initial_delay_seconds, self.chunk_seconds,
         )
 
-    def _publish_state(self, mode: str, *, pending_segments: int) -> None:
+    def _publish_state(self, mode: str, *, pending_windows: int) -> None:
         state = {
             "mode": mode,
-            "pending_segments": max(0, int(pending_segments)),
-            "target_segments": self.target_segments,
+            "pending_segments": max(0, int(pending_windows)),
+            "target_segments": self.target_windows,
+            "lane_count": self.lane_count,
             "updated_at": time.time(),
         }
         tmp = self.state_path.with_suffix(".tmp")
@@ -224,6 +232,14 @@ class NvrTimelineHelper:
         os.replace(tmp, self.state_path)
 
     def _publish_anchor(self, capture_epoch: float, rate: float) -> None:
+        # Defensive invariant: never publish a capture time earlier than one
+        # already published. Lane concurrency means windows can resolve
+        # slightly out of the order they'll ultimately be fed in; the feeder
+        # already enforces strict k-order delivery, but this is cheap
+        # belt-and-suspenders against any edge case in that reasoning.
+        if self._last_published_capture_epoch is not None:
+            capture_epoch = max(capture_epoch, self._last_published_capture_epoch)
+        self._last_published_capture_epoch = capture_epoch
         anchor = {
             "stream_id": self.stream_id,
             "capture_epoch": capture_epoch,
@@ -235,73 +251,87 @@ class NvrTimelineHelper:
         tmp.write_text(json.dumps(anchor, sort_keys=True), encoding="utf-8")
         os.replace(tmp, self.anchor_path)
 
-    # ---- writer: rolling NVR pulls -------------------------------------------------
+    def _window_bounds(self, k: int) -> tuple[datetime, datetime]:
+        start = self._t0 + timedelta(seconds=k * self.chunk_seconds)
+        end = start + timedelta(seconds=self.chunk_seconds)
+        return start, end
 
-    def _writer_loop(self) -> None:
-        self._read_head = datetime.now() - timedelta(seconds=self.initial_delay_seconds)
-        consecutive_failures = 0
+    def _epoch_dir_for_k(self, k: int) -> Path:
+        window_start, _ = self._window_bounds(k)
+        epoch = int(window_start.timestamp())
+        return self.segments_root / f"epoch_{epoch:012d}"
+
+    # ---- lanes: concurrent NVR pulls -------------------------------------------------
+
+    def _claim_next_window(self) -> int | None:
+        with self._window_lock:
+            # Don't let lanes race indefinitely far ahead of the feeder's
+            # actual position — bounds disk usage if downstream consumption
+            # stalls for a long time (lanes would otherwise keep resolving
+            # windows regardless of whether anything is draining them).
+            if self._next_unassigned_k >= self._feeder_next_k + self.lookahead_cap:
+                return None
+            k = self._next_unassigned_k
+            self._next_unassigned_k += 1
+            return k
+
+    def _lane_loop(self, lane_id: int) -> None:
         while not self._stop_event.is_set():
-            window_start = self._read_head
-            window_end = window_start + timedelta(seconds=self.chunk_seconds)
+            k = self._claim_next_window()
+            if k is None:
+                self._stop_event.wait(POLL_INTERVAL_SEC)
+                continue
 
-            # Don't chase the live edge — the NVR needs a moment to finalize a
-            # segment before it's queryable/playable.
-            now = datetime.now()
-            if window_end > now - timedelta(seconds=self.min_delay_seconds):
+            window_start, window_end = self._window_bounds(k)
+
+            # Don't chase the live edge — the NVR needs a moment to finalize
+            # a segment before it's queryable/playable (measured ~100-120s).
+            while not self._stop_event.is_set():
+                now = datetime.now()
+                if window_end <= now - timedelta(seconds=self.min_delay_seconds):
+                    break
                 self._stop_event.wait(2.0)
-                continue
+            if self._stop_event.is_set():
+                return
 
-            epoch = int(window_start.timestamp())
-            epoch_dir = self.segments_root / f"epoch_{epoch:012d}"
+            epoch_dir = self._epoch_dir_for_k(k)
             epoch_dir.mkdir(parents=True, exist_ok=True)
-            with self._state_lock:
-                self._active_epoch = epoch
 
-            url = build_playback_url(
-                self.nvr_host, self.nvr_user, self.nvr_pass, self.track_id, window_start, window_end
-            )
-            ok = self._pull_window(epoch, url, epoch_dir)
-
-            with self._state_lock:
-                self._active_epoch = None
-
-            if ok:
-                consecutive_failures = 0
-                # Advance by the MEASURED real duration, not the nominal chunk
-                # length — the NVR rounds up to the next keyframe past `endtime`
-                # (real_duration >= chunk_seconds), so advancing by the nominal
-                # length would make consecutive epochs' claimed capture-time
-                # ranges overlap, producing a small backward jump in the anchor
-                # at every segment boundary. Advancing by real duration keeps
-                # segments exactly contiguous: epoch(N+1) == epoch(N) + real_duration(N).
-                real_duration = self._segment_duration(epoch)
-                self._read_head = window_start + timedelta(seconds=real_duration)
-                continue
-
-            consecutive_failures += 1
-            stuck_for = (datetime.now() - window_start).total_seconds()
-            if stuck_for > self.max_delay_seconds:
-                logger.error(
-                    "Stream %s: window %s unrecoverable after %.0fs (max_delay=%ss) — "
-                    "skipping forward, gap logged",
-                    self.stream_id, window_start.isoformat(), stuck_for, self.max_delay_seconds,
+            consecutive_failures = 0
+            while not self._stop_event.is_set():
+                url = build_playback_url(
+                    self.nvr_host, self.nvr_user, self.nvr_pass, self.track_id, window_start, window_end
                 )
-                self._read_head = window_end
-                consecutive_failures = 0
-                continue
+                ok = self._pull_window(lane_id, k, url, epoch_dir)
+                if ok:
+                    with self._window_lock:
+                        self._window_status[k] = "done"
+                    break
 
-            backoff = min(10.0, 2.0 * consecutive_failures)
-            logger.warning(
-                "Stream %s: NVR pull failed for window %s (attempt %s), retrying in %.0fs",
-                self.stream_id, window_start.isoformat(), consecutive_failures, backoff,
-            )
-            self._stop_event.wait(backoff)
+                consecutive_failures += 1
+                stuck_for = (datetime.now() - window_start).total_seconds()
+                if stuck_for > self.max_delay_seconds:
+                    logger.error(
+                        "Stream %s: lane %s window k=%s (%s) unrecoverable after %.0fs "
+                        "(max_delay=%ss) — skipping forward, gap logged",
+                        self.stream_id, lane_id, k, window_start.isoformat(), stuck_for,
+                        self.max_delay_seconds,
+                    )
+                    with self._window_lock:
+                        self._window_status[k] = "failed"
+                    break
 
-    def _pull_window(self, epoch: int, url: str, epoch_dir: Path) -> bool:
+                backoff = min(10.0, 2.0 * consecutive_failures)
+                logger.warning(
+                    "Stream %s: lane %s NVR pull failed for window k=%s (%s), attempt %s, retrying in %.0fs",
+                    self.stream_id, lane_id, k, window_start.isoformat(), consecutive_failures, backoff,
+                )
+                self._stop_event.wait(backoff)
+
+    def _pull_window(self, lane_id: int, k: int, url: str, epoch_dir: Path) -> bool:
         """Pull one finite NVR playback window into a single raw elementary-stream
-        file (no internal segment-time splitting — see module docstring for why).
-        Returns True if a non-empty file with at least one decodable frame was
-        produced; records its real duration in self._segment_durations[epoch]."""
+        file. Returns True if a non-empty file with at least one decodable
+        frame was produced; records its real duration in self._window_duration."""
         fmt = "hevc" if self.codec == "h265" else "h264"
         ext = ".h265" if self.codec == "h265" else ".h264"
         out_path = epoch_dir / f"seg_000000{ext}"
@@ -313,43 +343,55 @@ class NvrTimelineHelper:
             "-f", fmt, str(out_path),
         ]
         reader = subprocess.Popen(reader_cmd, stderr=subprocess.PIPE, close_fds=True)
-        self._ffmpeg_reader_proc = reader
-        threading.Thread(target=self._drain_stderr, args=(reader, "reader"), daemon=True).start()
+        self._lane_reader_procs[lane_id] = reader
+        threading.Thread(target=self._drain_stderr, args=(lane_id, reader), daemon=True).start()
 
-        deadline = self.chunk_seconds + 20  # generous: connect + auth + playback + teardown
+        # Generous: measured single-session fetch of a 30s window took ~60s wall
+        # (NVR playback runs ~0.5x real-time), and concurrent lanes add further
+        # slack — chunk_seconds*5 comfortably covers that with margin rather
+        # than killing a fetch that would have succeeded.
+        deadline = max(150, self.chunk_seconds * 5)
         try:
             reader.wait(timeout=deadline)
         except subprocess.TimeoutExpired:
             reader.kill()
-        self._ffmpeg_reader_proc = None
+        self._lane_reader_procs.pop(lane_id, None)
 
         if not out_path.exists() or out_path.stat().st_size == 0:
             logger.warning(
-                "Stream %s: no data produced for window starting %s (reader exit=%s)",
-                self.stream_id, epoch_dir.name, reader.returncode,
+                "Stream %s: lane %s: no data produced for window %s (reader exit=%s)",
+                self.stream_id, lane_id, epoch_dir.name, reader.returncode,
             )
             shutil.rmtree(epoch_dir, ignore_errors=True)
             return False
 
         real_duration = self._probe_duration(out_path, fmt)
         if real_duration is None or real_duration <= 0:
-            logger.warning("Stream %s: could not determine duration for %s, discarding",
-                           self.stream_id, epoch_dir.name)
+            logger.warning("Stream %s: lane %s: could not determine duration for %s, discarding",
+                           self.stream_id, lane_id, epoch_dir.name)
             shutil.rmtree(epoch_dir, ignore_errors=True)
             return False
 
-        with self._state_lock:
-            self._segment_durations[epoch] = real_duration
+        with self._window_lock:
+            self._window_duration[k] = real_duration
         return True
 
     def _probe_duration(self, path: Path, fmt: str) -> float | None:
-        """Real content duration via frame count / fps — robust to the NVR
-        rounding actual footage to slightly more than the requested window."""
+        """Real content duration via packet count / fps — robust to the NVR
+        rounding actual footage to slightly more than the requested window.
+
+        -count_packets (demux-level NAL/access-unit parsing) gives an
+        identical count to -count_frames (full software decode) for these
+        raw H.264/H.265 elementary streams, but ~40x faster (measured: 0.3s
+        vs 13.4s for a 32s stream-0 clip) — decoding every window here was
+        the dominant client-side cost; even after fixing it, NVR-side
+        playback throughput itself is the real bottleneck (~0.5x real-time
+        per session), which is why this helper now runs concurrent lanes."""
         try:
             out = subprocess.run(
                 ["ffprobe", "-v", "error", "-f", fmt, "-i", str(path),
-                 "-select_streams", "v:0", "-count_frames",
-                 "-show_entries", "stream=nb_read_frames",
+                 "-select_streams", "v:0", "-count_packets",
+                 "-show_entries", "stream=nb_read_packets",
                  "-of", "default=noprint_wrappers=1:nokey=1"],
                 capture_output=True, text=True, timeout=self.chunk_seconds + 15,
             )
@@ -364,17 +406,16 @@ class NvrTimelineHelper:
             return None
         return nb_frames / self.fps
 
-    def _drain_stderr(self, proc: subprocess.Popen, label: str) -> None:
+    def _drain_stderr(self, lane_id: int, proc: subprocess.Popen) -> None:
         if proc.stderr is None:
             return
         for line in proc.stderr:
             msg = line.decode(errors="replace").rstrip()
             if msg:
-                logger.debug("Stream %s: ffmpeg-%s: %s", self.stream_id, label, msg)
+                logger.debug("Stream %s: lane %s ffmpeg: %s", self.stream_id, lane_id, msg)
         proc.stderr.close()
 
-    def _terminate_ffmpeg(self) -> None:
-        proc = self._ffmpeg_reader_proc
+    def _terminate_proc(self, proc: subprocess.Popen) -> None:
         if proc is None or proc.poll() is not None:
             return
         proc.terminate()
@@ -383,7 +424,7 @@ class NvrTimelineHelper:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    # ---- feeder: paced FIFO output + capture-clock anchor ---------------------------
+    # ---- feeder: strict k-order paced FIFO output + capture-clock anchor -------------
 
     def _feeder_loop(self) -> None:
         fifo_fd = os.open(self.fifo_path, os.O_WRONLY)
@@ -394,55 +435,81 @@ class NvrTimelineHelper:
             except OSError:
                 continue
 
+        next_k = 0
         primed = False
         while not self._stop_event.is_set():
-            with self._state_lock:
-                active_epoch = self._active_epoch
-            complete = list_complete_segments(self.segments_root, active_epoch)
-            pending = complete if self._last_fed is None else [s for s in complete if s > self._last_fed]
+            resolved_ahead = self._count_resolved_from(next_k)
 
-            if should_rebuffer(len(pending), primed, self.target_segments, self.low_watermark_segments):
-                self._publish_state("rebuffering" if primed else "buffering", pending_segments=len(pending))
+            if self._should_rebuffer(resolved_ahead, primed):
+                self._publish_state("rebuffering" if primed else "buffering", pending_windows=resolved_ahead)
                 if primed:
-                    self._publish_anchor(self._current_capture_epoch(), rate=0.0)
+                    self._publish_anchor(self._pending_capture_epoch(next_k), rate=0.0)
                 primed = False
                 self._stop_event.wait(POLL_INTERVAL_SEC)
                 continue
             if not primed:
-                logger.info("Stream %s: timeline primed (%s pending segments)", self.stream_id, len(pending))
+                logger.info("Stream %s: timeline primed (%s windows resolved ahead)", self.stream_id, resolved_ahead)
                 primed = True
 
-            self._publish_state("playing", pending_segments=len(pending))
-            next_seg = pending[0]
-            self._write_segment(fifo_fd, next_seg)
-            self._last_fed = next_seg
-            self._prune_old_segments()
+            self._publish_state("playing", pending_windows=resolved_ahead)
 
-    def _segment_duration(self, epoch: int) -> float:
-        with self._state_lock:
-            return self._segment_durations.get(epoch, self.chunk_seconds)
+            with self._window_lock:
+                status = self._window_status.get(next_k)
+            if status == "failed":
+                logger.error("Stream %s: window k=%s permanently unavailable — skipping (gap)",
+                             self.stream_id, next_k)
+                next_k += 1
+                with self._window_lock:
+                    self._feeder_next_k = next_k
+                self._prune_old_windows(next_k)
+                continue
 
-    def _current_capture_epoch(self) -> float:
-        if self._last_fed is None:
-            return time.time() - self.initial_delay_seconds
-        return self._last_fed.epoch + self._segment_duration(self._last_fed.epoch)
+            # status == "done"
+            epoch_dir = self._epoch_dir_for_k(next_k)
+            ext = ".h265" if self.codec == "h265" else ".h264"
+            seg_path = epoch_dir / f"seg_000000{ext}"
+            with self._window_lock:
+                real_duration = self._window_duration.get(next_k, self.chunk_seconds)
+            window_start, _ = self._window_bounds(next_k)
+            capture_start = int(window_start.timestamp())
+            self._write_segment(fifo_fd, seg_path, capture_start, real_duration)
+            next_k += 1
+            with self._window_lock:
+                self._feeder_next_k = next_k
+            self._prune_old_windows(next_k)
 
-    def _write_segment(self, fifo_fd: int, ref: SegmentRef) -> None:
+    def _count_resolved_from(self, start_k: int) -> int:
+        with self._window_lock:
+            count = 0
+            k = start_k
+            while k in self._window_status:
+                count += 1
+                k += 1
+            return count
+
+    def _should_rebuffer(self, resolved_ahead: int, primed: bool) -> bool:
+        if primed:
+            return resolved_ahead < self.low_watermark_windows
+        return resolved_ahead < self.target_windows
+
+    def _pending_capture_epoch(self, next_k: int) -> float:
+        window_start, _ = self._window_bounds(next_k)
+        return int(window_start.timestamp())
+
+    def _write_segment(self, fifo_fd: int, path: Path, capture_start: int, real_duration: float) -> None:
         try:
-            size = ref.path.stat().st_size
+            size = path.stat().st_size
         except OSError:
             return
         if size == 0:
             return
-        capture_start = ref.epoch  # single file per epoch — the epoch IS the capture start
-        real_duration = self._segment_duration(ref.epoch)
         bytes_per_sec = size / real_duration
         chunk = 65536
         start_mono = time.monotonic()
         last_anchor_pub = 0.0
         written = 0
         self._publish_anchor(capture_start, rate=1.0)
-        with ref.path.open("rb") as fh:
+        with path.open("rb") as fh:
             while not self._stop_event.is_set():
                 data = fh.read(chunk)
                 if not data:
@@ -458,8 +525,6 @@ class NvrTimelineHelper:
                 if slack > 0.005:
                     self._stop_event.wait(slack)
         self._publish_anchor(capture_start + real_duration, rate=1.0)
-        with self._state_lock:
-            self._segment_durations.pop(ref.epoch, None)
 
     def _write_all(self, fifo_fd: int, data: bytes) -> None:
         offset = 0
@@ -469,25 +534,21 @@ class NvrTimelineHelper:
                 raise RuntimeError("FIFO write returned no progress")
             offset += n
 
-    def _prune_old_segments(self) -> None:
+    def _prune_old_windows(self, fed_up_to_k: int) -> None:
         cutoff = time.time() - self.retention_seconds
-        for path in sorted(self.segments_root.glob("epoch_*/seg_*.*")):
-            ref = parse_segment_ref(path)
-            if ref is None:
+        with self._window_lock:
+            done_ks = list(self._window_status.keys())
+        for k in done_ks:
+            if k >= fed_up_to_k:
                 continue
-            if ref.epoch < cutoff and (self._last_fed is None or ref < self._last_fed):
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    continue
-        for d in sorted(self.segments_root.glob("epoch_*")):
-            try:
-                next(d.iterdir())
-            except StopIteration:
-                try:
-                    d.rmdir()
-                except OSError:
-                    pass
+            window_start, _ = self._window_bounds(k)
+            if window_start.timestamp() >= cutoff:
+                continue
+            epoch_dir = self._epoch_dir_for_k(k)
+            shutil.rmtree(epoch_dir, ignore_errors=True)
+            with self._window_lock:
+                self._window_status.pop(k, None)
+                self._window_duration.pop(k, None)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -505,6 +566,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-delay-seconds", type=int, default=180)
     p.add_argument("--max-delay-seconds", type=int, default=300)
     p.add_argument("--retention-seconds", type=int, default=900)
+    p.add_argument("--lane-count", type=int, default=DEFAULT_LANE_COUNT)
     return p
 
 
@@ -517,6 +579,7 @@ def main() -> int:
         buffer_dir=args.buffer_dir, chunk_seconds=args.chunk_seconds,
         initial_delay_seconds=args.initial_delay_seconds, min_delay_seconds=args.min_delay_seconds,
         max_delay_seconds=args.max_delay_seconds, retention_seconds=args.retention_seconds,
+        lane_count=args.lane_count,
     )
     return helper.run()
 

@@ -61,6 +61,7 @@ def _load_config() -> dict:
         "retention_seconds": int(_env("HICON_TIMELINE_RETENTION_SEC", "900")),
         "buffer_dir": _env("HICON_TIMELINE_BUFFER_DIR", str(BASE_DIR / "output" / "timeline_buffer")),
         "mediamtx_port": _env("HICON_TIMELINE_MEDIAMTX_PORT", "8555"),
+        "lane_count": _env("HICON_TIMELINE_LANE_COUNT", "5"),
     }
     for sid in STREAMS:
         cfg[f"track_{sid}"] = _env(f"HICON_TIMELINE_TRACK_{sid}", DEFAULT_TRACKS[sid])
@@ -87,6 +88,7 @@ def _build_helper_cmd(stream_id: int, cfg: dict) -> list[str]:
         "--min-delay-seconds", str(cfg["min_delay_seconds"]),
         "--max-delay-seconds", str(cfg["max_delay_seconds"]),
         "--retention-seconds", str(cfg["retention_seconds"]),
+        "--lane-count", str(cfg["lane_count"]),
     ]
 
 

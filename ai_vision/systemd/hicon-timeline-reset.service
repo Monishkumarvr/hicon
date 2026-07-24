@@ -1,0 +1,7 @@
+[Unit]
+Description=HiCon Timeline periodic reset (resets accumulated delay drift back to baseline)
+After=hicon-timeline.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart hicon-timeline.service
