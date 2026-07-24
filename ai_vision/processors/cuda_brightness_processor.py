@@ -110,8 +110,14 @@ class CudaTappingDetector:
             )
         self.frame_idx = 0
 
-    def update(self, gst_buffer, frame_meta) -> List[dict]:
-        """Run tapping detection. Returns list of event dicts."""
+    def update(self, gst_buffer, frame_meta, capture_ts=None, capture_dt=None) -> List[dict]:
+        """Run tapping detection. Returns list of event dicts.
+
+        capture_ts/capture_dt: when supplied (delayed-source capture clock),
+        stamp events with these instead of time.time()/datetime.now() — see
+        config.HICON_DELAYED_CAPTURE_CLOCK. None (default) reproduces today's
+        exact wall-clock behavior.
+        """
         self.frame_idx = frame_meta.frame_num
         events = []
 
@@ -134,13 +140,13 @@ class CudaTappingDetector:
 
         # Update per-zone state machines
         for zs in self.zone_states.values():
-            event = self._update_zone(zs)
+            event = self._update_zone(zs, capture_ts, capture_dt)
             if event:
                 events.append(event)
 
         return events
 
-    def _update_zone(self, zs: TappingZoneState) -> Optional[dict]:
+    def _update_zone(self, zs: TappingZoneState, capture_ts=None, capture_dt=None) -> Optional[dict]:
         ratio = zs.last_white_ratio
 
         if not zs.tapping_active:
@@ -153,8 +159,8 @@ class CudaTappingDetector:
                 zs.tapping_active = True
                 zs.start_frame = self.frame_idx - self.on_frames + 1
                 zs.on_count = 0
-                zs.event_start_time = time.time()
-                zs.event_start_datetime = datetime.now()
+                zs.event_start_time = capture_ts if capture_ts is not None else time.time()
+                zs.event_start_datetime = capture_dt if capture_dt is not None else datetime.now()
                 logger.info(
                     f"[Tapping] Zone '{zs.name}': STARTED at frame {zs.start_frame} "
                     f"({zs.start_frame / self.fps:.1f}s)"
@@ -177,8 +183,8 @@ class CudaTappingDetector:
                 zs.tapping_active = False
                 zs.end_frame = self.frame_idx - self.off_frames + 1
                 zs.off_count = 0
-                end_time = time.time()
-                end_datetime = datetime.now()
+                end_time = capture_ts if capture_ts is not None else time.time()
+                end_datetime = capture_dt if capture_dt is not None else datetime.now()
                 duration = end_time - zs.event_start_time
                 logger.info(
                     f"[Tapping] Zone '{zs.name}': ENDED at frame {zs.end_frame} "
@@ -238,7 +244,7 @@ class CudaDeslaggingDetector:
             )
         self.frame_idx = 0
 
-    def update(self, gst_buffer, frame_meta) -> List[dict]:
+    def update(self, gst_buffer, frame_meta, capture_ts=None, capture_dt=None) -> List[dict]:
         self.frame_idx = frame_meta.frame_num
         events = []
 
@@ -257,8 +263,8 @@ class CudaDeslaggingDetector:
             if now_active and not zs.deslagging_active:
                 zs.deslagging_active = True
                 zs.start_frame = self.frame_idx
-                zs.event_start_time = time.time()
-                zs.event_start_datetime = datetime.now()
+                zs.event_start_time = capture_ts if capture_ts is not None else time.time()
+                zs.event_start_datetime = capture_dt if capture_dt is not None else datetime.now()
                 logger.info(
                     f"[Deslagging] Zone '{zs.name}': STARTED at frame {self.frame_idx} "
                     f"({self.frame_idx / self.fps:.1f}s)"
@@ -274,8 +280,8 @@ class CudaDeslaggingDetector:
             elif not now_active and zs.deslagging_active:
                 zs.deslagging_active = False
                 zs.end_frame = self.frame_idx
-                end_time = time.time()
-                end_datetime = datetime.now()
+                end_time = capture_ts if capture_ts is not None else time.time()
+                end_datetime = capture_dt if capture_dt is not None else datetime.now()
                 duration = end_time - zs.event_start_time
                 logger.info(
                     f"[Deslagging] Zone '{zs.name}': ENDED at frame {self.frame_idx} "
@@ -338,7 +344,7 @@ class CudaSpectroDetector:
             )
         self.frame_idx = 0
 
-    def update(self, gst_buffer, frame_meta) -> List[dict]:
+    def update(self, gst_buffer, frame_meta, capture_ts=None, capture_dt=None) -> List[dict]:
         self.frame_idx = frame_meta.frame_num
         events = []
 
@@ -369,8 +375,8 @@ class CudaSpectroDetector:
             if now_active and not zs.spectro_active:
                 zs.spectro_active = True
                 zs.start_frame = self.frame_idx
-                zs.event_start_time = time.time()
-                zs.event_start_datetime = datetime.now()
+                zs.event_start_time = capture_ts if capture_ts is not None else time.time()
+                zs.event_start_datetime = capture_dt if capture_dt is not None else datetime.now()
                 logger.info(
                     f"[Spectro] Zone '{zs.name}': STARTED at frame {self.frame_idx} "
                     f"({self.frame_idx / self.fps:.1f}s)"
@@ -386,8 +392,8 @@ class CudaSpectroDetector:
             elif not now_active and zs.spectro_active:
                 zs.spectro_active = False
                 zs.end_frame = self.frame_idx
-                end_time = time.time()
-                end_datetime = datetime.now()
+                end_time = capture_ts if capture_ts is not None else time.time()
+                end_datetime = capture_dt if capture_dt is not None else datetime.now()
                 duration = end_time - zs.event_start_time
                 logger.info(
                     f"[Spectro] Zone '{zs.name}': ENDED at frame {self.frame_idx} "
@@ -554,7 +560,7 @@ class CudaBrightnessProcessor:
 
         return scaled
 
-    def process_frame_cuda(self, gst_buffer, frame_meta, batch_meta):
+    def process_frame_cuda(self, gst_buffer, frame_meta, batch_meta, capture_ts=None, capture_dt=None):
         """
         Process a frame using CUDA kernels directly on GPU NvBufSurface.
         No CPU frame extraction needed.
@@ -563,18 +569,21 @@ class CudaBrightnessProcessor:
             gst_buffer: GStreamer buffer from pad probe
             frame_meta: NvDsFrameMeta
             batch_meta: NvDsBatchMeta
+            capture_ts/capture_dt: resolved capture-clock timestamp (delayed-source
+                mode only, see config.HICON_DELAYED_CAPTURE_CLOCK); None (default)
+                leaves detectors stamping with their own time.time()/datetime.now().
         """
         try:
             events = []
 
             if self.tapping_detector:
-                events.extend(self.tapping_detector.update(gst_buffer, frame_meta))
+                events.extend(self.tapping_detector.update(gst_buffer, frame_meta, capture_ts, capture_dt))
 
             if self.deslagging_detector:
-                events.extend(self.deslagging_detector.update(gst_buffer, frame_meta))
+                events.extend(self.deslagging_detector.update(gst_buffer, frame_meta, capture_ts, capture_dt))
 
             if self.spectro_detector:
-                events.extend(self.spectro_detector.update(gst_buffer, frame_meta))
+                events.extend(self.spectro_detector.update(gst_buffer, frame_meta, capture_ts, capture_dt))
 
             # Handle events (DB insert, heat cycle, screenshots)
             for event in events:

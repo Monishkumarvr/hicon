@@ -174,13 +174,56 @@ def _log_memory_snapshot(reason: str):
 
 
 class _ProbeTimestampResolver:
-    """Map per-stream PTS into stable wall-clock datetimes."""
+    """Map per-stream PTS into stable wall-clock datetimes.
+
+    When config.DELAYED_CAPTURE_CLOCK is enabled and a stream is being fed
+    from hicon-timeline (an anchor.json exists at TIMELINE_BUFFER_DIR/
+    stream{N}/anchor.json — see timeline_service.py), capture time is read
+    from that anchor instead of derived from PTS: the anchor already knows
+    the NVR's true capture instant for the frame currently being emitted,
+    which PTS cannot express once footage is stitched from multiple NVR
+    playback windows (PTS resets at each window boundary). Falls back to
+    the existing PTS-anchored wall-clock — unchanged — when the flag is
+    off, no anchor file exists for the stream, or the anchor is stale (the
+    timeline service stalled/died): never silently serve a frozen or wrong
+    timestamp.
+    """
+
+    ANCHOR_CACHE_SEC = 0.2  # re-read anchor.json at most 5x/sec per stream
 
     def __init__(self):
         self._state = {}
         self._lock = threading.Lock()
+        self._anchor_cache = {}  # stream_id -> (read_at_monotonic, anchor_dict_or_None)
+
+    def _read_anchor(self, stream_id):
+        if not config.DELAYED_CAPTURE_CLOCK:
+            return None
+        now_mono = time.monotonic()
+        cached = self._anchor_cache.get(stream_id)
+        if cached is not None and (now_mono - cached[0]) < self.ANCHOR_CACHE_SEC:
+            return cached[1]
+
+        anchor = None
+        try:
+            anchor_path = Path(config.TIMELINE_BUFFER_DIR) / f"stream{stream_id}" / "anchor.json"
+            with open(anchor_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if (time.time() - float(data["updated_at"])) <= config.TIMELINE_ANCHOR_STALE_SEC:
+                anchor = data
+        except (OSError, ValueError, KeyError, TypeError):
+            anchor = None
+        self._anchor_cache[stream_id] = (now_mono, anchor)
+        return anchor
 
     def resolve(self, gst_buffer, stream_id):
+        anchor = self._read_anchor(stream_id)
+        if anchor is not None:
+            capture_now = anchor["capture_epoch"] + (
+                (time.monotonic() - anchor["host_monotonic"]) * anchor["rate"]
+            )
+            return capture_now, datetime.fromtimestamp(capture_now)
+
         wall_now = time.time()
         pts_ns = getattr(gst_buffer, "pts", Gst.CLOCK_TIME_NONE) if gst_buffer else Gst.CLOCK_TIME_NONE
         if pts_ns in (None, Gst.CLOCK_TIME_NONE) or pts_ns < 0:
@@ -476,11 +519,17 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                     except Exception as e:
                         logger.error(f"Native tapping state sync error: {e}", exc_info=True)
 
+                # Only thread the resolver's capture time into brightness when the
+                # delayed-capture-clock flag is on — keeps this call byte-identical
+                # (detectors use their own time.time()/datetime.now()) otherwise.
+                capture_ts = frame_timestamp if config.DELAYED_CAPTURE_CLOCK else None
+                capture_dt = frame_datetime if config.DELAYED_CAPTURE_CLOCK else None
+
                 # CUDA brightness: runs on GPU NvBufSurface directly (no CPU frame)
                 if cuda_brightness:
                     try:
                         brightness_processor.process_frame_cuda(
-                            gst_buffer, frame_meta, batch_meta,
+                            gst_buffer, frame_meta, batch_meta, capture_ts, capture_dt,
                         )
                     except Exception as e:
                         logger.error(f"CUDA brightness processor error: {e}", exc_info=True)
@@ -488,7 +537,7 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 # CPU brightness: legacy path using NumPy frame
                 elif cpu_brightness and frame is not None:
                     try:
-                        brightness_processor.process_frame_with_array(frame, frame_meta)
+                        brightness_processor.process_frame_with_array(frame, frame_meta, capture_ts, capture_dt)
                         # display_meta intentionally NOT written here — overlays are
                         # drawn via CPU/OpenCV in post_osd_probe_stream0_for_streaming.
                         # Writing NvDsDisplayMeta in the analysis branch shares batch_meta
@@ -1253,7 +1302,9 @@ def osd_sink_pad_probe_stream2(pad, info):
                         logger.error(f"Stream 2 hybrid melting controller error: {e}", exc_info=True)
                 elif run_cpu_melting and frame is not None:
                     try:
-                        brightness_processor_2.process_frame_with_array(frame, frame_meta)
+                        capture_ts = frame_timestamp if config.DELAYED_CAPTURE_CLOCK else None
+                        capture_dt = frame_datetime if config.DELAYED_CAPTURE_CLOCK else None
+                        brightness_processor_2.process_frame_with_array(frame, frame_meta, capture_ts, capture_dt)
                     except Exception as e:
                         logger.error(f"Stream 2 CPU melting processor error: {e}", exc_info=True)
             finally:

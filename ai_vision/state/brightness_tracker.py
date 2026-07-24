@@ -59,13 +59,16 @@ class BrightnessTracker:
             f"end_ratio<{end_white_ratio} x{end_frame_count}f{max_info}"
         )
 
-    def update_blob_logic(self, has_valid_blobs: bool) -> Optional[Dict]:
+    def update_blob_logic(self, has_valid_blobs: bool, capture_ts=None, capture_dt=None) -> Optional[Dict]:
         """
         Update state machine with boolean detection signal (e.g. from molten blob detection).
         Reuses the same consecutive frame logic as update().
 
         Args:
             has_valid_blobs: True if at least one valid blob was detected in the zone.
+            capture_ts/capture_dt: resolved capture-clock timestamp (delayed-source
+                mode only, see config.HICON_DELAYED_CAPTURE_CLOCK). None (default)
+                reproduces today's exact time.time()/datetime.now() behavior.
 
         Returns:
             Event dict on state transition, None otherwise.
@@ -77,8 +80,8 @@ class BrightnessTracker:
                 self.start_counter += 1
                 if self.start_counter >= self.start_frame_count:
                     self.state = "ACTIVE"
-                    self.event_start_time = time.time()
-                    self.event_start_datetime = datetime.now()
+                    self.event_start_time = capture_ts if capture_ts is not None else time.time()
+                    self.event_start_datetime = capture_dt if capture_dt is not None else datetime.now()
                     self.start_counter = 0
                     self.end_counter = 0
                     self._exceeded_max = False # Blob detection is pre-filtered
@@ -100,8 +103,8 @@ class BrightnessTracker:
             if not has_valid_blobs:
                 self.end_counter += 1
                 if self.end_counter >= self.end_frame_count:
-                    end_time = time.time()
-                    end_datetime = datetime.now()
+                    end_time = capture_ts if capture_ts is not None else time.time()
+                    end_datetime = capture_dt if capture_dt is not None else datetime.now()
                     duration = end_time - self.event_start_time
 
                     event = {
@@ -132,12 +135,15 @@ class BrightnessTracker:
 
         return None
 
-    def update(self, white_ratio: float) -> Optional[Dict]:
+    def update(self, white_ratio: float, capture_ts=None, capture_dt=None) -> Optional[Dict]:
         """
         Update state machine with new frame's white ratio.
 
         Args:
             white_ratio: Ratio of white pixels in ROI (0.0 - 1.0)
+            capture_ts/capture_dt: resolved capture-clock timestamp (delayed-source
+                mode only, see config.HICON_DELAYED_CAPTURE_CLOCK). None (default)
+                reproduces today's exact time.time()/datetime.now() behavior.
 
         Returns:
             Event dict on state transition, None otherwise.
@@ -149,8 +155,8 @@ class BrightnessTracker:
                 if self.start_counter >= self.start_frame_count:
                     # Transition to ACTIVE
                     self.state = "ACTIVE"
-                    self.event_start_time = time.time()
-                    self.event_start_datetime = datetime.now()
+                    self.event_start_time = capture_ts if capture_ts is not None else time.time()
+                    self.event_start_datetime = capture_dt if capture_dt is not None else datetime.now()
                     self.start_counter = 0
                     self.end_counter = 0
                     self._exceeded_max = False
@@ -180,8 +186,8 @@ class BrightnessTracker:
                 self.end_counter += 1
                 if self.end_counter >= self.end_frame_count:
                     # Transition to IDLE
-                    end_time = time.time()
-                    end_datetime = datetime.now()
+                    end_time = capture_ts if capture_ts is not None else time.time()
+                    end_datetime = capture_dt if capture_dt is not None else datetime.now()
                     duration = end_time - self.event_start_time
 
                     # Discard if max threshold was exceeded (false positive)

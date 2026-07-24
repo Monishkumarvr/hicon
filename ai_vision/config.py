@@ -344,6 +344,20 @@ USE_UDP_LOOPBACK_2 = os.getenv('HICON_USE_UDP_LOOPBACK_2', 'false').lower() == '
 UDP_LOOPBACK_PORT_0 = int(os.getenv('HICON_UDP_LOOPBACK_PORT_0', '5000'))
 UDP_LOOPBACK_PORT_2 = int(os.getenv('HICON_UDP_LOOPBACK_PORT_2', '5002'))
 
+# Delayed capture-clock: when a stream is sourced from hicon-timeline (see
+# timeline_service.py / pipeline/nvr_timeline_helper.py), event timestamps
+# should reflect the NVR's original capture instant, not wall-clock-at-
+# processing. _ProbeTimestampResolver reads the per-stream anchor.json this
+# service publishes instead of PTS-anchoring when this is enabled AND a
+# fresh anchor exists for that stream; otherwise it falls back to today's
+# exact PTS-anchored wall-clock behavior (off by default = no change).
+DELAYED_CAPTURE_CLOCK = os.getenv('HICON_DELAYED_CAPTURE_CLOCK', 'false').lower() == 'true'
+TIMELINE_BUFFER_DIR = os.getenv(
+    'HICON_TIMELINE_BUFFER_DIR',
+    str(Path(__file__).parent / 'output' / 'timeline_buffer'),
+)
+TIMELINE_ANCHOR_STALE_SEC = float(os.getenv('HICON_TIMELINE_ANCHOR_STALE_SEC', '5.0'))
+
 # Healthchecks.io heartbeat URL (empty = disabled)
 # Ping every 60s from watchdog; /fail on fatal error
 HEALTHCHECK_URL = os.getenv('HICON_HEALTHCHECK_URL', '')

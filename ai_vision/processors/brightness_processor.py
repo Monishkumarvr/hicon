@@ -234,7 +234,7 @@ class BrightnessProcessor:
 
         return False
 
-    def process_frame_with_array(self, frame, frame_meta):
+    def process_frame_with_array(self, frame, frame_meta, capture_ts=None, capture_dt=None):
         """
         Process a pre-extracted frame for tapping, deslagging, and spectro detection.
 
@@ -245,6 +245,9 @@ class BrightnessProcessor:
         Args:
             frame: numpy array from get_nvds_buf_surface — RGBA (H,W,4) or NV12 (H*3/2,W)
             frame_meta: NvDsFrameMeta
+            capture_ts/capture_dt: resolved capture-clock timestamp (delayed-source
+                mode only, see config.HICON_DELAYED_CAPTURE_CLOCK). None (default)
+                leaves trackers stamping with their own time.time()/datetime.now().
         """
         try:
             # Detect pixel format and derive actual frame height/width.
@@ -272,7 +275,7 @@ class BrightnessProcessor:
                 self._process_zone(
                     self._crop_to_bbox(gray, self._tapping_bbox),
                     self._tapping_mask, self._tapping_pixel_count,
-                    self.tapping_tracker, frame_for_ss
+                    self.tapping_tracker, frame_for_ss, capture_ts, capture_dt
                 )
 
             # Process deslagging zone (suppressed during tapping or active pouring cycle)
@@ -287,13 +290,14 @@ class BrightnessProcessor:
                         self._process_zone_blobs(
                             self._crop_to_bbox(gray, self._deslagging_bbox),
                             self._deslagging_mask, self._deslagging_pixel_count,
-                            self.deslagging_tracker, self._deslagging_config, frame_for_ss
+                            self.deslagging_tracker, self._deslagging_config, frame_for_ss,
+                            capture_ts, capture_dt
                         )
                     else:
                         self._process_zone(
                             self._crop_to_bbox(gray, self._deslagging_bbox),
                             self._deslagging_mask, self._deslagging_pixel_count,
-                            self.deslagging_tracker, frame_for_ss
+                            self.deslagging_tracker, frame_for_ss, capture_ts, capture_dt
                         )
 
             # Process spectro zone (suppressed during tapping or active pouring cycle)
@@ -307,19 +311,21 @@ class BrightnessProcessor:
                         self._process_zone_blobs(
                             self._crop_to_bbox(gray, self._spectro_bbox),
                             self._spectro_mask, self._spectro_pixel_count,
-                            self.spectro_tracker, self._spectro_config, frame_for_ss
+                            self.spectro_tracker, self._spectro_config, frame_for_ss,
+                            capture_ts, capture_dt
                         )
                     else:
                         self._process_zone(
                             self._crop_to_bbox(gray, self._spectro_bbox),
                             self._spectro_mask, self._spectro_pixel_count,
-                            self.spectro_tracker, frame_for_ss
+                            self.spectro_tracker, frame_for_ss, capture_ts, capture_dt
                         )
 
         except Exception as e:
             logger.error(f"BrightnessProcessor error: {e}", exc_info=True)
 
-    def _process_zone_blobs(self, gray, mask, pixel_count, tracker, zone_cfg, frame_rgba):
+    def _process_zone_blobs(self, gray, mask, pixel_count, tracker, zone_cfg, frame_rgba,
+                             capture_ts=None, capture_dt=None):
         """Process a single zone using molten blob logic (contours)."""
         threshold = tracker.brightness_threshold
         min_area = zone_cfg.get("min_blob_area", 50)
@@ -369,14 +375,15 @@ class BrightnessProcessor:
         self._last_white_ratios[tracker.name] = white_ratio
 
         # 3. Update Tracker
-        event = tracker.update_blob_logic(has_valid_blobs)
+        event = tracker.update_blob_logic(has_valid_blobs, capture_ts, capture_dt)
         if event:
             if event.get("phase") == "start":
                 self._handle_event_start(event, frame_rgba, white_ratio)
             else:
                 self._handle_event(event, frame_rgba, white_ratio)
 
-    def _process_zone(self, gray, mask, pixel_count, tracker, frame_rgba):
+    def _process_zone(self, gray, mask, pixel_count, tracker, frame_rgba,
+                       capture_ts=None, capture_dt=None):
         """Process a single brightness zone."""
         threshold = tracker.brightness_threshold
 
@@ -404,7 +411,7 @@ class BrightnessProcessor:
                 )
 
         # Update state machine
-        event = tracker.update(white_ratio)
+        event = tracker.update(white_ratio, capture_ts, capture_dt)
 
         if event:
             if event.get("phase") == "start":
