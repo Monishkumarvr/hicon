@@ -67,6 +67,14 @@ class BrightnessProcessor:
         self._tapping_config = zones_config.get('tapping', {})
         self._deslagging_config = zones_config.get('deslagging', {})
         self._spectro_config = zones_config.get('spectro', {})
+        # Zone name per event type (e.g. "tap-2"), used to tag emitted events so
+        # heat_cycle_manager can infer Furnace1/Furnace2 — see MeltingAnalysisController's
+        # _ordered_zone_names for the same pattern on the CUDA path.
+        self._zone_name_by_event_type = {
+            "tapping": self._first_zone_name(self._tapping_config),
+            "deslagging": self._first_zone_name(self._deslagging_config),
+            "spectro": self._first_zone_name(self._spectro_config),
+        }
         self._masks_built = False
         self._frame_shape = None
         self._tapping_mask = None
@@ -138,6 +146,16 @@ class BrightnessProcessor:
             enabled_detectors.append("spectro")
         enabled_label = " + ".join(enabled_detectors) if enabled_detectors else "none"
         logger.info("BrightnessProcessor initialized (%s)", enabled_label)
+
+    @staticmethod
+    def _first_zone_name(cfg):
+        """Return the single configured zone key for an event type, e.g. 'tap-2'."""
+        zones = cfg.get('zones', {})
+        if zones:
+            return next(iter(zones))
+        if cfg.get('roi_points'):
+            return "zone-1"
+        return ""
 
     def _scale_pts(self, pts, frame_w, frame_h, ref_w, ref_h):
         """Scale zone coordinates from calibration resolution to actual frame resolution."""
@@ -377,6 +395,7 @@ class BrightnessProcessor:
         # 3. Update Tracker
         event = tracker.update_blob_logic(has_valid_blobs, capture_ts, capture_dt)
         if event:
+            event.setdefault("zone_name", self._zone_name_by_event_type.get(tracker.name, ""))
             if event.get("phase") == "start":
                 self._handle_event_start(event, frame_rgba, white_ratio)
             else:
@@ -414,6 +433,7 @@ class BrightnessProcessor:
         event = tracker.update(white_ratio, capture_ts, capture_dt)
 
         if event:
+            event.setdefault("zone_name", self._zone_name_by_event_type.get(tracker.name, ""))
             if event.get("phase") == "start":
                 self._handle_event_start(event, frame_rgba, white_ratio)
             else:
