@@ -20,7 +20,7 @@ import math
 import numpy as np
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -233,6 +233,12 @@ class PouringProcessor:
         # (>= pour_min_dur) pour contribute to the tracker-based count.
         self._tracked_mould_observations: List[Dict[str, Any]] = []
         self._active_tracked_mould_id: Optional[int] = None
+        # Per-frame re-picked and tallied for the whole pour; _end_pour commits the
+        # majority vote, not whatever frame 1 happened to pick (fixes a customer-
+        # reported "stuck yellow" bug: a one-shot pick locked at pour start could
+        # permanently mis-assign to a glare-lit neighboring mould with moulds placed
+        # close together, and never self-correct for the rest of that pour).
+        self._mould_vote_counts: Counter = Counter()
         self._poured_mould_ids = set()
         self._poured_mould_durations: Dict[int, float] = defaultdict(float)
         self._tracker_pour_records: Dict[int, Dict[str, Any]] = {}
@@ -258,6 +264,7 @@ class PouringProcessor:
         self.canonical_refresh_conf = float(getattr(config, 'MOULD_CANONICAL_REFRESH_CONF', 0.20))
         self.raw_mould_overlay = bool(getattr(config, 'MOULD_RAW_OVERLAY', False))
         self.overlay_stale_s = float(getattr(config, 'MOULD_OVERLAY_STALE_S', 3.0))
+        self.overlay_dim_after_s = float(getattr(config, 'MOULD_OVERLAY_DIM_AFTER_S', 1.5))
         self._canonical_moulds: Dict[int, Dict[str, Any]] = {}
         self._canonical_candidates: List[Dict[str, Any]] = []
         self._next_canonical_id = 1
@@ -550,63 +557,81 @@ class PouringProcessor:
                 f"[{self.camera_id}] Frame {frame_num}: {len(mouths)} mouths, {len(trolleys)} trolleys"
             )
 
-        # 2. Find the relevant trolley (locked or best candidate)
-        target_trolley = self._get_target_trolley(trolleys, timestamp, mouths)
-        self._update_tracked_mould_observations(moulds, target_trolley, timestamp)
-
-        # 3. Check mouth-in-trolley (with EDGE_EXPAND)
-        mouth_in_trolley = False
+        # 2-8: trolley targeting, session, pour, and mould-counting logic — isolated
+        # in its own try/except so a failure here (e.g. an edge case in the canonical
+        # registry hit only by a later heat's mould layout) can never prevent steps
+        # 9-10 below from running. Those are the ONLY paths that can recover/reset
+        # state (cycle timeout, heat finalization); a customer report showed pours
+        # silently stop being counted after a second tapping/heat while tapping
+        # itself (a fully separate code path/try-block) kept working — exactly the
+        # signature of a per-frame exception permanently starving this recovery path.
+        target_trolley = None
         best_mouth = None
-        if target_trolley and mouths:
-            # IMPORTANT: choose mouth only from the target trolley expanded region.
-            # This prevents global max-confidence mouth in other areas from driving pour logic.
-            best_mouth = self._select_best_mouth_for_trolley(mouths, target_trolley)
-            mouth_in_trolley = best_mouth is not None
-            if best_mouth:
-                # Keep latest probe base available for session/pour screenshots and OSD overlay.
-                mx, my_bottom = best_mouth['bottom_center']
-                self._last_probe_base = (mx, my_bottom + self.probe_below_px)
-                if not self.session_active:
-                    self._last_probe_brightness = None
-                    self._last_probe_tail_brightness = None
-                    self._last_probe_is_pouring = None
+        try:
+            # 2. Find the relevant trolley (locked or best candidate)
+            target_trolley = self._get_target_trolley(trolleys, timestamp, mouths)
+            self._update_tracked_mould_observations(moulds, target_trolley, timestamp)
 
-        # 4. Update trolley bbox (keep latest position for locked trolley; skip phantom)
-        if target_trolley and self.trolley_locked and not target_trolley.get('is_phantom', False):
-            self.locked_trolley_bbox = target_trolley['bbox']
+            # 3. Check mouth-in-trolley (with EDGE_EXPAND)
+            mouth_in_trolley = False
+            if target_trolley and mouths:
+                # IMPORTANT: choose mouth only from the target trolley expanded region.
+                # This prevents global max-confidence mouth in other areas from driving pour logic.
+                best_mouth = self._select_best_mouth_for_trolley(mouths, target_trolley)
+                mouth_in_trolley = best_mouth is not None
+                if best_mouth:
+                    # Keep latest probe base available for session/pour screenshots and OSD overlay.
+                    mx, my_bottom = best_mouth['bottom_center']
+                    self._last_probe_base = (mx, my_bottom + self.probe_below_px)
+                    if not self.session_active:
+                        self._last_probe_brightness = None
+                        self._last_probe_tail_brightness = None
+                        self._last_probe_is_pouring = None
 
-        # 5. Session manager
-        self._update_session(mouth_in_trolley, best_mouth, target_trolley,
-                             mouths, trolleys, timestamp, datetime_obj, frame)
+            # 4. Update trolley bbox (keep latest position for locked trolley; skip phantom)
+            if target_trolley and self.trolley_locked and not target_trolley.get('is_phantom', False):
+                self.locked_trolley_bbox = target_trolley['bbox']
 
-        # 6. Refresh heat cycle presence before any pour-start business logic so
-        # fresh pours inherit the current heat_no on their very first DB row.
-        if (
-            self.heat_cycle_manager
-            and self.session_active
-            and mouth_in_trolley
-            and best_mouth is not None
-        ):
-            self.heat_cycle_manager.update_pouring_session_presence(
-                int(best_mouth['track_id']), timestamp, datetime_obj
-            )
+            # 5. Session manager
+            self._update_session(mouth_in_trolley, best_mouth, target_trolley,
+                                 mouths, trolleys, timestamp, datetime_obj, frame)
 
-        # 7. Pour detector (during active session, with frame data)
-        pour_probe_mouth = None
-        if self.session_active and frame is not None:
-            pour_probe_mouth = self._update_pour(
-                mouths, frame, timestamp, datetime_obj, trolleys, target_trolley
-            )
-
-        # 8. Mould counter (during active session)
-        mould_mouth = pour_probe_mouth or best_mouth
-        if self.session_active and self.pour_active and mould_mouth and target_trolley:
-            if self._active_tracked_mould_id is None:
-                self._active_tracked_mould_id = self._select_tracked_mould_for_pour(
-                    mould_mouth,
-                    target_trolley,
+            # 6. Refresh heat cycle presence before any pour-start business logic so
+            # fresh pours inherit the current heat_no on their very first DB row.
+            if (
+                self.heat_cycle_manager
+                and self.session_active
+                and mouth_in_trolley
+                and best_mouth is not None
+            ):
+                self.heat_cycle_manager.update_pouring_session_presence(
+                    int(best_mouth['track_id']), timestamp, datetime_obj
                 )
-            self._update_mould_counter(mould_mouth, target_trolley, timestamp, datetime_obj)
+
+            # 7. Pour detector (during active session, with frame data)
+            pour_probe_mouth = None
+            if self.session_active and frame is not None:
+                pour_probe_mouth = self._update_pour(
+                    mouths, frame, timestamp, datetime_obj, trolleys, target_trolley
+                )
+
+            # 8. Mould counter (during active session)
+            mould_mouth = pour_probe_mouth or best_mouth
+            if self.session_active and self.pour_active and mould_mouth and target_trolley:
+                # Re-pick every frame and tally into a vote counter rather than locking
+                # onto whatever frame 1 picked — _end_pour commits the majority vote, so
+                # a transient glare-induced wrong pick on one frame can't stick forever.
+                picked = self._select_tracked_mould_for_pour(mould_mouth, target_trolley)
+                if picked is not None:
+                    self._mould_vote_counts[picked] += 1
+                    self._active_tracked_mould_id = picked
+                self._update_mould_counter(mould_mouth, target_trolley, timestamp, datetime_obj)
+        except Exception:
+            logger.exception(
+                "[pouring] session/pour/mould logic failed on frame %s; skipped for "
+                "this frame only (cycle-timeout/heat-finalization below still run)",
+                self._frame_count,
+            )
 
         # 9. Pouring cycle timeout check (5 min)
         self._check_cycle_timeout(timestamp, datetime_obj, mouths, trolleys, frame)
@@ -897,6 +922,8 @@ class PouringProcessor:
                 self._tracker_slot_by_id[keep_cid] = drop_slot
         if self._active_tracked_mould_id == drop_cid:
             self._active_tracked_mould_id = keep_cid
+        if drop_cid in self._mould_vote_counts:
+            self._mould_vote_counts[keep_cid] += self._mould_vote_counts.pop(drop_cid)
 
         self._canonical_merges_total += 1
         METRICS_REGISTRY.increment('mould.canonical_merges')
@@ -2463,6 +2490,10 @@ class PouringProcessor:
 
         self._active_segment = None
         self._active_tracked_mould_id = None
+        # Scope votes to "since the last split", not the whole pour: a split means
+        # the ladle moved to a new physical mould, so votes for the previous one
+        # must not dilute the new segment's majority pick.
+        self._mould_vote_counts = Counter()
         self._materialize_mould_records(include_active=False)
         self._sync_mould_records_to_heat_cycle()
         return self.mould_records[-1] if self.mould_records else None
@@ -2482,6 +2513,7 @@ class PouringProcessor:
         self._active_segment = None
         self._active_tracked_mould_id = None
         self._active_raw_tracked_mould_id = None
+        self._mould_vote_counts = Counter()
         self.brightness_above_since = None
         self.brightness_below_since = None
         self.pour_on_count = 0
@@ -2595,6 +2627,7 @@ class PouringProcessor:
             self.active_mould_start_datetime = None
             self.active_mould_start_norm = None
             self._active_tracked_mould_id = None
+            self._mould_vote_counts = Counter()
             self._materialize_mould_records(include_active=False)
             self.displacement_hold_frames = None
             self.split_hold_quadrant = None
@@ -2606,7 +2639,13 @@ class PouringProcessor:
 
         self.last_pour_duration = duration
 
-        committed_tracker_id = self._active_tracked_mould_id
+        # Commit the majority-voted mould across the whole pour, not just whatever
+        # frame 1 happened to pick (see _mould_vote_counts comment at __init__).
+        committed_tracker_id = (
+            self._mould_vote_counts.most_common(1)[0][0]
+            if self._mould_vote_counts
+            else self._active_tracked_mould_id
+        )
         if self._active_raw_tracked_mould_id is not None:
             self._poured_raw_mould_ids.add(int(self._active_raw_tracked_mould_id))
         if committed_tracker_id is not None and committed_tracker_id >= 0:
@@ -2810,6 +2849,7 @@ class PouringProcessor:
         self.active_mould_start_datetime = None
         self.active_mould_start_norm = None
         self._active_tracked_mould_id = None
+        self._mould_vote_counts = Counter()
         self.displacement_hold_frames = None
         self.split_hold_quadrant = None
         self.split_rearm_required = False
@@ -2985,6 +3025,7 @@ class PouringProcessor:
         self._tracked_mould_observations.clear()
         self._active_tracked_mould_id = None
         self._active_raw_tracked_mould_id = None
+        self._mould_vote_counts = Counter()
         self._poured_mould_ids.clear()
         self._poured_raw_mould_ids.clear()
         self._poured_mould_durations.clear()
@@ -3308,6 +3349,18 @@ class PouringProcessor:
             if now - entry['last_seen_ts'] <= self.overlay_stale_s
         ]
 
+    def _canonical_display_color(self, entry: Dict[str, Any], now: float) -> Tuple[int, int, int]:
+        """BGR color for a canonical box: green if poured, orange if not; halved
+        (dimmed) once older than overlay_dim_after_s but still within
+        overlay_stale_s, so a brief glare-induced detection dropout reads as
+        fading rather than the box vanishing outright (customer-reported
+        "black blinking spot")."""
+        poured = entry['cid'] in self._poured_mould_ids
+        color = (0, 220, 0) if poured else (0, 170, 255)
+        if now - entry['last_seen_ts'] > self.overlay_dim_after_s:
+            color = tuple(c // 2 for c in color)
+        return color
+
     def _trolley_visible_for_display(self, now: float) -> bool:
         """True while the locked trolley was actually detected within the phantom
         window — the lock itself persists for the whole heat cycle."""
@@ -3400,13 +3453,15 @@ class PouringProcessor:
             # Canonical mould boxes (stable freeze layer; raw churning rects are
             # suppressed at extraction time). Poured moulds render brighter + '*'.
             # Only recently-seen entries are drawn — departed moulds keep counting
-            # internally but stop ghosting on screen.
+            # internally but stop ghosting on screen. Between overlay_dim_after_s
+            # and overlay_stale_s a box fades instead of hard-vanishing, so a brief
+            # glare dropout on one mould doesn't read as an alarming black gap.
             if self.canonical_enabled:
                 for entry in self._canonical_entries_for_display(now):
                     cid = entry['cid']
                     bx1, by1, bx2, by2 = (int(v) for v in entry['bbox'])
                     poured = cid in self._poured_mould_ids
-                    color = (0, 220, 0) if poured else (0, 170, 255)
+                    color = self._canonical_display_color(entry, now)
                     cv2.rectangle(frame_bgr, (bx1, by1), (bx2, by2), color, 2)
                     label = f"M{cid}" + ("*" if poured else "")
                     cv2.putText(frame_bgr, label, (bx1, max(12, by1 - 4)),

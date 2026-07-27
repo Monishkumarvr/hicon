@@ -57,6 +57,67 @@
 
 FPS held steady at ~25fps × 3 streams for 90s post-restart with zero outages/errors after the one expected ~5s reconnect during the 7-min engine-build window (stream 2 starved of frames while the build thread was blocking; self-recovered via nvurisrcbin). Pre-existing test failures (`test_nvurisrcbin_stream0_honors_configured_tcp`, 2× `test_segment_buffer_helper` tests) confirmed unrelated via `git stash` diff — not regressions from this phase. Tracked as `hicon-2db` (closed).
 
+## Update 2026-07-28 — three customer-reported issues fixed (HI-CON Pouring Detection Report)
+
+A customer test report identified 4 issues. Three parallel investigations (code trace + DB/
+journal search + registry-logic trace) verified each against the running code before any fix
+was written.
+
+**Why the report's exact numbers don't match any day in our DB/journal:** `HiConDatabase.
+cleanup_old_data(days=7)` (`db_manager.py:751`) hard-deletes `melting_events`/`pouring_events`/
+`heat_cycles` rows older than 7 days, and journal retention is similarly short. If this report
+predates that window, the telemetry is simply gone — this does **not** mean the report
+describes fabricated or offline-only data. Flagged as a process gap: we currently have no way
+to retroactively cross-validate an older customer report against our own logs.
+
+**Issue 2 (mould stuck yellow after pouring) — confirmed real, fixed.** `_select_tracked_mould_
+for_pour` was called once at pour start and locked in forever (`if self._active_tracked_mould_id
+is None:` gate). With moulds placed close together, glare from an actively-pouring mould could
+make the wrong neighbor's bbox win the pick on the very first qualifying frame — and since
+canonical expiry is blocked for anything in `_poured_mould_ids`, the wrong mould turned green
+permanently while the real one stayed yellow forever, not just until TTL. Fixed: re-pick every
+frame during the pour, tally into `_mould_vote_counts` (a `Counter`), and `_end_pour` commits
+the **majority-voted** mould, not whatever frame 1 or the last frame happened to pick. Votes are
+scoped per mould-split segment (reset in `_close_active_mould` too, not just `_start_pour`/
+`_end_pour`/`_reset_all_state`) so a multi-mould sweep within one continuous pour doesn't dilute
+across mould boundaries, and `_merge_canonical` migrates a dropped duplicate's votes to the kept
+id so a mid-pour merge can't lose them.
+
+**Issue 1 (pours stop being counted after a 2nd tapping) — structural cause found, fixed
+defensively.** `_check_cycle_timeout` and `_finalize_heat_cycles_if_due` — the only two paths
+that can ever recover/reset pouring state — were the LAST two steps inside `process_frame`,
+after all session/pour/mould-counting logic (steps 2-8, including all canonical-registry dict/
+EMA/merge logic), with no per-step exception isolation. If any exception fired in steps 2-8 on
+a frame — e.g. a 2nd-heat-specific mould layout hitting an edge case the 1st heat didn't — it
+was caught by the one outer try/except in `hicon_pipeline.py` and logged **once per frame,
+forever**, silently starving steps 9-10 for the rest of the process's life. Tapping detection is
+a fully separate code path/try-block, so it would keep working while pours froze — matching the
+report exactly. Could not be reproduced against the customer's original incident (7-day
+retention), so this is a structural fix, not an incident-reproduction: steps 2-8 are now wrapped
+in their own try/except inside `process_frame`, so steps 9-10 always run regardless of upstream
+failures.
+
+**Issue 4 (black blinking spot instead of yellow/green) — plausible cause tied to our own recent
+ghost-overlay fix, fixed.** `_canonical_entries_for_display` (this week's fix) hides a mould's
+box entirely once undetected for >3s (`overlay_stale_s`). Brief, repeated glare-induced
+detection dropout on one mould would make its box vanish/reappear/vanish, exposing the naturally
+dark mould cavity underneath each time — reading as a "blinking black spot." No literal black
+box color exists anywhere in the draw path (verified). Fixed: added a dimmed tier
+(`overlay_dim_after_s`, default 1.5s) — 0-1.5s draws normally, 1.5-3.0s draws at half brightness
+instead of vanishing, >3.0s still hides. Extracted into `_canonical_display_color` for direct
+unit testing.
+
+**Issue 3 (pours outside the defined zone not captured)** — no action; the customer's own report
+already states this is expected by design (zone gating).
+
+Tests: +9 (`test_mould_canonical_registry.py`) — majority-vote commit (direct and end-to-end via
+the real selection path with a deliberately-wrong last pick), vote migration on merge, vote reset
+at `_start_pour`/`_reset_all_state`, exception isolation (single frame and 5 recurring failures),
+dimmed-tier color transitions. 148 pass (full suite), same 2 pre-existing unrelated
+`segment_buffer_helper` failures (the third, a `test_rtsp_builder_stage1.py` mock-ordering
+flake, didn't reproduce this run). Deployed 12:19 with zero open heat cycles, streams steady at
+25fps after a normal post-restart settling dip.
+
 ## Update 2026-07-21 (3) — trolley-bbox EMA continuity fix, confirmed via video + DB + journal review
 
 **Found by cross-referencing raw NVR footage (`stream0_20260717_180000-190000_IST.mkv`) against

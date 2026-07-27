@@ -1,7 +1,11 @@
 """Canonical mould registry: latch/freeze/churn-immunity/expiry/selection tests."""
 
-import pytest
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from processors.pouring_processor import PouringProcessor
 
@@ -503,3 +507,174 @@ def test_mould_position_stable_across_same_physical_relock_end_to_end(tmp_path):
     assert len(proc._canonical_moulds) == 1  # still one mould, not split/duplicated
     assert cid in proc._canonical_moulds      # same identity preserved
     assert cid in proc._poured_mould_ids       # poured status intact
+
+
+# ---------------------------------------------------------------------------
+# Customer report fixes (2026-07-28): stuck-yellow majority-vote assignment,
+# exception isolation for the count-freeze risk, dimmed-tier overlay for the
+# black-blink complaint.
+# ---------------------------------------------------------------------------
+
+
+def test_end_pour_commits_majority_vote_not_last_pick(tmp_path):
+    """The bug: a one-shot pick (whatever frame 1 or the LAST frame happened to
+    select) could lock onto a glare-lit neighboring mould forever. The fix must
+    credit whichever mould was selected most often across the whole pour."""
+    proc = _make_proc(tmp_path)
+    proc.pour_active = True
+    proc.pour_start_time = 0.0
+    proc.pour_start_datetime = datetime.now()
+    # 4 votes for 7 (the true target), 1 stray vote for 42 (a transient glare
+    # blip) that happens to be the LAST pick -- proves this isn't just "credit
+    # the last selection".
+    proc._mould_vote_counts = Counter({7: 4, 42: 1})
+    proc._active_tracked_mould_id = 42
+
+    proc._end_pour(3.0, datetime.now(), [], [], None)
+
+    assert proc.tracker_mould_count == 1
+    assert 7 in proc._poured_mould_ids
+    assert 42 not in proc._poured_mould_ids
+
+
+def test_majority_vote_accumulates_via_real_selection_path(tmp_path):
+    """End-to-end through _select_tracked_mould_for_pour: a probe that lands on
+    mould A once (glare blip) then mould B four times must still credit B."""
+    proc = _make_proc(tmp_path)
+    _latch_one(proc, track_id=1, cx=500, cy=400)
+    _latch_one(proc, track_id=2, cx=900, cy=620, t=1010.0)
+    # _latch_one returns next(iter(...)), which is unreliable for a SECOND latch
+    # onto the same trolley (no clearing event in between) -- read the two real
+    # keys directly instead.
+    cid_a, cid_b = sorted(proc._canonical_moulds)
+
+    mouth_near_a = {"bbox": (480, 380, 520, 420), "confidence": 0.9, "track_id": 5,
+                    "center": (500, 400), "bottom_center": (500, 420), "gie_id": 1}
+    mouth_near_b = {"bbox": (880, 600, 920, 640), "confidence": 0.9, "track_id": 5,
+                    "center": (900, 620), "bottom_center": (900, 640), "gie_id": 1}
+
+    proc.pour_active = True
+    proc.pour_start_time = 1000.0
+    proc.pour_start_datetime = datetime.now()
+    proc._mould_vote_counts = Counter()
+
+    # Last pick is the WRONG one (A) -- old "lock onto last/first pick" behavior
+    # would have credited A; majority vote must still credit B.
+    for mouth in (mouth_near_b, mouth_near_b, mouth_near_b, mouth_near_b, mouth_near_a):
+        picked = proc._select_tracked_mould_for_pour(mouth, TROLLEY)
+        if picked is not None:
+            proc._mould_vote_counts[picked] += 1
+            proc._active_tracked_mould_id = picked
+
+    assert proc._active_tracked_mould_id == cid_a  # confirms the "wrong last pick" setup
+    assert proc._mould_vote_counts[cid_b] == 4
+    assert proc._mould_vote_counts[cid_a] == 1
+
+    proc._end_pour(1003.0, datetime.now(), [], [], None)
+    assert cid_b in proc._poured_mould_ids
+    assert cid_a not in proc._poured_mould_ids
+
+
+def test_merge_migrates_vote_counts_to_the_kept_id(tmp_path):
+    proc = _make_proc(tmp_path)
+    cid_a = _latch_one(proc, track_id=1, cx=500, cy=400)
+    proc._mould_vote_counts[cid_a] = 3
+    # Force-seed a duplicate at the same spot and merge it away.
+    cid_b = proc._next_canonical_id
+    proc._next_canonical_id += 1
+    entry_a = proc._canonical_moulds[cid_a]
+    proc._canonical_moulds[cid_b] = {
+        "cid": cid_b, "centroid_rel": entry_a["centroid_rel"], "bbox": entry_a["bbox"],
+        "first_ts": 1005.0, "last_seen_ts": 1005.0, "hits": 3, "tracker_ids": {77},
+    }
+    proc._mould_vote_counts[cid_b] = 2
+    proc._merge_canonical(cid_a, cid_b)  # keep=cid_a, drop=cid_b
+    assert proc._mould_vote_counts[cid_a] == 5
+    assert cid_b not in proc._mould_vote_counts
+
+
+def test_start_pour_and_reset_clear_vote_counts(tmp_path):
+    proc = _make_proc(tmp_path)
+    proc._mould_vote_counts = Counter({1: 5})
+    proc._start_pour(1000.0, datetime.now(), [], [], None, 240, 500, 400, TROLLEY, None)
+    assert not proc._mould_vote_counts
+
+    proc._mould_vote_counts = Counter({1: 5})
+    proc._reset_all_state()
+    assert not proc._mould_vote_counts
+
+
+def test_process_frame_exception_isolation_keeps_cycle_timeout_running(tmp_path, monkeypatch):
+    """A failure in session/pour/mould logic (steps 2-8) must never prevent the
+    cycle-timeout and heat-finalization steps (9-10) from running -- those are
+    the only paths that can recover state. Matches a customer report where
+    pours stopped being counted after a second tapping while tapping itself
+    (a fully separate code path) kept working -- the signature of exactly this
+    kind of permanent per-frame freeze."""
+    proc = _make_proc(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated edge-case failure in session/pour logic")
+
+    monkeypatch.setattr(proc, "_get_target_trolley", boom)
+
+    calls = {"timeout": 0, "finalize": 0}
+    monkeypatch.setattr(
+        proc, "_check_cycle_timeout",
+        lambda *a, **k: calls.__setitem__("timeout", calls["timeout"] + 1),
+    )
+    monkeypatch.setattr(
+        proc, "_finalize_heat_cycles_if_due",
+        lambda *a, **k: calls.__setitem__("finalize", calls["finalize"] + 1),
+    )
+
+    frame_meta = SimpleNamespace(obj_meta_list=None)
+    proc.process_frame(frame_meta, None, 1000.0, datetime.now())
+
+    assert calls["timeout"] == 1
+    assert calls["finalize"] == 1
+
+
+def test_process_frame_survives_repeated_exceptions_across_frames(tmp_path, monkeypatch):
+    """The freeze this fix targets is a PERMANENT one -- the same exception
+    recurring every frame must still let steps 9-10 run every time, not just
+    once."""
+    proc = _make_proc(tmp_path)
+    monkeypatch.setattr(proc, "_update_session", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    calls = {"timeout": 0}
+    monkeypatch.setattr(
+        proc, "_check_cycle_timeout",
+        lambda *a, **k: calls.__setitem__("timeout", calls["timeout"] + 1),
+    )
+    frame_meta = SimpleNamespace(obj_meta_list=None)
+    for i in range(5):
+        proc.process_frame(frame_meta, None, 1000.0 + i, datetime.now())
+    assert calls["timeout"] == 5
+
+
+def test_canonical_display_color_dims_between_thresholds_not_hard_vanish(tmp_path):
+    proc = _make_proc(tmp_path)
+    cid = _latch_one(proc)
+    entry = proc._canonical_moulds[cid]
+    full_color = (0, 170, 255)  # not poured, full brightness
+    dim_color = tuple(c // 2 for c in full_color)
+
+    entry["last_seen_ts"] = 1000.0
+    assert proc._canonical_display_color(entry, now=1000.5) == full_color  # < dim_after_s (1.5)
+    assert proc._canonical_display_color(entry, now=1002.0) == dim_color  # between 1.5 and stale_s (3.0)
+    # Still within overlay_stale_s (3.0) at 2.9s -- must still be drawn (dimmed),
+    # not excluded -- confirmed via the display filter directly.
+    assert entry in proc._canonical_entries_for_display(now=1002.9)
+    assert entry not in proc._canonical_entries_for_display(now=1003.1)
+
+
+def test_canonical_display_color_poured_dims_too(tmp_path):
+    proc = _make_proc(tmp_path)
+    cid = _latch_one(proc)
+    proc._poured_mould_ids.add(cid)
+    entry = proc._canonical_moulds[cid]
+    entry["last_seen_ts"] = 1000.0
+    full_color = (0, 220, 0)
+    dim_color = tuple(c // 2 for c in full_color)
+    assert proc._canonical_display_color(entry, now=1000.5) == full_color
+    assert proc._canonical_display_color(entry, now=1002.0) == dim_color

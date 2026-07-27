@@ -460,6 +460,11 @@ MOULD_RAW_OVERLAY = os.getenv('HICON_MOULD_RAW_OVERLAY', 'false').lower() == 'tr
 # overlay. Counting state is unaffected — poured entries persist for the heat
 # cycle regardless; this only stops ghost boxes after the trolley leaves frame.
 MOULD_OVERLAY_STALE_S = float(os.getenv('HICON_MOULD_OVERLAY_STALE_S', '3.0'))
+# Below this age a canonical box draws at full brightness; between this and
+# MOULD_OVERLAY_STALE_S it draws dimmed instead of hard-vanishing, so a brief
+# glare-induced detection dropout on one mould reads as "fading", not an
+# alarming black gap where the box used to be.
+MOULD_OVERLAY_DIM_AFTER_S = float(os.getenv('HICON_MOULD_OVERLAY_DIM_AFTER_S', '1.5'))
 
 # Per-frame mould diagnostics CSV (output/csv/mould_diag_YYYYMMDD.csv).
 MOULD_DIAG_CSV = os.getenv('HICON_MOULD_DIAG_CSV', 'false').lower() == 'true'
