@@ -63,12 +63,22 @@ A customer test report identified 4 issues. Three parallel investigations (code 
 journal search + registry-logic trace) verified each against the running code before any fix
 was written.
 
-**Why the report's exact numbers don't match any day in our DB/journal:** `HiConDatabase.
+**Correction (2026-07-28, later same day):** the paragraph below was wrong on the mechanism.
+Verified by grepping the whole codebase and every systemd timer/cron entry: `cleanup_old_data`
+had **zero call sites anywhere** — no cron, no timer, no code path — it was dead code, never
+actually invoked. Deleted entirely from `db_manager.py` at the user's request ("don't cleanup
+old data from db, just cleanup the images"), so it can never be accidentally wired up later.
+`sync_manager.py`'s `_cleanup_screenshots` (image files only — "no DB row deletion" per its own
+docstring) is unaffected and was always the only cleanup actually running. Why the report's
+numbers still don't match any DB/journal day remains unresolved — most likely explained by the
+journal's own short retention, or the report simply predating this deployment/dataset.
+
+~~**Why the report's exact numbers don't match any day in our DB/journal:** `HiConDatabase.
 cleanup_old_data(days=7)` (`db_manager.py:751`) hard-deletes `melting_events`/`pouring_events`/
 `heat_cycles` rows older than 7 days, and journal retention is similarly short. If this report
 predates that window, the telemetry is simply gone — this does **not** mean the report
 describes fabricated or offline-only data. Flagged as a process gap: we currently have no way
-to retroactively cross-validate an older customer report against our own logs.
+to retroactively cross-validate an older customer report against our own logs.~~
 
 **Issue 2 (mould stuck yellow after pouring) — confirmed real, fixed.** `_select_tracked_mould_
 for_pour` was called once at pour start and locked in forever (`if self._active_tracked_mould_id

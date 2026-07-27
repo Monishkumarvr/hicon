@@ -6,7 +6,7 @@ import logging
 import queue
 import threading
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 import json
@@ -745,44 +745,6 @@ class HiConDatabase:
 
         conn.close()
         return {'melting': melting_stuck, 'pouring': pouring_stuck}
-
-    # === DATA ROTATION (7-day cleanup) ===
-
-    def cleanup_old_data(self, days: int = 7):
-        """
-        Delete data older than specified days.
-
-        Args:
-            days: Number of days to retain
-        """
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-
-        conn = self._get_connection()
-        c = conn.cursor()
-
-        tables = [
-            'melting_events',
-            'pouring_events',
-            'heat_cycles',
-        ]
-
-        total_deleted = 0
-        for table in tables:
-            c.execute(f'DELETE FROM {table} WHERE created_at < ?', (cutoff,))
-            deleted = c.rowcount
-            total_deleted += deleted
-            if deleted > 0:
-                logger.info(f"✓ Deleted {deleted} old records from {table}")
-
-        conn.commit()
-        conn.close()
-
-        if total_deleted > 0:
-            # Vacuum to reclaim space
-            conn = self._get_connection()
-            conn.execute('VACUUM')
-            conn.close()
-            logger.info(f"✓ Total cleanup: {total_deleted} records, database vacuumed")
 
     # === STATISTICS ===
 
