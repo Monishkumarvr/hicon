@@ -1,8 +1,11 @@
 """
-Stream 0 local RTSP relay branch.
+Local RTSP relay branch for any DeepStream stream.
 
-Publishes the post-OSD annotated Stream 0 output to the local MediaMTX
-server so any remote fan-out happens outside the main DeepStream pipeline.
+Publishes the post-OSD annotated output to a local MediaMTX server.
+MediaMTX re-serves it as WebRTC (and RTSP) to browsers/clients.
+
+Uses x264enc (software H.264) — nvv4l2h264enc is not available on
+Orin Nano with this JetPack / DeepStream build.
 """
 import logging
 
@@ -16,12 +19,11 @@ from gi.repository import Gst, GstRtsp
 logger = logging.getLogger(__name__)
 
 
-class Stream0LocalRelayManager:
-    """Attach a local RTSP publishing branch to the post-OSD Stream 0 tee."""
+class LocalRelayManager:
+    """Attach a local RTSP publishing branch to a post-OSD tee element."""
 
     LOCAL_HOST = "127.0.0.1"
     LOCAL_PORT = 8554
-    LOCAL_PATH = "stream0_overlay"
 
     def __init__(
         self,
@@ -38,10 +40,12 @@ class Stream0LocalRelayManager:
         self.elements = {}
 
     @property
+    def local_path(self) -> str:
+        return f"stream{self.stream_id}_overlay"
+
+    @property
     def publish_uri(self) -> str:
-        return (
-            f"rtsp://{self.LOCAL_HOST}:{self.LOCAL_PORT}/{self.LOCAL_PATH}"
-        )
+        return f"rtsp://{self.LOCAL_HOST}:{self.LOCAL_PORT}/{self.local_path}"
 
     @staticmethod
     def _safe_set_property(element, name, value) -> None:
@@ -56,9 +60,11 @@ class Stream0LocalRelayManager:
             )
 
     def _build_caps_string(self) -> str:
+        # x264enc needs system memory (no NVMM) and I420 format.
+        # nvvideoconvert will bridge from NVMM to system memory.
         caps = [
-            "video/x-raw(memory:NVMM)",
-            "format=NV12",
+            "video/x-raw",
+            "format=I420",
             f"width={self.target_width}",
             f"height={self.target_height}",
         ]
@@ -68,14 +74,13 @@ class Stream0LocalRelayManager:
         return ", ".join(caps)
 
     def _configure_encoder(self, encoder) -> None:
-        # Insert codec config regularly so new readers can attach cleanly.
-        self._safe_set_property(encoder, "insert-sps-pps", True)
+        # x264enc: bitrate in kbps, speed-preset=ultrafast, tune=zerolatency
+        self._safe_set_property(encoder, "speed-preset", 1)    # ultrafast
+        self._safe_set_property(encoder, "tune", 0x00000004)   # zerolatency
+        self._safe_set_property(encoder, "bitrate", 1500)       # kbps
         if self.target_fps > 0:
-            frame_interval = max(1, int(round(self.target_fps)))
-            self._safe_set_property(encoder, "iframeinterval", frame_interval)
-            self._safe_set_property(encoder, "idrinterval", frame_interval)
-        self._safe_set_property(encoder, "bitrate", 2_000_000)
-        self._safe_set_property(encoder, "maxperf-enable", True)
+            key_int = max(1, int(round(self.target_fps)))
+            self._safe_set_property(encoder, "key-int-max", key_int)
 
     def _on_new_payloader(self, _sink, payloader) -> None:
         self._safe_set_property(payloader, "config-interval", 1)
@@ -96,7 +101,7 @@ class Stream0LocalRelayManager:
         if capsfilter:
             capsfilter.set_property("caps", Gst.Caps.from_string(self._build_caps_string()))
 
-        encoder = Gst.ElementFactory.make("nvv4l2h264enc", f"relay-enc-{sid}")
+        encoder = Gst.ElementFactory.make("x264enc", f"relay-enc-{sid}")
         if encoder:
             self._configure_encoder(encoder)
 
@@ -169,3 +174,7 @@ class Stream0LocalRelayManager:
             self.publish_uri,
         )
         return True
+
+
+# Backward-compat alias (tests import Stream0LocalRelayManager by name)
+Stream0LocalRelayManager = LocalRelayManager

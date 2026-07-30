@@ -2,23 +2,24 @@ logLevel: info
 
 rtsp: yes
 rtspTransports: [tcp]
-rtspAddress: 127.0.0.1:8554
+rtspAddress: 127.0.0.1:8554   # loopback only — DeepStream pushes from localhost
 
-# Disable unused protocols to avoid port conflicts
 rtmp: no
 hls: no
-webrtc: no
 srt: no
+
+# WebRTC: browser accesses https://<jetson-ip>:8889/stream0_overlay etc.
+# MediaMTX auto-generates a self-signed TLS cert on first run.
+webrtc: yes
+webrtcAddress: :8889
 
 readTimeout: 60s
 writeTimeout: 30s
 
 paths:
-  stream0:
-    source: publisher
-    rtspTransport: udp
-    sourceOnDemand: no
   stream0_overlay:
     source: publisher
-    runOnReady:
-    runOnReadyRestart: no
+  stream1_overlay:
+    source: publisher
+  stream2_overlay:
+    source: publisher

@@ -51,7 +51,7 @@ from db_manager import HiConDatabase, AsyncDBWriter
 from pipeline.gst_builder import DeepStreamPipelineBuilder
 from pipeline.bus_handler import BusHandler
 from pipeline.recording import RecordingManager
-from pipeline.stream0_local_relay import Stream0LocalRelayManager
+from pipeline.stream0_local_relay import LocalRelayManager, Stream0LocalRelayManager
 from processors.brightness_processor import BrightnessProcessor
 from processors.melting_analysis_controller import MeltingAnalysisController
 from processors.melting_meta_reader import MeltingMetaReader
@@ -63,7 +63,10 @@ from utils.metrics import REGISTRY as metrics_registry, MetricsReporter
 from utils.perf import timed_section
 from utils.screenshot import AsyncScreenshotWriter
 from utils.zone_loader import load_zones_config
-from streaming.mjpeg_server import MJPEGServer
+if config.LIVE_STREAM_BACKEND == 'webrtc':
+    from streaming.webrtc_server import WebRTCServer as _LiveStreamServer
+else:
+    from streaming.mjpeg_server import MJPEGServer as _LiveStreamServer
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -103,6 +106,8 @@ bus_handler = None
 sync_manager = None
 recording_manager = None
 stream0_local_relay_manager = None
+stream1_local_relay_manager = None
+stream2_local_relay_manager = None
 mjpeg_server = None
 async_db_writer = None
 screenshot_writer = None
@@ -1347,7 +1352,7 @@ def main():
     global brightness_processor, brightness_processor_2, pyrometer_processor
     global melting_controller, melting_meta_reader
     global melting_controller_2, melting_meta_reader_2
-    global bus_handler, sync_manager, recording_manager, stream0_local_relay_manager, mjpeg_server
+    global bus_handler, sync_manager, recording_manager, stream0_local_relay_manager, stream1_local_relay_manager, stream2_local_relay_manager, mjpeg_server
     global async_db_writer, screenshot_writer
 
     logger.info("=" * 60)
@@ -1768,17 +1773,29 @@ def main():
         nvurisrcbin_stream_ids=builder.nvurisrcbin_stream_ids,
     )
 
-    # Initialize MJPEG live streaming server (if enabled)
+    # Initialize live streaming server (if enabled)
     mjpeg_server = None
     if config.ENABLE_LIVE_STREAM:
-        mjpeg_server = MJPEGServer(
+        _stream_port = (
+            config.WEBRTC_PORT
+            if config.LIVE_STREAM_BACKEND == 'webrtc'
+            else config.LIVE_STREAM_PORT
+        )
+        _extra = (
+            {'dashboard_port': config.WEBRTC_DASHBOARD_PORT}
+            if config.LIVE_STREAM_BACKEND == 'webrtc'
+            else {}
+        )
+        mjpeg_server = _LiveStreamServer(
             host=config.LIVE_STREAM_HOST,
-            port=config.LIVE_STREAM_PORT,
-            jpeg_quality=config.LIVE_STREAM_QUALITY,
+            port=_stream_port,
             max_fps=config.LIVE_STREAM_FPS,
+            # MJPEG-only params — absorbed via **kwargs by WebRTCServer
+            jpeg_quality=config.LIVE_STREAM_QUALITY,
             timestamp_overlay=config.LIVE_STREAM_TIMESTAMP_OVERLAY,
             demand_driven=config.LIVE_STREAM_DEMAND_DRIVEN,
             idle_grace_sec=config.LIVE_STREAM_IDLE_GRACE_SEC,
+            **_extra,
         )
         # Only register streams that have pipeline elements and are enabled for live preview.
         live_stream_keys = [
@@ -1790,7 +1807,14 @@ def main():
             if _enabled and _key in elements and elements[_key]:
                 mjpeg_server.register_stream(_sid)
         mjpeg_server.start()
-        logger.info(f"✓ Live streaming enabled: http://{config.LIVE_STREAM_HOST}:{config.LIVE_STREAM_PORT}/")
+        _scheme = 'https' if config.LIVE_STREAM_BACKEND == 'webrtc' else 'http'
+        logger.info(
+            "✓ Live streaming enabled (%s): %s://%s:%d/",
+            config.LIVE_STREAM_BACKEND,
+            _scheme,
+            config.LIVE_STREAM_HOST,
+            _stream_port,
+        )
     else:
         logger.info("Live streaming disabled (ENABLE_LIVE_STREAM=false)")
 
@@ -1887,6 +1911,48 @@ def main():
                 stream0_local_relay_manager = None
         else:
             logger.warning("Stream 0 local relay enabled but tee_0 is missing; relay disabled")
+
+    stream1_local_relay_manager = None
+    if config.ENABLE_STREAM1_LOCAL_RELAY:
+        tee_1 = elements.get('tee_1')
+        if tee_1:
+            stream1_local_relay_manager = LocalRelayManager(
+                stream_id=1,
+                target_fps=config.INFERENCE_VIDEO_FPS,
+                target_width=config.INFERENCE_VIDEO_WIDTH,
+                target_height=config.INFERENCE_VIDEO_HEIGHT,
+            )
+            if stream1_local_relay_manager.setup_relay_branch(pipeline, tee_1):
+                logger.info(
+                    "Stream 1: local MediaMTX relay branch configured at %s",
+                    stream1_local_relay_manager.publish_uri,
+                )
+            else:
+                logger.error("Stream 1: failed to configure local MediaMTX relay branch")
+                stream1_local_relay_manager = None
+        else:
+            logger.warning("Stream 1 local relay enabled but tee_1 is missing; relay disabled")
+
+    stream2_local_relay_manager = None
+    if config.ENABLE_STREAM2_LOCAL_RELAY:
+        tee_2 = elements.get('tee_2')
+        if tee_2:
+            stream2_local_relay_manager = LocalRelayManager(
+                stream_id=2,
+                target_fps=config.INFERENCE_VIDEO_FPS,
+                target_width=config.INFERENCE_VIDEO_WIDTH,
+                target_height=config.INFERENCE_VIDEO_HEIGHT,
+            )
+            if stream2_local_relay_manager.setup_relay_branch(pipeline, tee_2):
+                logger.info(
+                    "Stream 2: local MediaMTX relay branch configured at %s",
+                    stream2_local_relay_manager.publish_uri,
+                )
+            else:
+                logger.error("Stream 2: failed to configure local MediaMTX relay branch")
+                stream2_local_relay_manager = None
+        else:
+            logger.warning("Stream 2 local relay enabled but tee_2 is missing; relay disabled")
 
     # Attach pad probes
     if 'pgie_mould' in elements and elements['pgie_mould']:

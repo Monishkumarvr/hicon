@@ -239,6 +239,12 @@ INFERENCE_VIDEO_HEIGHT = int(os.getenv('HICON_INFERENCE_VIDEO_HEIGHT', '360'))
 ENABLE_STREAM0_LOCAL_RELAY = os.getenv(
     'HICON_ENABLE_STREAM0_LOCAL_RELAY', 'false'
 ).lower() == 'true'
+ENABLE_STREAM1_LOCAL_RELAY = os.getenv(
+    'HICON_ENABLE_STREAM1_LOCAL_RELAY', 'false'
+).lower() == 'true'
+ENABLE_STREAM2_LOCAL_RELAY = os.getenv(
+    'HICON_ENABLE_STREAM2_LOCAL_RELAY', 'false'
+).lower() == 'true'
 STREAM0_REMOTE_RELAY_URL = os.getenv('HICON_STREAM0_REMOTE_RELAY_URL', '').strip()
 
 # Recording schedule: 'always' for 24/7, or time windows like '06:00-08:00,18:00-20:00'
@@ -534,6 +540,11 @@ LIVE_STREAM_TIMESTAMP_OVERLAY = os.getenv(
 ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 ENABLE_LIVE_STREAM_2 = os.getenv('HICON_ENABLE_LIVE_STREAM_2', str(ENABLE_LIVE_STREAM)).lower() == 'true'
+
+# Streaming backend: "webrtc" (NVENC hardware, default) or "mjpeg" (CPU fallback)
+LIVE_STREAM_BACKEND = os.getenv('HICON_LIVE_STREAM_BACKEND', 'webrtc').lower()
+WEBRTC_PORT = int(os.getenv('HICON_WEBRTC_PORT', '8554'))
+WEBRTC_DASHBOARD_PORT = int(os.getenv('HICON_WEBRTC_DASHBOARD_PORT', '8556'))
 
 # === Telemetry (Edge_Optimization_Plan.md Phase 1) ===
 METRICS_INTERVAL_SEC = float(os.getenv('HICON_METRICS_INTERVAL_SEC', '60'))
