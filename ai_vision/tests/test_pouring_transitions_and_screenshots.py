@@ -125,7 +125,7 @@ def test_runtime_geometry_dedupes_offsets_after_rounding(tmp_path):
     assert len(proc.probe_offsets) == len(set(proc.probe_offsets))
 
 
-def test_tracker_mould_assignment_uses_containment_then_nearest(tmp_path):
+def test_tracker_mould_assignment_uses_containment_only(tmp_path):
     proc = _make_proc(tmp_path)
     # Exercise the raw-track selection path (canonical registry has its own tests
     # in test_mould_canonical_registry.py and is bypassed here).
@@ -141,8 +141,11 @@ def test_tracker_mould_assignment_uses_containment_then_nearest(tmp_path):
     contained_mouth = {"bottom_center": (260, 200)}
     assert proc._select_tracked_mould_for_pour(contained_mouth, trolley) == 41
 
-    nearest_mouth = {"bottom_center": (390, 120)}
-    assert proc._select_tracked_mould_for_pour(nearest_mouth, trolley) == 42
+    # Probe lands inside neither mould's bbox — must not fall back to "nearest
+    # anyway"; a pour over an empty trolley slot must not be attributed to a
+    # mould the probe was never actually over.
+    uncontained_mouth = {"bottom_center": (390, 120)}
+    assert proc._select_tracked_mould_for_pour(uncontained_mouth, trolley) is None
 
 
 def test_valid_pour_commits_tracker_id_and_short_pour_does_not(tmp_path):
@@ -218,6 +221,68 @@ def test_tracker_mode_syncs_distinct_moulds_to_heat_cycle(tmp_path):
 
     assert set(proc.heat_cycle_manager.records) == {"MOULD_C1", "MOULD_C2"}
     assert proc.heat_cycle_manager.records["MOULD_C1"]["mould_track_id"] == 41
+
+
+def test_tracker_mode_skips_legacy_open_mould_but_shadow_mode_still_opens_it(tmp_path):
+    proc = _make_proc(tmp_path)
+    proc._save_event_screenshot = lambda *args, **kwargs: None
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("_open_active_mould should not run in tracker mode")
+
+    proc._open_active_mould = _boom
+    trolley = {"track_id": 11, "bbox": (100, 100, 600, 400), "confidence": 0.9}
+    mouth = {"track_id": 5, "bbox": (250, 90, 290, 130), "confidence": 0.8,
+             "bottom_center": (270, 130), "center": (270, 110)}
+
+    proc.mould_count_mode = "tracker"
+    proc._start_pour(0.0, datetime.now(), [mouth], [trolley], None,
+                      brightness=240, probe_x=270, probe_y=160,
+                      target_trolley=trolley, best_mouth=mouth)
+    assert proc._active_segment is None
+    assert proc.next_mould_id == 1  # never incremented — legacy path never ran
+
+    # Same call, legacy/shadow mode: the legacy path must still run (rollback safety net).
+    proc.pour_active = False
+    proc.mould_count_mode = "shadow"
+    try:
+        proc._start_pour(0.0, datetime.now(), [mouth], [trolley], None,
+                          brightness=240, probe_x=270, probe_y=160,
+                          target_trolley=trolley, best_mouth=mouth)
+        assert False, "expected _open_active_mould to run (and raise) in shadow mode"
+    except AssertionError as exc:
+        assert "_open_active_mould should not run" in str(exc)
+
+
+def test_tracker_mode_db_breakdown_is_tracker_sourced_not_legacy(tmp_path):
+    captured = {}
+
+    class CapturingDB(DummyDB):
+        def update_pouring_end(self, **kwargs):
+            captured.update(kwargs)
+
+    proc = PouringProcessor(
+        db_manager=CapturingDB(),
+        config=DummyConfig(),
+        screenshot_dir=str(tmp_path),
+        heat_cycle_manager=None,
+    )
+    proc._save_event_screenshot = lambda *args, **kwargs: None
+    proc.mould_count_mode = "tracker"
+    now = datetime.now()
+
+    proc.pour_active = True
+    proc.pour_start_time = 0.0
+    proc.pour_start_datetime = now
+    proc.pour_sync_id = "sync-1"
+    proc._active_tracked_mould_id = 42
+    proc._end_pour(3.0, now, [], [], None)
+
+    assert proc.mould_records == []  # legacy clustering never populated
+    breakdown = captured["mould_wise_pouring_time"]["moulds"]
+    assert len(breakdown) == 1
+    assert breakdown[0]["mould_track_id"] == 42
+    assert captured["mould_wise_pouring_time"]["mould_count"] == proc.tracker_mould_count
 
 
 def test_session_start_end_and_cycle_timeout(tmp_path):

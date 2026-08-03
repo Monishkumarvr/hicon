@@ -1260,7 +1260,7 @@ class PouringProcessor:
         return self._active_raw_tracked_mould_id
 
     def _select_mould_from_entries(self, observations, mouth, trolley) -> Optional[int]:
-        """30/50px probe containment, then nearest centroid, over entry dicts."""
+        """30/50px probe containment only — no nearest-centroid fallback."""
         if not observations or mouth is None or trolley is None:
             return None
 
@@ -1275,18 +1275,8 @@ class PouringProcessor:
                 if x1 <= probe[0] <= x2 and y1 <= probe[1] <= y2:
                     return int(observation['track_id'])
 
-        tx1, ty1, tx2, ty2 = trolley['bbox']
-        tw = max(float(tx2 - tx1), 1.0)
-        th = max(float(ty2 - ty1), 1.0)
-        probe_rel = ((probe_30[0] - tx1) / tw, (probe_30[1] - ty1) / th)
-        nearest = min(
-            observations,
-            key=lambda item: math.hypot(
-                probe_rel[0] - item['centroid_rel'][0],
-                probe_rel[1] - item['centroid_rel'][1],
-            ),
-        )
-        return int(nearest['track_id'])
+        # No mould bbox actually contains the probe — do not attribute this pour.
+        return None
 
     @property
     def tracker_mould_count(self) -> int:
@@ -2539,8 +2529,14 @@ class PouringProcessor:
                 len(self._canonical_moulds),
             )
 
-        # Placement detector: capture pre-pour snapshot, detect new mould blob
-        if self.placement_detector is not None and target_trolley is not None:
+        # Placement detector + legacy clustering are shadow/legacy-mode-only:
+        # in 'tracker' mode their output is never consulted (see _end_pour),
+        # so skip the compute entirely to avoid wasted CPU and stale DB fields.
+        if (
+            self.mould_count_mode != 'tracker'
+            and self.placement_detector is not None
+            and target_trolley is not None
+        ):
             self._active_placement_blob_id = self.placement_detector.on_pour_start(
                 frame, target_trolley.get('bbox'), timestamp
             )
@@ -2578,14 +2574,16 @@ class PouringProcessor:
         except Exception as e:
             logger.error(f"Failed to insert pour start: {e}")
 
-        # Start active mould slot for this pour.
-        bm = best_mouth
-        if bm is None and mouths:
-            locked_trolley = self._get_locked_trolley(trolleys)
-            bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
-        if bm is None and mouths:
-            bm = max(mouths, key=lambda m: m['confidence'])
-        self._open_active_mould(timestamp, datetime_obj, bm, target_trolley)
+        # Start active mould slot for this pour (legacy clustering path only —
+        # tracker mode counts moulds via NvDCF track IDs, see _select_tracked_mould_for_pour above).
+        if self.mould_count_mode != 'tracker':
+            bm = best_mouth
+            if bm is None and mouths:
+                locked_trolley = self._get_locked_trolley(trolleys)
+                bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
+            if bm is None and mouths:
+                bm = max(mouths, key=lambda m: m['confidence'])
+            self._open_active_mould(timestamp, datetime_obj, bm, target_trolley)
 
         # Screenshot
         self._save_event_screenshot(
@@ -2628,7 +2626,8 @@ class PouringProcessor:
             self.active_mould_start_norm = None
             self._active_tracked_mould_id = None
             self._mould_vote_counts = Counter()
-            self._materialize_mould_records(include_active=False)
+            if self.mould_count_mode != 'tracker':
+                self._materialize_mould_records(include_active=False)
             self.displacement_hold_frames = None
             self.split_hold_quadrant = None
             self.split_rearm_required = False
@@ -2693,48 +2692,53 @@ class PouringProcessor:
                 duration,
             )
 
-        bm = best_mouth
-        if bm is None and mouths:
+        # Finalize current active mould on pour end (legacy clustering path only —
+        # tracker mode already committed the majority-voted mould ID above).
+        if self.mould_count_mode != 'tracker':
+            bm = best_mouth
+            if bm is None and mouths:
+                locked_trolley = self._get_locked_trolley(trolleys)
+                bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
+            if bm is None and mouths:
+                bm = max(mouths, key=lambda m: m['confidence'])
+
             locked_trolley = self._get_locked_trolley(trolleys)
-            bm = self._select_best_mouth_for_trolley(mouths, locked_trolley) if locked_trolley else None
-        if bm is None and mouths:
-            bm = max(mouths, key=lambda m: m['confidence'])
 
-        locked_trolley = self._get_locked_trolley(trolleys)
-
-        # Finalize current active mould on pour end.
-        closed = self._close_active_mould(
-            timestamp=timestamp,
-            datetime_obj=datetime_obj,
-            mouth=bm,
-            min_duration_s=self.pour_min_dur,
-            close_axis="end",
-            split_dx_px=0.0,
-            split_dy_px=0.0,
-            trolley=locked_trolley,
-        )
-        if not closed:
-            if self.active_mould_start_time is not None:
-                age = timestamp - self.active_mould_start_time
-                logger.info(
-                    f"[mould] Skip finalization at pour end: active_mould={self.active_mould_id}, "
-                    f"duration={age:.1f}s"
-                )
-            else:
-                logger.info(
-                    f"[mould] Skip finalization at pour end: active_mould={self.active_mould_id}, no start"
-                )
-        else:
-            cluster_txt = f"C{closed['cluster_id']}" if closed.get('cluster_id') else "C-"
-            logger.info(
-                "[mould] Mould #%s completed: %.1fs | %s | axis=%s",
-                closed.get("mould_no"),
-                float(closed.get("duration_s", 0.0)),
-                cluster_txt,
-                str(closed.get("split_axis", "-")).upper(),
+            closed = self._close_active_mould(
+                timestamp=timestamp,
+                datetime_obj=datetime_obj,
+                mouth=bm,
+                min_duration_s=self.pour_min_dur,
+                close_axis="end",
+                split_dx_px=0.0,
+                split_dy_px=0.0,
+                trolley=locked_trolley,
             )
+            if not closed:
+                if self.active_mould_start_time is not None:
+                    age = timestamp - self.active_mould_start_time
+                    logger.info(
+                        f"[mould] Skip finalization at pour end: active_mould={self.active_mould_id}, "
+                        f"duration={age:.1f}s"
+                    )
+                else:
+                    logger.info(
+                        f"[mould] Skip finalization at pour end: active_mould={self.active_mould_id}, no start"
+                    )
+            else:
+                cluster_txt = f"C{closed['cluster_id']}" if closed.get('cluster_id') else "C-"
+                logger.info(
+                    "[mould] Mould #%s completed: %.1fs | %s | axis=%s",
+                    closed.get("mould_no"),
+                    float(closed.get("duration_s", 0.0)),
+                    cluster_txt,
+                    str(closed.get("split_axis", "-")).upper(),
+                )
 
-        logger.info(f"[pour] END - duration={duration:.1f}s, moulds={self.mould_count}")
+        official_count_for_log = (
+            self.tracker_mould_count if self.mould_count_mode == 'tracker' else self.mould_count
+        )
+        logger.info(f"[pour] END - duration={duration:.1f}s, moulds={official_count_for_log}")
         for rec in self._get_mould_breakdown():
             cluster_txt = f"C{rec['cluster_id']}" if rec.get("cluster_id") is not None else "C-"
             logger.info(
@@ -2747,8 +2751,9 @@ class PouringProcessor:
         self._pour_start_time_wall = None  # Clear for next pour
 
         # Placement detector: close pour, cross-validate, compute effective count
+        # (legacy/shadow-mode-only — in tracker mode its output is never consulted below).
         predictive_count = None
-        if self.placement_detector is not None:
+        if self.mould_count_mode != 'tracker' and self.placement_detector is not None:
             self.placement_detector.on_pour_end(self._active_placement_blob_id, duration)
             self._active_placement_blob_id = None
             predictive_count = self.placement_detector.get_poured_blob_count()
@@ -2931,7 +2936,14 @@ class PouringProcessor:
     # =========================================================================
 
     def _get_mould_breakdown(self):
-        """Return per-mould timings with cluster and split-axis attribution."""
+        """Return per-mould timings with cluster and split-axis attribution.
+
+        Dispatches to the tracker-based breakdown in 'tracker' mode so the DB
+        'moulds' field reflects the same source of truth as the official
+        mould_count instead of the (unrun) legacy clustering records.
+        """
+        if self.mould_count_mode == 'tracker' and self.mould_gie_enabled:
+            return self._get_tracker_mould_breakdown()
         breakdown = []
         for rec in self.mould_records:
             cluster = rec.get("cluster_id")
@@ -2946,6 +2958,34 @@ class PouringProcessor:
                     "end": rec.get("end_iso", ""),
                     "split_dx_px": round(float(rec.get("split_dx_px", 0.0)), 1),
                     "split_dy_px": round(float(rec.get("split_dy_px", 0.0)), 1),
+                }
+            )
+        return breakdown
+
+    def _get_tracker_mould_breakdown(self):
+        """Tracker-mode breakdown: one record per distinct NvDCF-tracked mould
+        ID that received a committed pour (mirrors _get_mould_breakdown's shape
+        for downstream/DB compatibility; there is no clustering or split axis
+        in tracker mode, so those fields are always null/zero)."""
+        breakdown = []
+        for tracker_id, rec in sorted(
+            self._tracker_pour_records.items(),
+            key=lambda item: item[1]['slot_id'],
+        ):
+            start_dt = rec.get('start_datetime_obj')
+            end_dt = rec.get('end_datetime_obj')
+            breakdown.append(
+                {
+                    "mould_no": int(rec['slot_id']),
+                    "mould_slot_id": int(rec['slot_id']),
+                    "mould_track_id": int(tracker_id),
+                    "cluster_id": None,
+                    "axis": "",
+                    "duration_s": round(float(rec.get('duration_s', 0.0)), 2),
+                    "start": start_dt.isoformat() if start_dt else "",
+                    "end": end_dt.isoformat() if end_dt else "",
+                    "split_dx_px": 0.0,
+                    "split_dy_px": 0.0,
                 }
             )
         return breakdown
@@ -3195,12 +3235,18 @@ class PouringProcessor:
             max_lines_by_height = max(6, (frame_h - 20) // line_height)
             line_budget = max(4, min(max_labels, max_lines_by_height))
 
+            # In tracker mode, legacy clustering doesn't run — display tracker-derived
+            # numbers so the overlay reflects the actual official count (see _get_mould_breakdown).
+            is_tracker_mode = self.mould_count_mode == 'tracker'
+            mould_count_display = self.tracker_mould_count if is_tracker_mode else self.mould_count
+            clustered_count_display = self.tracker_mould_count if is_tracker_mode else self.clustered_mould_count
+
             # Build right-panel text rows: (text, role)
             rows = [
                 ("POURING INFERENCE", "title"),
                 (
                     f"{datetime_obj.strftime('%H:%M:%S')} S:{'ON' if self.session_active else 'OFF'} "
-                    f"P:{'ON' if self.pour_active else 'OFF'} M:{self.mould_count} C:{self.clustered_mould_count} "
+                    f"P:{'ON' if self.pour_active else 'OFF'} M:{mould_count_display} C:{clustered_count_display} "
                     f"B:{brightness_txt} T:{target_tid}/{lock_tid}",
                     "metrics",
                 ),
@@ -3208,26 +3254,25 @@ class PouringProcessor:
 
             if self.trolley_locked and self.locked_trolley_id is not None:
                 rows.append((f"Trolley #{self.locked_trolley_id} [LOCKED]", "locked"))
-                rows.append((f"Total Moulds: {self.mould_count}", "totals"))
+                rows.append((f"Total Moulds: {mould_count_display}", "totals"))
 
-                records_by_no = {int(r.get("mould_no", -1)): r for r in self.mould_records}
                 mould_rows = []
-                for mid in sorted(self.mould_completed_times.keys()):
-                    frames = self.mould_completed_times[mid]
-                    time_s = frames / self.fps
-                    rec = records_by_no.get(int(mid))
-                    if rec:
-                        cluster = rec.get("cluster_id")
-                        cluster_txt = f"C{cluster}" if cluster is not None else "C-"
-                        axis_txt = str(rec.get("split_axis", "-")).upper()
-                    else:
-                        cluster_txt = "C-"
-                        axis_txt = "-"
+                for rec in self._get_mould_breakdown():
+                    mid = rec.get("mould_no")
+                    time_s = float(rec.get("duration_s", 0.0))
+                    cluster = rec.get("cluster_id")
+                    cluster_txt = f"C{cluster}" if cluster is not None else "C-"
+                    axis_txt = str(rec.get("axis", "")).upper() or "-"
                     mould_rows.append((f"M#{mid}: {time_s:.1f}s {cluster_txt} {axis_txt}", "mould_done"))
 
                 if self.pour_active and self._pour_start_time_wall is not None:
                     active_s = timestamp - self._pour_start_time_wall
-                    next_mid = self.mould_count + 1
+                    if is_tracker_mode and self._active_tracked_mould_id is not None:
+                        next_mid = self._tracker_slot_by_id.get(
+                            self._active_tracked_mould_id, mould_count_display + 1
+                        )
+                    else:
+                        next_mid = mould_count_display + 1
                     mould_rows.append((f"M#{next_mid}: {active_s:.1f}s ACTIVE", "mould_active"))
 
                 # Keep the latest mould rows when vertical space is limited.
@@ -3391,11 +3436,14 @@ class PouringProcessor:
             )
             lock_tid = self.locked_trolley_id if self.locked_trolley_id is not None else "-"
 
+            is_tracker_mode = self.mould_count_mode == 'tracker'
+            mould_count_display = self.tracker_mould_count if is_tracker_mode else self.mould_count
+
             rows = [
                 f"{datetime.now().strftime('%H:%M:%S')} "
                 f"S:{'ON' if self.session_active else 'OFF'} "
                 f"P:{'ON' if self.pour_active else 'OFF'} "
-                f"M:{self.mould_count} B:{brightness_txt} T:{lock_tid}",
+                f"M:{mould_count_display} B:{brightness_txt} T:{lock_tid}",
             ]
             if self.trolley_locked and self.locked_trolley_id is not None:
                 away_txt = ""
@@ -3406,13 +3454,19 @@ class PouringProcessor:
                     )
                     away_txt = f" (away {away_s:.0f}s)"
                 rows.append(
-                    f"Trolley #{self.locked_trolley_id} [LOCKED]{away_txt}  Moulds: {self.mould_count}"
+                    f"Trolley #{self.locked_trolley_id} [LOCKED]{away_txt}  Moulds: {mould_count_display}"
                 )
-                for mid, frames in list(self.mould_completed_times.items())[-6:]:
-                    rows.append(f"  M#{mid}: {frames / self.fps:.1f}s")
+                for rec in self._get_mould_breakdown()[-6:]:
+                    rows.append(f"  M#{rec.get('mould_no')}: {float(rec.get('duration_s', 0.0)):.1f}s")
                 if self.pour_active and self._pour_start_time_wall is not None:
                     active_s = time.time() - self._pour_start_time_wall
-                    rows.append(f"  M#{self.mould_count + 1}: {active_s:.1f}s ACTIVE")
+                    if is_tracker_mode and self._active_tracked_mould_id is not None:
+                        next_mid = self._tracker_slot_by_id.get(
+                            self._active_tracked_mould_id, mould_count_display + 1
+                        )
+                    else:
+                        next_mid = mould_count_display + 1
+                    rows.append(f"  M#{next_mid}: {active_s:.1f}s ACTIVE")
             else:
                 rows.append("No active trolley")
 
