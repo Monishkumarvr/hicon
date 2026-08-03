@@ -897,6 +897,23 @@ def stream0_stage_probe_tracker_src(pad, info):
     return Gst.PadProbeReturn.OK
 
 
+def stream0_stage_probe_nvvidconv_osd_src(pad, info):
+    """Track Stream 0 liveness at nvvidconv_osd_0.src (bridges tracker_0.src -> nvosd_0.sink,
+    where the real FPS/watchdog frame counter is ticked — added to localize a stall that
+    showed upstream stages fresh but nvosd_0's own sink probe silent, see hicon-t3b)."""
+    return _mark_stream0_stage("nvvidconv_osd_src", info)
+
+
+def stream0_stage_probe_caps_osd_src(pad, info):
+    """Track Stream 0 liveness at caps_osd_0.src."""
+    return _mark_stream0_stage("caps_osd_src", info)
+
+
+def stream0_stage_probe_preosdq_src(pad, info):
+    """Track Stream 0 liveness at preosdq0.src (immediately upstream of nvosd_0.sink)."""
+    return _mark_stream0_stage("preosdq_src", info)
+
+
 def _should_extract_live_frame(stream_id: int) -> bool:
     """Throttle MJPEG extraction before expensive GPU-to-CPU frame copies."""
     global _live_stream_warmup_deadline
@@ -2174,6 +2191,34 @@ def main():
                     stream0_stage_probe_tracker_src,
                 )
                 logger.info("Stream 0: stage probe attached at tracker_0.src")
+        # Bridge tracker_0.src -> nvosd_0.sink: the FPS/watchdog frame counter is only
+        # ticked by nvosd_0's own sink-pad probe, not by anything above. Added to localize
+        # a stall observed where mux/pgie/tracker stayed fresh but nvosd_0 went silent
+        # (hicon-t3b).
+        if 'nvvidconv_osd_0' in elements and elements['nvvidconv_osd_0']:
+            nvvidconv_osd0_srcpad = elements['nvvidconv_osd_0'].get_static_pad("src")
+            if nvvidconv_osd0_srcpad:
+                nvvidconv_osd0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_nvvidconv_osd_src,
+                )
+                logger.info("Stream 0: stage probe attached at nvvidconv_osd_0.src")
+        if 'caps_osd_0' in elements and elements['caps_osd_0']:
+            caps_osd0_srcpad = elements['caps_osd_0'].get_static_pad("src")
+            if caps_osd0_srcpad:
+                caps_osd0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_caps_osd_src,
+                )
+                logger.info("Stream 0: stage probe attached at caps_osd_0.src")
+        if 'preosdq0' in elements and elements['preosdq0']:
+            preosdq0_srcpad = elements['preosdq0'].get_static_pad("src")
+            if preosdq0_srcpad:
+                preosdq0_srcpad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    stream0_stage_probe_preosdq_src,
+                )
+                logger.info("Stream 0: stage probe attached at preosdq0.src")
 
     # Stream 0: Post-OSD probe for live streaming (extracts frames WITH overlays)
     if mjpeg_server and 'queue_display_0' in elements and elements['queue_display_0']:

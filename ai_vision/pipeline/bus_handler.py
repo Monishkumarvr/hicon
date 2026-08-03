@@ -42,6 +42,9 @@ _STREAM0_STAGE_ORDER = (
     "pgie_src",
     "tracker_sink",
     "tracker_src",
+    "nvvidconv_osd_src",
+    "caps_osd_src",
+    "preosdq_src",
 )
 _STREAM0_UPSTREAM_PTS_ORDER = (
     "decoder_src",
