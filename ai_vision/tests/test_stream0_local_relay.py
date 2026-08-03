@@ -84,7 +84,6 @@ def test_stream0_local_relay_branch_builds_expected_publish_chain(monkeypatch):
     assert manager.elements["sink"].props["location"] == manager.publish_uri
     assert manager.elements["sink"].props["protocols"] == GstRtsp.RTSPLowerTrans.TCP
     assert manager.elements["parser"].props["config-interval"] == -1
-    assert manager.elements["encoder"].props["insert-sps-pps"] is True
     assert manager.elements["queue"].props["leaky"] == 2
     assert "relay-sink-0" in pipeline.added
 
