@@ -541,11 +541,6 @@ ENABLE_LIVE_STREAM_0 = os.getenv('HICON_ENABLE_LIVE_STREAM_0', str(ENABLE_LIVE_S
 ENABLE_LIVE_STREAM_1 = os.getenv('HICON_ENABLE_LIVE_STREAM_1', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 ENABLE_LIVE_STREAM_2 = os.getenv('HICON_ENABLE_LIVE_STREAM_2', str(ENABLE_LIVE_STREAM)).lower() == 'true'
 
-# Streaming backend: "webrtc" (NVENC hardware, default) or "mjpeg" (CPU fallback)
-LIVE_STREAM_BACKEND = os.getenv('HICON_LIVE_STREAM_BACKEND', 'webrtc').lower()
-WEBRTC_PORT = int(os.getenv('HICON_WEBRTC_PORT', '8554'))
-WEBRTC_DASHBOARD_PORT = int(os.getenv('HICON_WEBRTC_DASHBOARD_PORT', '8556'))
-
 # === Telemetry (Edge_Optimization_Plan.md Phase 1) ===
 METRICS_INTERVAL_SEC = float(os.getenv('HICON_METRICS_INTERVAL_SEC', '60'))
 

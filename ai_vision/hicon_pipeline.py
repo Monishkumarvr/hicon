@@ -63,10 +63,7 @@ from utils.metrics import REGISTRY as metrics_registry, MetricsReporter
 from utils.perf import timed_section
 from utils.screenshot import AsyncScreenshotWriter
 from utils.zone_loader import load_zones_config
-if config.LIVE_STREAM_BACKEND == 'webrtc':
-    from streaming.webrtc_server import WebRTCServer as _LiveStreamServer
-else:
-    from streaming.mjpeg_server import MJPEGServer as _LiveStreamServer
+from streaming.mjpeg_server import MJPEGServer as _LiveStreamServer
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1793,26 +1790,15 @@ def main():
     # Initialize live streaming server (if enabled)
     mjpeg_server = None
     if config.ENABLE_LIVE_STREAM:
-        _stream_port = (
-            config.WEBRTC_PORT
-            if config.LIVE_STREAM_BACKEND == 'webrtc'
-            else config.LIVE_STREAM_PORT
-        )
-        _extra = (
-            {'dashboard_port': config.WEBRTC_DASHBOARD_PORT}
-            if config.LIVE_STREAM_BACKEND == 'webrtc'
-            else {}
-        )
+        _stream_port = config.LIVE_STREAM_PORT
         mjpeg_server = _LiveStreamServer(
             host=config.LIVE_STREAM_HOST,
             port=_stream_port,
             max_fps=config.LIVE_STREAM_FPS,
-            # MJPEG-only params — absorbed via **kwargs by WebRTCServer
             jpeg_quality=config.LIVE_STREAM_QUALITY,
             timestamp_overlay=config.LIVE_STREAM_TIMESTAMP_OVERLAY,
             demand_driven=config.LIVE_STREAM_DEMAND_DRIVEN,
             idle_grace_sec=config.LIVE_STREAM_IDLE_GRACE_SEC,
-            **_extra,
         )
         # Only register streams that have pipeline elements and are enabled for live preview.
         live_stream_keys = [
@@ -1824,11 +1810,8 @@ def main():
             if _enabled and _key in elements and elements[_key]:
                 mjpeg_server.register_stream(_sid)
         mjpeg_server.start()
-        _scheme = 'https' if config.LIVE_STREAM_BACKEND == 'webrtc' else 'http'
         logger.info(
-            "✓ Live streaming enabled (%s): %s://%s:%d/",
-            config.LIVE_STREAM_BACKEND,
-            _scheme,
+            "✓ Live streaming enabled (mjpeg): http://%s:%d/",
             config.LIVE_STREAM_HOST,
             _stream_port,
         )

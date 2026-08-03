@@ -7,11 +7,7 @@ rtspAddress: 127.0.0.1:8554   # loopback only — DeepStream pushes from localho
 rtmp: no
 hls: no
 srt: no
-
-# WebRTC: browser accesses https://<jetson-ip>:8889/stream0_overlay etc.
-# MediaMTX auto-generates a self-signed TLS cert on first run.
-webrtc: yes
-webrtcAddress: :8889
+webrtc: no
 
 readTimeout: 60s
 writeTimeout: 30s
