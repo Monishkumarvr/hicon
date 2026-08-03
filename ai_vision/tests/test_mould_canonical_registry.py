@@ -548,10 +548,13 @@ def test_majority_vote_accumulates_via_real_selection_path(tmp_path):
     # keys directly instead.
     cid_a, cid_b = sorted(proc._canonical_moulds)
 
+    # bottom_center placed so the probe (bottom_center + probe_below_px) lands
+    # inside each mould's own bbox — containment is now the only selection
+    # signal, there's no more nearest-centroid fallback to lean on.
     mouth_near_a = {"bbox": (480, 380, 520, 420), "confidence": 0.9, "track_id": 5,
-                    "center": (500, 400), "bottom_center": (500, 420), "gie_id": 1}
+                    "center": (500, 400), "bottom_center": (500, 390), "gie_id": 1}
     mouth_near_b = {"bbox": (880, 600, 920, 640), "confidence": 0.9, "track_id": 5,
-                    "center": (900, 620), "bottom_center": (900, 640), "gie_id": 1}
+                    "center": (900, 620), "bottom_center": (900, 590), "gie_id": 1}
 
     proc.pour_active = True
     proc.pour_start_time = 1000.0
