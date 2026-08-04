@@ -133,22 +133,11 @@ POUR_NVINFER_INTERVAL = _get_nvinfer_interval(
     0,
 )
 
-# Mould counting: anchor-based trolley motion + spatial clustering
+# Mould counting: displacement threshold shared with trolley relock gating
+# (_should_relock_trolley) — the spatial-clustering mould-counting system that used
+# to also read this has been removed; only NvDCF-tracked mould-bbox containment
+# selection (tracker mode) is used now.
 MOULD_DISPLACEMENT_THRESHOLD = float(os.getenv('HICON_MOULD_DISPLACEMENT', '0.15'))
-MOULD_SUSTAINED_DURATION = float(os.getenv('HICON_MOULD_SUSTAINED', '0.30'))
-CLUSTER_R_CLUSTER = float(os.getenv('HICON_CLUSTER_R_CLUSTER', '0.08'))
-CLUSTER_R_MERGE = float(os.getenv('HICON_CLUSTER_R_MERGE', '0.07'))  # Euclidean distance threshold
-CLUSTER_BACKTRACK_CID_GUARD = int(os.getenv('HICON_CLUSTER_BACKTRACK_CID_GUARD', '5'))
-MOULD_SPLIT_MIN_DX_PX = float(os.getenv('HICON_MOULD_SPLIT_MIN_DX_PX', '12.0'))
-MOULD_SPLIT_MIN_DY_PX = float(os.getenv('HICON_MOULD_SPLIT_MIN_DY_PX', '12.0'))
-MOULD_SPLIT_COOLDOWN_S = float(os.getenv('HICON_MOULD_SPLIT_COOLDOWN_S', '1.5'))
-MOULD_SPLIT_REARM_BASELINE_S = float(os.getenv('HICON_MOULD_SPLIT_REARM_BASELINE_S', '0.5'))
-MOULD_SPLIT_DOM_RATIO = float(os.getenv('HICON_MOULD_SPLIT_DOM_RATIO', '1.35'))
-MOULD_AXIS_ONLY_MIN_MAG = float(os.getenv('HICON_MOULD_AXIS_ONLY_MIN_MAG', '0.05'))
-MOULD_SPLIT_REARM_DX_PX = float(os.getenv('HICON_MOULD_SPLIT_REARM_DX_PX', '10.0'))
-MOULD_SPLIT_REARM_DY_PX = float(os.getenv('HICON_MOULD_SPLIT_REARM_DY_PX', '14.0'))
-LOG_MOULD_DISPLACEMENT = os.getenv('HICON_LOG_MOULD_DISPLACEMENT', 'false').lower() == 'true'
-MOULD_DISP_LOG_INTERVAL_S = float(os.getenv('HICON_MOULD_DISP_LOG_INTERVAL_S', '0.25'))
 
 # Trolley bbox expansion for mouth-inside check (reference parity: all sides)
 EDGE_EXPAND_PX = int(os.getenv('HICON_EDGE_EXPAND_PX', '180'))
@@ -173,12 +162,6 @@ TAPPING_ONLY_CYCLE_TIMEOUT_S = float(os.getenv('HICON_TAPPING_ONLY_CYCLE_TIMEOUT
 
 # Minimum pyrometer rod bbox area in pixels² — rejects small false-positive detections
 PYROMETER_MIN_AREA_PX2 = int(os.getenv('HICON_PYROMETER_MIN_AREA', '7000'))
-
-# Mould switch requires last pour >= this duration
-MOULD_SWITCH_MIN_POUR_S = float(os.getenv('HICON_MOULD_SWITCH_MIN_POUR', '2.0'))
-
-# Minimum cumulative pour time per mould cluster (offline parity filter)
-MIN_CLUSTER_POUR_S = float(os.getenv('HICON_MIN_CLUSTER_POUR_S', '1.5'))
 
 # =============================================================================
 # MOULD PLACEMENT DETECTION
@@ -433,7 +416,7 @@ CONFIG_MOULD = os.getenv(
 )
 MOULD_GIE_ENABLED = os.getenv('HICON_MOULD_GIE_ENABLED', 'false').lower() == 'true'
 MOULD_GIE_INTERVAL = int(os.getenv('HICON_MOULD_GIE_INTERVAL', '11'))
-MOULD_COUNT_MODE = os.getenv('HICON_MOULD_COUNT_MODE', 'shadow').strip().lower()
+MOULD_COUNT_MODE = os.getenv('HICON_MOULD_COUNT_MODE', 'tracker').strip().lower()
 MOULD_MIN_AREA_PX = int(os.getenv('HICON_MOULD_MIN_AREA_PX', '400'))
 MOULD_TRACKER_CLASS_ID = int(os.getenv('HICON_MOULD_TRACKER_CLASS_ID', '2'))
 MOULD_GIE_UNIQUE_ID = int(os.getenv('HICON_MOULD_GIE_UNIQUE_ID', '4'))
@@ -449,7 +432,7 @@ PYRO_NVINFER_INTERVAL = _get_nvinfer_interval(
 # A mould "latches" after being matched LATCH_HITS times over >= LATCH_MIN_AGE_S at a
 # stable trolley-relative position; latched entries keep a stable canonical id and an
 # EMA position regardless of tracker-ID churn. Match radius is trolley-normalized
-# (same space as CLUSTER_R_CLUSTER).
+# (0-1 fraction of trolley width/height).
 MOULD_CANONICAL_ENABLED = os.getenv('HICON_MOULD_CANONICAL_ENABLED', 'true').lower() == 'true'
 MOULD_CANONICAL_MATCH_RADIUS = float(os.getenv('HICON_MOULD_CANONICAL_MATCH_RADIUS', '0.08'))
 MOULD_CANONICAL_LATCH_HITS = int(os.getenv('HICON_MOULD_CANONICAL_LATCH_HITS', '3'))
@@ -573,10 +556,13 @@ def validate_config():
     if POUR_NVINFER_INTERVAL < 0 or MOULD_GIE_INTERVAL < 0:
         raise ValueError("nvinfer intervals must be >= 0")
 
-    if MOULD_COUNT_MODE not in {'legacy', 'shadow', 'tracker'}:
-        raise ValueError("HICON_MOULD_COUNT_MODE must be legacy, shadow, or tracker")
+    if MOULD_COUNT_MODE != 'tracker':
+        raise ValueError(
+            "HICON_MOULD_COUNT_MODE must be tracker — brightness/clustering-based "
+            "legacy and shadow mould counting have been removed"
+        )
 
-    if MOULD_COUNT_MODE == 'tracker' and not MOULD_GIE_ENABLED:
+    if not MOULD_GIE_ENABLED:
         raise ValueError(
             "HICON_MOULD_COUNT_MODE=tracker requires HICON_MOULD_GIE_ENABLED=true"
         )
@@ -689,19 +675,6 @@ def get_config_summary():
         'mouth_missing_tol_s': MOUTH_MISSING_TOL_S,
         'mouth_hold_s': MOUTH_HOLD_S,
         'pouring_cycle_timeout_s': POURING_CYCLE_TIMEOUT_S,
-        'mould_switch_min_pour_s': MOULD_SWITCH_MIN_POUR_S,
-        'min_cluster_pour_s': MIN_CLUSTER_POUR_S,
-        'cluster_backtrack_cid_guard': CLUSTER_BACKTRACK_CID_GUARD,
-        'mould_split_min_dx_px': MOULD_SPLIT_MIN_DX_PX,
-        'mould_split_min_dy_px': MOULD_SPLIT_MIN_DY_PX,
-        'mould_split_cooldown_s': MOULD_SPLIT_COOLDOWN_S,
-        'mould_split_rearm_baseline_s': MOULD_SPLIT_REARM_BASELINE_S,
-        'mould_split_dom_ratio': MOULD_SPLIT_DOM_RATIO,
-        'mould_axis_only_min_mag': MOULD_AXIS_ONLY_MIN_MAG,
-        'mould_split_rearm_dx_px': MOULD_SPLIT_REARM_DX_PX,
-        'mould_split_rearm_dy_px': MOULD_SPLIT_REARM_DY_PX,
-        'log_mould_displacement': LOG_MOULD_DISPLACEMENT,
-        'mould_disp_log_interval_s': MOULD_DISP_LOG_INTERVAL_S,
         'enable_inference_video': ENABLE_INFERENCE_VIDEO,
         'enable_inference_video_stream_0': ENABLE_INFERENCE_VIDEO_STREAM_0,
         'enable_inference_video_stream_1': ENABLE_INFERENCE_VIDEO_STREAM_1,

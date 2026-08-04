@@ -27,7 +27,7 @@ class DummyConfig:
     MOULD_GIE_UNIQUE_ID = 4
     MOULD_TRACKER_CLASS_ID = 2
     MOULD_MIN_AREA_PX = 400
-    MOULD_COUNT_MODE = "shadow"
+    MOULD_COUNT_MODE = "tracker"
     STREAM_0_TRACKER_MAX_TARGETS = 64
     SESSION_START_DURATION = 1.0
     SESSION_END_DURATION = 1.5
@@ -42,12 +42,6 @@ class DummyConfig:
     POUR_END_DURATION = 0.80
     POUR_MIN_DURATION = 2.0
     MOULD_DISPLACEMENT_THRESHOLD = 0.25
-    MOULD_SUSTAINED_DURATION = 0.30
-    CLUSTER_R_CLUSTER = 0.08
-    CLUSTER_R_MERGE = 0.07
-    CLUSTER_BACKTRACK_CID_GUARD = 5
-    MOULD_SWITCH_MIN_POUR_S = 2.0
-    MIN_CLUSTER_POUR_S = 1.5
     EDGE_EXPAND_PX = 180
     MOUTH_MISSING_TOL_S = 0.6
     MOUTH_HOLD_S = 0.4
@@ -72,7 +66,6 @@ def test_runtime_geometry_keeps_reference_values_at_1920x1080(tmp_path):
     end = proc.brightness_end
     start_frames = proc.pour_start_frames
     end_frames = proc.pour_end_frames
-    r_cluster = proc.r_cluster
 
     proc._update_runtime_geometry(1920, 1080)
 
@@ -86,7 +79,6 @@ def test_runtime_geometry_keeps_reference_values_at_1920x1080(tmp_path):
     assert proc.brightness_end == end
     assert proc.pour_start_frames == start_frames
     assert proc.pour_end_frames == end_frames
-    assert proc.r_cluster == r_cluster
 
 
 def test_runtime_geometry_scales_reference_pixels_to_1280x720(tmp_path):
@@ -96,7 +88,6 @@ def test_runtime_geometry_scales_reference_pixels_to_1280x720(tmp_path):
     start_frames = proc.pour_start_frames
     end_frames = proc.pour_end_frames
     displacement = proc.displacement_thresh
-    r_merge = proc.r_merge
 
     proc._update_runtime_geometry(1280, 720)
 
@@ -106,16 +97,11 @@ def test_runtime_geometry_scales_reference_pixels_to_1280x720(tmp_path):
     assert proc.probe_radius == 5
     assert proc.probe_tail_dy == 13
     assert proc.probe_offsets == [(0, 0), (8, 0), (-8, 0), (16, 0), (-16, 0)]
-    assert proc.split_min_dx_px == 8.0
-    assert proc.split_min_dy_px == 8.0
-    assert proc.split_rearm_dx_px == 7.0
-    assert proc.split_rearm_dy_px == 9.0
     assert proc.brightness_start == start
     assert proc.brightness_end == end
     assert proc.pour_start_frames == start_frames
     assert proc.pour_end_frames == end_frames
     assert proc.displacement_thresh == displacement
-    assert proc.r_merge == r_merge
 
 
 def test_runtime_geometry_dedupes_offsets_after_rounding(tmp_path):
@@ -223,37 +209,6 @@ def test_tracker_mode_syncs_distinct_moulds_to_heat_cycle(tmp_path):
     assert proc.heat_cycle_manager.records["MOULD_C1"]["mould_track_id"] == 41
 
 
-def test_tracker_mode_skips_legacy_open_mould_but_shadow_mode_still_opens_it(tmp_path):
-    proc = _make_proc(tmp_path)
-    proc._save_event_screenshot = lambda *args, **kwargs: None
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("_open_active_mould should not run in tracker mode")
-
-    proc._open_active_mould = _boom
-    trolley = {"track_id": 11, "bbox": (100, 100, 600, 400), "confidence": 0.9}
-    mouth = {"track_id": 5, "bbox": (250, 90, 290, 130), "confidence": 0.8,
-             "bottom_center": (270, 130), "center": (270, 110)}
-
-    proc.mould_count_mode = "tracker"
-    proc._start_pour(0.0, datetime.now(), [mouth], [trolley], None,
-                      brightness=240, probe_x=270, probe_y=160,
-                      target_trolley=trolley, best_mouth=mouth)
-    assert proc._active_segment is None
-    assert proc.next_mould_id == 1  # never incremented — legacy path never ran
-
-    # Same call, legacy/shadow mode: the legacy path must still run (rollback safety net).
-    proc.pour_active = False
-    proc.mould_count_mode = "shadow"
-    try:
-        proc._start_pour(0.0, datetime.now(), [mouth], [trolley], None,
-                          brightness=240, probe_x=270, probe_y=160,
-                          target_trolley=trolley, best_mouth=mouth)
-        assert False, "expected _open_active_mould to run (and raise) in shadow mode"
-    except AssertionError as exc:
-        assert "_open_active_mould should not run" in str(exc)
-
-
 def test_tracker_mode_db_breakdown_is_tracker_sourced_not_legacy(tmp_path):
     captured = {}
 
@@ -268,7 +223,6 @@ def test_tracker_mode_db_breakdown_is_tracker_sourced_not_legacy(tmp_path):
         heat_cycle_manager=None,
     )
     proc._save_event_screenshot = lambda *args, **kwargs: None
-    proc.mould_count_mode = "tracker"
     now = datetime.now()
 
     proc.pour_active = True
@@ -278,7 +232,6 @@ def test_tracker_mode_db_breakdown_is_tracker_sourced_not_legacy(tmp_path):
     proc._active_tracked_mould_id = 42
     proc._end_pour(3.0, now, [], [], None)
 
-    assert proc.mould_records == []  # legacy clustering never populated
     breakdown = captured["mould_wise_pouring_time"]["moulds"]
     assert len(breakdown) == 1
     assert breakdown[0]["mould_track_id"] == 42
@@ -339,7 +292,7 @@ def test_session_start_end_and_cycle_timeout(tmp_path):
     proc.trolley_locked = True
     proc.locked_trolley_id = 11
     proc.mouth_last_seen_in_trolley = 0.0
-    proc.mould_count = 3
+    proc._poured_mould_ids.add(7)
     proc._check_cycle_timeout(
         timestamp=301.0,
         datetime_obj=datetime.now(),
@@ -348,7 +301,7 @@ def test_session_start_end_and_cycle_timeout(tmp_path):
         frame=None,
     )
     assert proc.trolley_locked is False
-    assert proc.mould_count == 0
+    assert proc.tracker_mould_count == 0
 
 
 def test_probe_points_passed_to_all_pouring_event_screenshots(tmp_path):
@@ -463,68 +416,6 @@ def test_mouth_in_trolley_expands_top_edge_only(tmp_path):
     assert proc._is_mouth_in_expanded_trolley({"center": (260, 150)}, trolley) is False
     # Below bottom edge (no bottom expansion) → False
     assert proc._is_mouth_in_expanded_trolley({"center": (150, 250)}, trolley) is False
-
-
-def test_reference_motion_split_uses_sustained_hold(tmp_path):
-    proc = _make_proc(tmp_path)
-    base_time = 10.0
-    base_dt = datetime.now()
-    samples = []
-    for idx in range(4):
-        samples.append({"time": base_time + idx * 0.04, "datetime": base_dt, "norm": (0.10, 0.10)})
-    for idx in range(proc.sustained_hold_frames + 2):
-        samples.append(
-            {
-                "time": base_time + (idx + 4) * 0.04,
-                "datetime": base_dt,
-                "norm": (0.45, 0.10),
-            }
-        )
-    segment = {
-        "start_time": samples[0]["time"],
-        "start_datetime": base_dt,
-        "end_time": samples[-1]["time"],
-        "end_datetime": base_dt,
-        "samples": samples,
-        "ladle_track_id": 9,
-    }
-    split = []
-    proc._split_segment_by_motion(segment, split)
-    assert len(split) == 2
-
-
-def test_cluster_backtrack_guard_5_allows_recent_old_cluster_reuse(tmp_path):
-    proc = _make_proc(tmp_path)
-    proc.r_merge = 0.005
-
-    def make_segment(start_time, x):
-        start_dt = datetime.now()
-        samples = []
-        for idx in range(60):
-            samples.append(
-                {
-                    "time": start_time + idx * 0.04,
-                    "datetime": start_dt,
-                    "norm": (x, 0.2),
-                }
-            )
-        return {
-            "start_time": samples[0]["time"],
-            "start_datetime": start_dt,
-            "end_time": samples[-1]["time"],
-            "end_datetime": start_dt,
-            "samples": samples,
-            "ladle_track_id": 11,
-        }
-
-    proc.completed_segments = [
-        make_segment(0.0, 0.00),
-        make_segment(4.0, 0.12),
-        make_segment(8.0, 0.24),
-        make_segment(12.0, 0.01),
-    ]
-    proc._recompute_clusters()
-    assert [record["cluster_id"] for record in proc.mould_records] == [1, 2, 3, 1]
 
 
 def test_reference_pour_start_requires_tail_score(tmp_path):
@@ -670,193 +561,3 @@ def test_reference_hold_probe_reuse_within_mouth_hold_window(tmp_path):
 
     assert proc.active_probe_from_hold is True
     assert proc._last_probe_base == (88, 111)
-
-
-# ---------------------------------------------------------------------------
-# Cluster rescue gate tests
-# ---------------------------------------------------------------------------
-
-def _make_segment(start_time, x, y=0.2, duration=3.0, fps=25):
-    """Build a minimal raw segment with uniform norm samples at position (x, y)."""
-    start_dt = datetime.now()
-    n_samples = max(4, int(duration * fps))
-    samples = [
-        {"time": start_time + i / fps, "datetime": start_dt, "norm": (x, y)}
-        for i in range(n_samples)
-    ]
-    return {
-        "start_time": samples[0]["time"],
-        "start_datetime": start_dt,
-        "end_time": samples[-1]["time"],
-        "end_datetime": start_dt,
-        "samples": samples,
-        "ladle_track_id": 1,
-    }
-
-
-def test_rescue_gate_triggers_on_heat0124_pattern(tmp_path):
-    """21 segments at 21 distinct positions → 10 clusters under r=0.08 → gate fires."""
-    proc = _make_proc(tmp_path)
-    # 10 distinct x positions, each visited ~2 times = 21 segments total
-    xs = [i * 0.04 for i in range(10)]  # spacing 0.04, within r_cluster=0.08
-    segs = []
-    t = 0.0
-    for i, x in enumerate(xs):
-        segs.append(_make_segment(t, x))
-        t += 4.0
-    # Second pass over first 11 positions (merges into existing clusters under r=0.08)
-    for x in xs[:11]:
-        segs.append(_make_segment(t, x + 0.001))  # slight jitter, stays < r_cluster
-        t += 4.0
-
-    proc.completed_segments = segs
-    proc._recompute_clusters()
-
-    # Baseline: 10 clusters (segments at +0.001 merge into existing under r=0.08)
-    # Gate: 21 segs, 10 clusters, ratio=0.476 ≤ 0.65, gap=11 ≥ 8 → rescue runs
-    # After rescue: positions are 0.04 apart (> 0.008 gap) → sub-clusters split
-    assert proc.clustered_mould_count >= 10
-
-
-def test_rescue_gate_does_not_trigger_on_normal_revisit_pattern(tmp_path):
-    """24 segments, 20 clusters (ratio=0.833 > 0.65) — gate must NOT fire."""
-    proc = _make_proc(tmp_path)
-    # 20 distinct positions, 4 revisited once (gap < 0.008 = true revisit jitter)
-    xs = [i * 0.06 for i in range(20)]
-    segs = []
-    t = 0.0
-    for x in xs:
-        segs.append(_make_segment(t, x))
-        t += 4.0
-    # 4 revisit pours at same positions (x + tiny jitter < 0.008)
-    for x in xs[:4]:
-        segs.append(_make_segment(t, x + 0.002))
-        t += 4.0
-
-    proc.completed_segments = segs
-    proc._recompute_clusters()
-
-    # 24 segs, ~20 clusters, ratio ~0.833 > 0.65 → gate stays off
-    # Cluster count should stay at ~20 (no rescue splitting)
-    assert proc.clustered_mould_count <= 20
-
-
-def test_rescue_gate_does_not_trigger_on_15_segments_12_clusters(tmp_path):
-    """15 segs, 12 clusters: valid_segs=15 < 18 → gate must NOT fire."""
-    proc = _make_proc(tmp_path)
-    xs = [i * 0.07 for i in range(12)]
-    segs = []
-    t = 0.0
-    for x in xs:
-        segs.append(_make_segment(t, x))
-        t += 4.0
-    for x in xs[:3]:
-        segs.append(_make_segment(t, x + 0.001))
-        t += 4.0
-
-    proc.completed_segments = segs
-    proc._recompute_clusters()
-
-    # 15 segs < 18 → gate blocked, no rescue
-    assert proc.clustered_mould_count <= 12
-
-
-def test_rescue_splits_suspicious_cluster_with_significant_gap(tmp_path):
-    """A cluster with 2 segments at x=0.10 and x=0.30 (gap=0.20 >> 0.008) must split."""
-    proc = _make_proc(tmp_path)
-    # Force a scenario where r_cluster=0.08 merges x=0.10 and x=0.18 into one cluster,
-    # but those positions are actually distinct (gap=0.08 > 0.008 internal gap).
-    # Use 21 total segs to pass the gate, with one cluster clearly spanning 2 positions.
-    segs = []
-    t = 0.0
-    # 10 single-position clusters
-    for i in range(10):
-        segs.append(_make_segment(t, i * 0.12))
-        t += 4.0
-    # One over-merged cluster: 11 extra segments all within r=0.08 of x=0.05
-    # but internally split between x=0.05 and x=0.09 (gap=0.04 > 0.008)
-    for _ in range(6):
-        segs.append(_make_segment(t, 0.05))
-        t += 4.0
-    for _ in range(5):
-        segs.append(_make_segment(t, 0.09))
-        t += 4.0
-
-    proc.completed_segments = segs
-    proc._recompute_clusters()
-
-    # Gate: 21 segs, baseline ≤ 11 clusters, ratio ≤ 0.52 ≤ 0.65, gap ≥ 10 ≥ 8
-    # Rescue should split the over-merged cluster → total clusters > baseline
-    assert proc.clustered_mould_count >= 10
-
-
-def test_rescue_keeps_same_position_revisit_merged(tmp_path):
-    """Re-pours with x-gap <= 0.008 must remain in one cluster after rescue."""
-    proc = _make_proc(tmp_path)
-    # Build a heat that triggers the gate: 21 segs, baseline ~10 clusters
-    segs = []
-    t = 0.0
-    for i in range(10):
-        segs.append(_make_segment(t, i * 0.04))
-        t += 4.0
-    # 11 revisit segments all within 0.005 of x=0.00 (true same-position revisits)
-    for _ in range(11):
-        segs.append(_make_segment(t, 0.00 + 0.003))
-        t += 4.0
-
-    proc.completed_segments = segs
-    proc._recompute_clusters()
-
-    # The 12 same-position pours (x≈0.00) should remain 1 cluster after rescue
-    cluster_ids = [r["cluster_id"] for r in proc.mould_records if abs(r.get("rep_norm", (1,))[0]) < 0.01]
-    if cluster_ids:
-        assert len(set(cluster_ids)) == 1, "Same-position revisits must stay merged"
-
-
-def test_lower_displacement_threshold_detects_slow_motion_split(tmp_path):
-    """Displacement 0.15 fires on a 0.20-unit move that 0.25 would miss."""
-    import types
-
-    def _make_proc_with_threshold(tmp_path, threshold):
-        cfg = DummyConfig()
-        cfg.MOULD_DISPLACEMENT_THRESHOLD = threshold
-        return PouringProcessor(
-            db_manager=DummyDB(),
-            config=cfg,
-            screenshot_dir=str(tmp_path),
-            heat_cycle_manager=None,
-        )
-
-    base_dt = datetime.now()
-    fps = 25
-
-    def make_two_position_segment(disp):
-        """Segment starting at x=0.10, then moving disp units in x."""
-        samples = []
-        t = 0.0
-        for i in range(10):
-            samples.append({"time": t, "datetime": base_dt, "norm": (0.10, 0.50)})
-            t += 1 / fps
-        for i in range(20):
-            samples.append({"time": t, "datetime": base_dt, "norm": (0.10 + disp, 0.50)})
-            t += 1 / fps
-        return {
-            "start_time": 0.0, "start_datetime": base_dt,
-            "end_time": t, "end_datetime": base_dt,
-            "samples": samples, "ladle_track_id": 1,
-        }
-
-    seg = make_two_position_segment(0.20)
-
-    proc_025 = _make_proc_with_threshold(tmp_path, 0.25)
-    out_025 = []
-    proc_025._split_segment_by_motion(seg, out_025)
-
-    proc_015 = _make_proc_with_threshold(tmp_path, 0.15)
-    out_015 = []
-    proc_015._split_segment_by_motion(seg, out_015)
-
-    # At threshold 0.25: displacement 0.20 never exceeds threshold → no split
-    assert len(out_025) == 1, "0.25 threshold should NOT split a 0.20-unit displacement"
-    # At threshold 0.15: displacement 0.20 > 0.15 → split fires
-    assert len(out_015) == 2, "0.15 threshold should split a 0.20-unit displacement"

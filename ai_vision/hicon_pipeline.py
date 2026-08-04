@@ -1530,17 +1530,6 @@ def main():
     if config.ENABLE_STREAM_0_POURING_PROCESSOR:
         try:
             from processors.pouring_processor import PouringProcessor
-            _placement_detector = None
-            if getattr(config, 'ENABLE_MOULD_PLACEMENT', True):
-                try:
-                    from processors.mould_placement_detector import MouldPlacementDetector
-                    _placement_detector = MouldPlacementDetector(config)
-                    logger.info(
-                        "Stream 0: Mould placement detector initialized "
-                        "(mode=%s)", getattr(config, 'MOULD_TRACKING_MODE', 'reactive')
-                    )
-                except Exception as _pd_exc:
-                    logger.warning("Stream 0: Mould placement detector unavailable: %s", _pd_exc)
             pouring_processor = PouringProcessor(
                 db_manager=async_db_writer,
                 config=config,
@@ -1548,7 +1537,6 @@ def main():
                 heat_cycle_manager=heat_cycle_manager,
                 enable_display_meta=stream0_enable_display_meta,
                 screenshot_writer=screenshot_writer,
-                placement_detector=_placement_detector,
             )
             logger.info("Stream 0: Pouring processor initialized")
             _pp = pouring_processor
