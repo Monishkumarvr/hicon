@@ -32,6 +32,7 @@ class HiConDatabase:
         self.migrate_add_sync_tracking()
         self.migrate_add_heat_cycle_melting_columns()
         self.migrate_add_melting_zone_column()
+        self.migrate_add_has_pouring_session_column()
         logger.info(f"Database initialized: {self.db_path}")
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -115,6 +116,7 @@ class HiConDatabase:
             deslagging_events TEXT,
             spectro_events TEXT,
             pyrometer_events TEXT,
+            has_pouring_session INTEGER DEFAULT 0,
             synced INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         )''')
@@ -209,6 +211,25 @@ class HiConDatabase:
                 logger.info(f"Added column {col_name} to heat_cycles")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+        conn.commit()
+        conn.close()
+
+    def migrate_add_has_pouring_session_column(self):
+        """Add has_pouring_session column to heat_cycles if it doesn't exist.
+
+        Lets sync_manager tell "no pouring session this cycle" (legitimate,
+        stay silent) apart from "a pouring session happened but the pouring
+        aggregate is unexpectedly empty" (a bug — see hicon-3q4).
+        """
+        conn = self._get_connection()
+        c = conn.cursor()
+
+        try:
+            c.execute("ALTER TABLE heat_cycles ADD COLUMN has_pouring_session INTEGER DEFAULT 0")
+            logger.info("Added has_pouring_session column to heat_cycles")
+        except sqlite3.OperationalError:
+            logger.debug("has_pouring_session column already exists in heat_cycles")
 
         conn.commit()
         conn.close()
@@ -496,7 +517,8 @@ class HiConDatabase:
                          tapping_events: Optional[List] = None,
                          deslagging_events: Optional[List] = None,
                          spectro_events: Optional[List] = None,
-                         pyrometer_events: Optional[List] = None) -> str:
+                         pyrometer_events: Optional[List] = None,
+                         has_pouring_session: bool = False) -> str:
         """
         Insert completed heat cycle record.
 
@@ -549,13 +571,15 @@ class HiConDatabase:
                  location, camera_id, cycle_start_time, cycle_end_time,
                  pouring_start_time, pouring_end_time, total_pouring_time,
                  mould_wise_pouring_time, tapping_start_time, tapping_end_time,
-                 tapping_events, deslagging_events, spectro_events, pyrometer_events, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 tapping_events, deslagging_events, spectro_events, pyrometer_events,
+                 has_pouring_session, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (sync_id, heat_no, customer_id, slno, date, shift, ladle_number,
                  location, camera_id, cycle_start_time, cycle_end_time,
                  pouring_start_time, pouring_end_time, total_pouring_time,
                  mould_wise_json, tapping_start_time, tapping_end_time,
                  tapping_events_json, deslagging_events_json, spectro_events_json, pyrometer_events_json,
+                 int(bool(has_pouring_session)),
                  datetime.now().isoformat()))
             conn.commit()
             logger.info(f"Inserted heat cycle: {heat_no} (slno: {slno})")
@@ -608,7 +632,8 @@ class HiConDatabase:
                      location, camera_id, cycle_start_time, cycle_end_time,
                      pouring_start_time, pouring_end_time, total_pouring_time,
                      mould_wise_pouring_time, tapping_start_time, tapping_end_time,
-                     tapping_events, deslagging_events, spectro_events, pyrometer_events
+                     tapping_events, deslagging_events, spectro_events, pyrometer_events,
+                     has_pouring_session
                      FROM heat_cycles
                      WHERE synced = 0
                      ORDER BY created_at ASC

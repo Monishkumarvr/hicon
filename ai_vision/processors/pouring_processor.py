@@ -2122,6 +2122,11 @@ class PouringProcessor:
                 committed_tracker_id,
                 self.tracker_mould_count,
             )
+            # Push into the active heat cycle's aggregate (pouring_start_time/
+            # pouring_end_time/mould_wise_pouring_time) — without this, tracker-mode
+            # pours are detected and stored in pouring_events but never reach the
+            # heat_cycles row the cloud /pouring payload is actually built from.
+            self._sync_mould_records_to_heat_cycle()
         elif self.mould_gie_enabled:
             logger.warning(
                 "[mould-tracker] valid pour %.1fs had no mould assignment; legacy count retained",
@@ -2351,6 +2356,7 @@ class PouringProcessor:
                 deslagging_events=cycle.deslagging_events if cycle.deslagging_events else None,
                 spectro_events=cycle.spectro_events if cycle.spectro_events else None,
                 pyrometer_events=cycle.pyrometer_events if cycle.pyrometer_events else None,
+                has_pouring_session=cycle.has_pouring_session,
             )
             logger.info(
                 f"HEAT CYCLE FINALIZED: {cycle.heat_no} - "

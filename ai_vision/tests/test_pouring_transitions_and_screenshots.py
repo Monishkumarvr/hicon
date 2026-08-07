@@ -3,7 +3,9 @@ from pathlib import Path
 
 import numpy as np
 
+from db_manager import HiConDatabase
 from processors.pouring_processor import PouringProcessor
+from state.heat_cycle_manager import HeatCycleManager
 
 
 class DummyDB:
@@ -561,3 +563,35 @@ def test_reference_hold_probe_reuse_within_mouth_hold_window(tmp_path):
 
     assert proc.active_probe_from_hold is True
     assert proc._last_probe_base == (88, 111)
+
+
+def test_end_pour_syncs_tracker_commit_into_active_heat_cycle(tmp_path):
+    """Regression for a bug where a committed tracker pour never reached the
+    heat cycle's mould_pourings — _sync_mould_records_to_heat_cycle() existed
+    but had no production caller, so every heat cycle finalized with a blank
+    pouring_start_time/pouring_end_time/mould_wise_pouring_time even though
+    pours were detected and stored in pouring_events fine. This drives a real
+    _end_pour() with a real HeatCycleManager, not just the bridge function
+    directly, so it would have caught the missing call site."""
+    db = HiConDatabase(str(tmp_path / "heat_cycle.sqlite"))
+    heat_cycle_manager = HeatCycleManager(db, ladle_absence_timeout=300.0)
+
+    proc = PouringProcessor(
+        db_manager=DummyDB(),
+        config=DummyConfig(),
+        screenshot_dir=str(tmp_path),
+        heat_cycle_manager=heat_cycle_manager,
+    )
+    proc._save_event_screenshot = lambda *args, **kwargs: None
+    now = datetime.now()
+
+    proc.locked_trolley_id = 7
+    proc.pour_active = True
+    proc.pour_start_time = 0.0
+    proc.pour_start_datetime = now
+    proc._active_tracked_mould_id = 42
+    proc._end_pour(3.0, now, [], [], None)
+
+    assert heat_cycle_manager.active_cycle is not None
+    assert len(heat_cycle_manager.active_cycle.mould_pourings) == 1
+    assert heat_cycle_manager.active_cycle.mould_pourings[0].mould_track_id == 42

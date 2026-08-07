@@ -241,7 +241,20 @@ class SyncManager:
             pouring_end = format_timestamp_for_api(cycle.get('pouring_end_time'))
             if not pouring_start or not pouring_end:
                 pouring_skipped_sync_ids.add(cycle['sync_id'])
-                logger.debug(f"  Skipping pouring sync for {cycle['sync_id']}: incomplete session (start={pouring_start}, end={pouring_end})")
+                if cycle.get('has_pouring_session'):
+                    # A pouring session was observed for this cycle, so the pouring
+                    # aggregate should not be empty — this combination means the
+                    # detected-pour -> heat-cycle bridge silently dropped data
+                    # (see hicon-3q4). Loud on purpose: this exact bug went
+                    # unnoticed for over a week because it only ever logged debug.
+                    logger.error(
+                        f"  Heat cycle {cycle['heat_no']} ({cycle['sync_id']}) had a pouring "
+                        f"session but its pouring aggregate is empty (start={pouring_start}, "
+                        f"end={pouring_end}) — not syncing to /pouring, investigate the "
+                        f"detected-pour-to-heat-cycle bridge"
+                    )
+                else:
+                    logger.debug(f"  Skipping pouring sync for {cycle['sync_id']}: incomplete session (start={pouring_start}, end={pouring_end})")
             else:
                 # Pouring payload (new API format)
                 # Use sync_id + '-p' so AGNI treats /agni and /pouring as distinct records.

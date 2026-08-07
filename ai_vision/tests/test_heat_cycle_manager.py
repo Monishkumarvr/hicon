@@ -497,6 +497,7 @@ def test_pouring_processor_inserts_heat_cycle_with_empty_ladle_number(tmp_path):
         spectro_events=[],
         pyrometer_events=[],
         furnace_label="Furnace1",
+        has_pouring_session=False,
     )
 
     processor._insert_heat_cycle_to_db(cycle)

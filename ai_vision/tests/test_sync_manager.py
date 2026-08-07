@@ -124,3 +124,67 @@ def test_sync_manager_uses_cycle_furnace_for_agni_location():
     assert melting_items[0]["deslagging"] is True
     assert melting_items[0]["spectro"] is True
     assert melting_items[0]["pyrometer"] is True
+
+
+def _incomplete_pouring_cycle(has_pouring_session):
+    return {
+        "sync_id": "cycle-2",
+        "heat_no": "HEAT_0002",
+        "customer_id": "cust-1",
+        "date": "2026-08-07",
+        "location": "Casting Section",
+        "camera_id": "Cam-Process",
+        "cycle_start_time": "2026-08-07T10:00:00",
+        "cycle_end_time": "2026-08-07T10:20:00",
+        "pouring_start_time": "",
+        "pouring_end_time": "",
+        "total_pouring_time": "0",
+        "mould_wise_pouring_time": json.dumps([]),
+        "tapping_start_time": None,
+        "tapping_end_time": None,
+        "tapping_events": json.dumps([]),
+        "deslagging_events": json.dumps([]),
+        "spectro_events": json.dumps([]),
+        "pyrometer_events": json.dumps([]),
+        "has_pouring_session": has_pouring_session,
+    }
+
+
+def test_sync_manager_errors_loudly_when_pouring_session_missing_aggregate(caplog):
+    """Regression for hicon-3q4: a heat cycle that had a pouring session but
+    whose pouring aggregate came out empty (the detected-pour -> heat-cycle
+    bridge bug) must be logged as an error, not silently skipped — this exact
+    combination went unnoticed for over a week because it only ever hit
+    logger.debug."""
+    db = FakeDB([_incomplete_pouring_cycle(has_pouring_session=1)])
+    api = FakeAPI()
+    manager = SyncManager(
+        database=db, api_client=api, customer_id="cust-1",
+        camera_id="Cam-Process", location="Casting Section", furnace_id="",
+    )
+
+    with caplog.at_level("ERROR", logger="sync.sync_manager"):
+        manager._sync_heat_cycles()
+
+    assert len(api.pouring_batches) == 0  # never attempts the incomplete payload
+    assert any(
+        "HEAT_0002" in record.message and "pouring session" in record.message
+        for record in caplog.records if record.levelname == "ERROR"
+    )
+
+
+def test_sync_manager_stays_silent_for_a_genuine_no_pouring_cycle(caplog):
+    """A tapping-only cycle that never had a pouring session at all is the
+    legitimate case — no pouring data is expected, so no error."""
+    db = FakeDB([_incomplete_pouring_cycle(has_pouring_session=0)])
+    api = FakeAPI()
+    manager = SyncManager(
+        database=db, api_client=api, customer_id="cust-1",
+        camera_id="Cam-Process", location="Casting Section", furnace_id="",
+    )
+
+    with caplog.at_level("DEBUG", logger="sync.sync_manager"):
+        manager._sync_heat_cycles()
+
+    assert len(api.pouring_batches) == 0
+    assert not any(record.levelname == "ERROR" for record in caplog.records)
