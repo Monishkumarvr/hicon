@@ -163,29 +163,6 @@ TAPPING_ONLY_CYCLE_TIMEOUT_S = float(os.getenv('HICON_TAPPING_ONLY_CYCLE_TIMEOUT
 # Minimum pyrometer rod bbox area in pixels² — rejects small false-positive detections
 PYROMETER_MIN_AREA_PX2 = int(os.getenv('HICON_PYROMETER_MIN_AREA', '7000'))
 
-# =============================================================================
-# MOULD PLACEMENT DETECTION
-# Controls: HICON_MOULD_TRACKING_MODE
-#   reactive (default) — existing cluster-based mould_count, placement runs silently for logs
-#   predictive         — mould_count = blobs that received pours (placement detector is primary)
-#   hybrid             — predictive if detection succeeded; reactive fallback
-# Rollback: set HICON_MOULD_TRACKING_MODE=reactive in .env — no code change required.
-# =============================================================================
-MOULD_TRACKING_MODE            = os.getenv('HICON_MOULD_TRACKING_MODE', 'reactive')
-ENABLE_MOULD_PLACEMENT         = os.getenv('HICON_ENABLE_MOULD_PLACEMENT', 'true').lower() == 'true'
-PLACEMENT_DIFF_THRESH          = int(os.getenv('HICON_PLACEMENT_DIFF_THRESH', '30'))
-PLACEMENT_MIN_BLOB_AREA_PX     = int(os.getenv('HICON_PLACEMENT_MIN_BLOB_AREA_PX', '50'))
-PLACEMENT_MAX_BLOB_AREA_PX     = int(os.getenv('HICON_PLACEMENT_MAX_BLOB_AREA_PX', '2000'))
-PLACEMENT_R_ASSIGN             = float(os.getenv('HICON_PLACEMENT_R_ASSIGN', '0.15'))
-PLACEMENT_HYBRID_CONF_THRESHOLD= float(os.getenv('HICON_PLACEMENT_HYBRID_CONF_THRESHOLD', '0.70'))
-PLACEMENT_SAVE_DEBUG_IMAGES    = os.getenv('HICON_PLACEMENT_SAVE_DEBUG_IMAGES', 'false').lower() == 'true'
-PLACEMENT_CANONICAL_W          = int(os.getenv('HICON_PLACEMENT_CANONICAL_W', '128'))
-PLACEMENT_CANONICAL_H          = int(os.getenv('HICON_PLACEMENT_CANONICAL_H', '64'))
-PLACEMENT_MIN_ASPECT           = float(os.getenv('HICON_PLACEMENT_MIN_ASPECT', '0.15'))
-PLACEMENT_MAX_ASPECT           = float(os.getenv('HICON_PLACEMENT_MAX_ASPECT', '6.67'))
-PLACEMENT_CANNY_LOW            = int(os.getenv('HICON_PLACEMENT_CANNY_LOW', '40'))
-PLACEMENT_CANNY_HIGH           = int(os.getenv('HICON_PLACEMENT_CANNY_HIGH', '120'))
-
 # Enable per-frame CPU extraction for processors
 ENABLE_FRAME_PROCESSING = os.getenv('HICON_ENABLE_FRAME_PROCESSING', 'true').lower() == 'true'
 
@@ -361,22 +338,6 @@ STREAM_0_DECODE_ONLY_MODE = os.getenv('HICON_STREAM_0_DECODE_ONLY_MODE', 'false'
 STREAM_0_POSTMUX_ONLY_MODE = os.getenv('HICON_STREAM_0_POSTMUX_ONLY_MODE', 'false').lower() == 'true'
 STREAM_0_POSTCONV_ONLY_MODE = os.getenv('HICON_STREAM_0_POSTCONV_ONLY_MODE', 'false').lower() == 'true'
 STREAM_0_PREOSD_ONLY_MODE = os.getenv('HICON_STREAM_0_PREOSD_ONLY_MODE', 'false').lower() == 'true'
-STREAM_0_DECOUPLED_ANALYSIS_MODE = os.getenv(
-    'HICON_STREAM_0_DECOUPLED_ANALYSIS_MODE', 'false'
-).lower() == 'true'
-# Diagnostic-only flags for the Stream 0 analysis branch. The supported
-# production topology is NV12 tee -> analysisq0 -> hicon_pouring_0 -> fakesink
-# with CPU Python analysis in the branch probe; RGBA side-branch conversion is
-# intentionally not part of the supported path.
-STREAM_0_ANALYSIS_BRANCH_ENABLED = os.getenv(
-    'HICON_STREAM_0_ANALYSIS_BRANCH_ENABLED', 'true'
-).lower() == 'true'
-STREAM_0_ANALYSIS_RGBA_ENABLED = os.getenv(
-    'HICON_STREAM_0_ANALYSIS_RGBA_ENABLED', 'false'
-).lower() == 'true'
-STREAM_0_ANALYSIS_PROBE_ENABLED = os.getenv(
-    'HICON_STREAM_0_ANALYSIS_PROBE_ENABLED', 'true'
-).lower() == 'true'
 ENABLE_STREAM_0_POURING_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_POURING_PROCESSOR', 'true').lower() == 'true'
 ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR = os.getenv('HICON_ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR', 'true').lower() == 'true'
 ENABLE_DEBUG_PROBES = os.getenv('HICON_ENABLE_DEBUG_PROBES', 'false').lower() == 'true'
@@ -642,10 +603,6 @@ def get_config_summary():
         'stream_0_postmux_only_mode': STREAM_0_POSTMUX_ONLY_MODE,
         'stream_0_postconv_only_mode': STREAM_0_POSTCONV_ONLY_MODE,
         'stream_0_preosd_only_mode': STREAM_0_PREOSD_ONLY_MODE,
-        'stream_0_decoupled_analysis_mode': STREAM_0_DECOUPLED_ANALYSIS_MODE,
-        'stream_0_analysis_branch_enabled': STREAM_0_ANALYSIS_BRANCH_ENABLED,
-        'stream_0_analysis_rgba_enabled': STREAM_0_ANALYSIS_RGBA_ENABLED,
-        'stream_0_analysis_probe_enabled': STREAM_0_ANALYSIS_PROBE_ENABLED,
         'stream_0_mux_width': STREAM_0_MUX_WIDTH,
         'stream_0_mux_height': STREAM_0_MUX_HEIGHT,
         'stream_1_mux_width': STREAM_1_MUX_WIDTH,

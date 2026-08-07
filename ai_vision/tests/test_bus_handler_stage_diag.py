@@ -34,7 +34,7 @@ class FakeLoop:
 
 
 def test_update_stream0_stage_time_records_latest_timestamp():
-    handler = BusHandler(FakePipeline(), FakeLoop(), stream0_decoupled_analysis_mode=True)
+    handler = BusHandler(FakePipeline(), FakeLoop())
 
     handler.update_stream0_stage_time("mux_src")
 
@@ -43,7 +43,7 @@ def test_update_stream0_stage_time_records_latest_timestamp():
 
 
 def test_update_stream0_stage_sample_tracks_pts_delta():
-    handler = BusHandler(FakePipeline(), FakeLoop(), stream0_decoupled_analysis_mode=True)
+    handler = BusHandler(FakePipeline(), FakeLoop())
 
     handler.update_stream0_stage_sample("decoder_src", 1_000_000_000)
     handler.update_stream0_stage_sample("decoder_src", 1_040_000_000)
@@ -63,11 +63,10 @@ def test_fps_logger_emits_stream0_stage_ages(monkeypatch, caplog):
 
     monkeypatch.setattr("pipeline.bus_handler.GLib.timeout_add_seconds", fake_timeout_add_seconds)
 
-    handler = BusHandler(FakePipeline(), FakeLoop(), stream0_decoupled_analysis_mode=True)
+    handler = BusHandler(FakePipeline(), FakeLoop())
     now = time.time()
     handler.last_frame_time[0] = now
     handler._frame_counts[0] = 25
-    handler.stream0_analysis_last_time = now
     handler.stream0_stage_last_time = {
         "decoder_src": now,
         "nvvidconv_src": now,
@@ -92,7 +91,6 @@ def test_fps_logger_emits_stream0_stage_ages(monkeypatch, caplog):
 
     assert "callback" in scheduled
     assert scheduled["callback"]() is True
-    assert "[S0-DIAG]" in caplog.text
     assert "[S0-STAGES] decoder_src_age=" in caplog.text
     assert "nvvidconv_src_age=" in caplog.text
     assert "caps_src_age=" in caplog.text

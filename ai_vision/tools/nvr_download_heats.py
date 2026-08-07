@@ -3,7 +3,7 @@
 Download NVR clips for heat cycles from hicon.db.
 
 Queries heat_cycles for Cam-Process from May 14, downloads each clip
-(tapping_start - 2min  →  pouring_end + 1min) from NVR-1 via ISAPI.
+(tapping_start - 2min  →  pouring_end + 1min) from the recorder via RTSP playback.
 
 Usage:
     python3 tools/nvr_download_heats.py
@@ -14,18 +14,20 @@ Usage:
 import argparse
 import os
 import sqlite3
+import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timedelta
 
-import requests
-from requests.auth import HTTPDigestAuth
-
 # ─── NVR config ──────────────────────────────────────────────────────────────
-NVR_IP    = "192.168.28.8"
+# 192.168.28.8 (NVR-1) does NOT hold HiCon cameras — its track 3401 is a different
+# camera ("EP Area"). The only recorder with our footage is 192.168.28.6
+# (Hikvision DS-7716NXI-K4). See ai_vision/docs/nvr_backfill_feasibility_2026-07-23.md.
+NVR_IP    = "192.168.28.6"
 NVR_USER  = "admin"
 NVR_PASS  = "NVR@321#"
-TRACK_ID  = "3401"          # Cam-Process main stream
+TRACK_ID  = "1201"          # Stream 0 / Process — ch12 "POURING" on 192.168.28.6
 
 # ─── DB / output ─────────────────────────────────────────────────────────────
 DB_PATH   = os.path.join(os.path.dirname(__file__), "../data/hicon.db")
@@ -56,57 +58,84 @@ def human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def probe_duration(path: str):
+    """Return the media duration in seconds, or None if ffprobe can't read it."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError):
+        return None
+
+
 MAX_RETRIES = 3
 
 def download_clip(heat_no: str, start_dt: datetime, end_dt: datetime, out_path: str) -> bool:
-    xml = (
-        f"<downloadRequest>"
-        f"<playbackURI>rtsp://{NVR_IP}/Streaming/tracks/{TRACK_ID}/"
-        f"?starttime={fmt_nvr(start_dt)}&amp;endtime={fmt_nvr(end_dt)}"
-        f"</playbackURI></downloadRequest>"
+    # This NVR's firmware (V4.76.015) rejects ISAPI ContentMgmt/download's XML body
+    # (statusCode 6 / badXmlContent) — RTSP playback works cleanly instead.
+    nvr_pass_enc = urllib.parse.quote(NVR_PASS, safe="")
+    url = (
+        f"rtsp://{NVR_USER}:{nvr_pass_enc}@{NVR_IP}/Streaming/tracks/{TRACK_ID}/"
+        f"?starttime={fmt_nvr(start_dt)}&endtime={fmt_nvr(end_dt)}"
     )
-
-    url  = f"http://{NVR_IP}/ISAPI/ContentMgmt/download"
-    auth = HTTPDigestAuth(NVR_USER, NVR_PASS)
     tmp_path = out_path + ".tmp"
+    clip_secs = (end_dt - start_dt).total_seconds()
+    # The NVR doesn't cut off cleanly at `endtime` on its own (observed ~40% overshoot) —
+    # `-t` forces ffmpeg to stop at the exact requested duration regardless.
+    # proc_timeout is a safety net, not the primary stop mechanism: measured ~24s fixed
+    # RTSP/seek overhead plus roughly real-time transfer once flowing; 1.5x + buffer covers
+    # a slower NVR/network without depending on exact throughput.
+    proc_timeout = max(300, clip_secs * 1.5 + 180)
+    # The Jetson<->camera-segment link this NVR sits behind drops for 30-110s every ~300s
+    # (see camera_lan_periodic_outage_2026_07 memory). Without a socket-level timeout, a
+    # blackout mid-download stalls the TCP read and ffmpeg just hangs until proc_timeout
+    # kills it — wasting the whole attempt instead of failing fast so the retry loop below
+    # can land on a clean window. 90s covers the observed blackout durations with margin.
+    stall_timeout_us = 90_000_000
 
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1:
             print(f"  Retry {attempt}/{MAX_RETRIES} ...", end="", flush=True)
             time.sleep(5)
 
-        try:
-            # 30s connect timeout; 90s read timeout per chunk — avoids hanging forever
-            r = requests.post(url, data=xml.encode(), headers={"Content-Type": "application/xml"},
-                              auth=auth, timeout=(30, 90), stream=True)
-        except requests.exceptions.RequestException as e:
-            print(f"\n  ✗ Connection error: {e}")
-            continue
-
-        if r.status_code != 200:
-            body = r.text[:200]
-            print(f"\n  ✗ HTTP {r.status_code}: {body}")
-            continue
-
-        total = int(r.headers.get("Content-Length", 0))
         if attempt == 1:
-            print(f"  Downloading {human_size(total)} ...", end="", flush=True)
+            print(f"  Downloading ...", end="", flush=True)
 
-        written = 0
         t0 = time.time()
         try:
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        f.write(chunk)
-                        written += len(chunk)
-        except Exception as e:
+            result = subprocess.run(
+                # -f matroska: the ".tmp" suffix on tmp_path defeats ffmpeg's
+                # extension-based format sniffing otherwise.
+                ["ffmpeg", "-y", "-rtsp_transport", "tcp", "-stimeout", str(stall_timeout_us),
+                 "-i", url, "-c", "copy", "-t", f"{clip_secs:.0f}", "-f", "matroska", tmp_path],
+                capture_output=True, text=True, timeout=proc_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"\n  ✗ ffmpeg timed out after {proc_timeout:.0f}s (attempt {attempt})")
+            continue
+
+        if result.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            print(f"\n  ✗ Stream error (attempt {attempt}): {e}")
+            print(f"\n  ✗ ffmpeg failed (attempt {attempt}): {result.stderr.strip()[-300:]}")
+            continue
+
+        # A stall (e.g. the ~300s network blackout hitting mid-download) makes ffmpeg's
+        # -stimeout end the input early -- ffmpeg then exits 0 with a valid but truncated
+        # file. Reject anything meaningfully short of the requested duration instead of
+        # silently keeping partial footage.
+        actual_secs = probe_duration(tmp_path)
+        if actual_secs is None or actual_secs < clip_secs - 5:
+            os.remove(tmp_path)
+            got = f"{actual_secs:.1f}s" if actual_secs is not None else "unknown"
+            print(f"\n  ✗ truncated (attempt {attempt}): got {got} of {clip_secs:.0f}s requested -- likely a network stall")
             continue
 
         elapsed = time.time() - t0
+        written = os.path.getsize(tmp_path)
         speed   = written / elapsed / 1024 / 1024
         os.rename(tmp_path, out_path)
         print(f" done  {human_size(written)}  ({speed:.1f} MB/s)  [{elapsed:.0f}s]")
@@ -184,7 +213,7 @@ def main():
         clip_end   = pour_end  + timedelta(seconds=TRAIL_SECS)
         duration_m = (clip_end - clip_start).total_seconds() / 60
 
-        filename = f"{heat_no}_{tap_start.strftime('%Y%m%d_%H%M')}_IST.mp4"
+        filename = f"{heat_no}_{tap_start.strftime('%Y%m%d_%H%M')}_IST.mkv"
         out_path = os.path.join(OUT_DIR, filename)
         clips.append((heat_no, clip_start, clip_end, out_path, duration_m))
 

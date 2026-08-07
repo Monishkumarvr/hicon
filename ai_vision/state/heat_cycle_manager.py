@@ -836,6 +836,42 @@ class HeatCycleManager:
         )
         self._maybe_checkpoint()
         return cycle.heat_no
+
+    def prune_tracker_mould_pourings(self, valid_mould_ids) -> int:
+        """Drop tracker-sourced mould records the processor no longer knows about.
+
+        The canonical mould registry merges two tracker IDs when they turn out to be
+        the same physical mould, dropping one from the processor's aggregates and
+        folding its duration into the survivor. Without this, the dropped mould's
+        record stayed in the cycle forever — counting one physical mould twice and
+        double-counting its pour time. Legacy-sourced records are never touched.
+
+        Returns the number of records removed.
+        """
+        cycle = self.active_cycle
+        if cycle is None:
+            return 0
+
+        keep, dropped = [], []
+        for pouring in cycle.mould_pourings:
+            if pouring.source == "tracker" and pouring.mould_id not in valid_mould_ids:
+                dropped.append(pouring.mould_id)
+            else:
+                keep.append(pouring)
+
+        if not dropped:
+            return 0
+
+        cycle.mould_pourings = keep
+        logger.info(
+            "  🧹 Pruned %d merged-away tracker mould(s) from %s: %s (%d remain)",
+            len(dropped),
+            cycle.heat_no,
+            ", ".join(dropped),
+            len(keep),
+        )
+        self._maybe_checkpoint()
+        return len(dropped)
     
     def check_and_finalize_cycles(self, current_time: float, current_datetime: datetime) -> List[HeatCycle]:
         """

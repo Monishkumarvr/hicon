@@ -166,34 +166,6 @@ def test_stream0_decode_chain_creates_isolation_queues_and_extra_surfaces(monkey
     assert "source isolation queues enabled" in caplog.text
 
 
-def test_create_all_elements_decoupled_analysis_mode_builds_current_analysis_branch(monkeypatch, caplog):
-    def fake_make(factory_name, name):
-        return FakeElement(factory_name, name)
-
-    builder = _make_builder(
-        rtsp_stream_0="rtsp://example/stream0",
-        config_pouring="/tmp/config_pouring.txt",
-        tracker_lib="/tmp/libtracker.so",
-        tracker_config="/tmp/tracker.yml",
-        stream_0_decoupled_analysis_mode=True,
-    )
-    builder.pipeline = FakePipeline()
-    monkeypatch.setattr(gst_builder_mod.Gst.ElementFactory, "make", fake_make)
-    monkeypatch.setattr(builder, "_create_decode_chain", lambda stream_id, rtsp_url: None)
-    caplog.set_level(logging.INFO)
-
-    assert builder._create_all_elements() is True
-    assert "displayq0" in builder.elements
-    assert "analysisq0" in builder.elements
-    assert "analysis_sink0" in builder.elements
-    assert "nvvidconv_osd_0" not in builder.elements
-    assert builder.elements["displayq0"].props["leaky"] == 0
-    assert builder.elements["analysisq0"].props["leaky"] == 2
-    assert builder.elements["analysisq0"].props["max-size-buffers"] == 2
-    assert builder.elements["nvosd_0"].props["process-mode"] == 0
-    assert "decoupled analysis mode" in caplog.text
-
-
 def test_stream0_local_relay_enables_annotated_tee_without_recording(monkeypatch):
     def fake_make(factory_name, name):
         return FakeElement(factory_name, name)
@@ -203,7 +175,6 @@ def test_stream0_local_relay_enables_annotated_tee_without_recording(monkeypatch
         config_pouring="/tmp/config_pouring.txt",
         tracker_lib="/tmp/libtracker.so",
         tracker_config="/tmp/tracker.yml",
-        stream_0_decoupled_analysis_mode=True,
         enable_inference_video=False,
         enable_live_stream_0=False,
         enable_stream0_local_relay=True,

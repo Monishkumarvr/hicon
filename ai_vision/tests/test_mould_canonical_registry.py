@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from db_manager import HiConDatabase
 from processors.pouring_processor import PouringProcessor
+from state.heat_cycle_manager import HeatCycleManager, MouldPouringRecord
 
 
 class DummyDB:
@@ -681,3 +683,157 @@ def test_canonical_display_color_poured_dims_too(tmp_path):
     dim_color = tuple(c // 2 for c in full_color)
     assert proc._canonical_display_color(entry, now=1000.5) == full_color
     assert proc._canonical_display_color(entry, now=1002.0) == dim_color
+
+
+# ---------------------------------------------------------------------------
+# Slot-number stability (hicon-9cp)
+# ---------------------------------------------------------------------------
+
+class TrackerConfig(DummyConfig):
+    MOULD_COUNT_MODE = "tracker"
+
+
+def _commit_pour(proc, tracker_id, start_ts):
+    """Drive one committed pour for `tracker_id` through the real _end_pour path."""
+    now = datetime.now()
+    proc.pour_active = True
+    proc.pour_start_time = start_ts
+    proc.pour_start_datetime = now
+    proc._mould_vote_counts = Counter()
+    proc._active_tracked_mould_id = tracker_id
+    proc._end_pour(start_ts + 3.0, now, [], [], None)
+
+
+def _tracker_record(slot_id, ts):
+    return {
+        "slot_id": slot_id,
+        "ladle_track_id": 7,
+        "start_time_wall": ts,
+        "start_datetime_obj": datetime.now(),
+        "end_time_wall": ts + 3.0,
+        "end_datetime_obj": datetime.now(),
+        "duration_s": 3.0,
+    }
+
+
+def test_slot_numbers_are_never_reused_after_a_merge(tmp_path):
+    """A canonical merge of two already-poured moulds discards the dropped one's
+    slot. Deriving the next slot from len(_tracker_slot_by_id) handed that freed
+    number to a different physical mould, and upsert_completed_mould_pouring
+    matches on the "MOULD_C{n}" string — so the two collapsed into one record."""
+    proc = _make_proc(tmp_path)
+    proc._save_event_screenshot = lambda *args, **kwargs: None
+    proc.locked_trolley_id = 7
+
+    _latch_one(proc, track_id=1, cx=460, cy=360)
+    _latch_one(proc, track_id=2, cx=700, cy=500, t=1010.0)
+    _latch_one(proc, track_id=3, cx=940, cy=640, t=1020.0)
+    cid_a, cid_b, cid_c = sorted(proc._canonical_moulds)
+
+    _commit_pour(proc, cid_a, 1000.0)
+    _commit_pour(proc, cid_b, 1010.0)
+    _commit_pour(proc, cid_c, 1020.0)
+    assert [proc._tracker_slot_by_id[c] for c in (cid_a, cid_b, cid_c)] == [1, 2, 3]
+
+    # Both already poured, so cid_c's slot 3 is discarded outright, not transferred.
+    proc._merge_canonical(cid_b, cid_c)
+    assert cid_c not in proc._tracker_slot_by_id
+    assert proc._tracker_slot_by_id[cid_b] == 2
+
+    _latch_one(proc, track_id=4, cx=580, cy=620, t=1030.0)
+    cid_d = max(proc._canonical_moulds)
+    _commit_pour(proc, cid_d, 1030.0)
+
+    # 4, not the freed-up 3 — a genuinely different mould must never inherit it.
+    assert proc._tracker_slot_by_id[cid_d] == 4
+    assert len(set(proc._tracker_slot_by_id.values())) == len(proc._tracker_slot_by_id)
+
+
+def test_restore_seeds_slot_counter_past_restored_numbers(tmp_path):
+    """Restore assigns slots directly from persisted "MOULD_C{n}" strings rather
+    than through the counter, so the counter must be advanced past them or a
+    mid-cycle restart re-collides with what it just restored."""
+    now = datetime.now()
+    records = [
+        MouldPouringRecord(
+            mould_id=f"MOULD_C{slot}", mould_track_id=100 + slot,
+            start_time=1000.0, start_datetime=now,
+            end_time=1003.0, end_datetime=now,
+            duration_seconds=3.0, source="tracker",
+        )
+        # 3 and 4 were merged away before the restart — restored slots are sparse.
+        for slot in (1, 2, 5)
+    ]
+    stub_manager = SimpleNamespace(
+        active_cycle=SimpleNamespace(mould_pourings=records, ladle_track_ids=[7]),
+        upsert_completed_mould_pouring=lambda **kwargs: None,
+        prune_tracker_mould_pourings=lambda valid_mould_ids: 0,
+        update_pouring_session_presence=lambda *args, **kwargs: None,
+    )
+
+    proc = PouringProcessor(
+        db_manager=DummyDB(),
+        config=TrackerConfig(),
+        screenshot_dir=str(tmp_path),
+        heat_cycle_manager=stub_manager,
+    )
+    proc._save_event_screenshot = lambda *args, **kwargs: None
+    proc.locked_trolley_id = 7
+
+    assert proc._next_tracker_slot == 6
+
+    _commit_pour(proc, 999, 2000.0)
+    assert proc._tracker_slot_by_id[999] == 6  # not 3, and not a re-used 1/2/5
+
+
+def test_sync_prunes_merged_away_mould_from_heat_cycle(tmp_path):
+    """cycle.mould_pourings is append-only and _merge_canonical never notified the
+    heat cycle, so a merged-away mould stayed counted forever while its duration
+    was also folded into the survivor's total."""
+    db = HiConDatabase(str(tmp_path / "heat_cycle.sqlite"))
+    manager = HeatCycleManager(db, ladle_absence_timeout=300.0)
+    proc = PouringProcessor(
+        db_manager=DummyDB(),
+        config=TrackerConfig(),
+        screenshot_dir=str(tmp_path),
+        heat_cycle_manager=manager,
+    )
+
+    proc._tracker_pour_records = {
+        101: _tracker_record(1, 1000.0),
+        102: _tracker_record(2, 1010.0),
+        103: _tracker_record(3, 1020.0),
+    }
+    proc._sync_mould_records_to_heat_cycle()
+    assert {p.mould_id for p in manager.active_cycle.mould_pourings} == {
+        "MOULD_C1", "MOULD_C2", "MOULD_C3",
+    }
+
+    # A merge folds 103 into 102 and drops it from the processor's aggregates.
+    del proc._tracker_pour_records[103]
+    proc._sync_mould_records_to_heat_cycle()
+
+    assert {p.mould_id for p in manager.active_cycle.mould_pourings} == {
+        "MOULD_C1", "MOULD_C2",
+    }
+
+
+def test_sync_with_no_tracker_records_prunes_nothing(tmp_path):
+    """Defensive guard: an empty _tracker_pour_records must never be read as
+    'everything was merged away' and wipe restored state."""
+    db = HiConDatabase(str(tmp_path / "heat_cycle.sqlite"))
+    manager = HeatCycleManager(db, ladle_absence_timeout=300.0)
+    proc = PouringProcessor(
+        db_manager=DummyDB(),
+        config=TrackerConfig(),
+        screenshot_dir=str(tmp_path),
+        heat_cycle_manager=manager,
+    )
+
+    proc._tracker_pour_records = {101: _tracker_record(1, 1000.0)}
+    proc._sync_mould_records_to_heat_cycle()
+    assert len(manager.active_cycle.mould_pourings) == 1
+
+    proc._tracker_pour_records = {}
+    proc._sync_mould_records_to_heat_cycle()
+    assert len(manager.active_cycle.mould_pourings) == 1

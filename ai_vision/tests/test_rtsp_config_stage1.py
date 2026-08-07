@@ -56,7 +56,6 @@ def test_config_reads_stream0_diagnostic_bypass_flags(monkeypatch):
         HICON_STREAM_0_POSTMUX_ONLY_MODE="true",
         HICON_STREAM_0_POSTCONV_ONLY_MODE="true",
         HICON_STREAM_0_PREOSD_ONLY_MODE="true",
-        HICON_STREAM_0_DECOUPLED_ANALYSIS_MODE="true",
     )
 
     assert config.STREAM_0_BYPASS_TRACKER is True
@@ -65,7 +64,6 @@ def test_config_reads_stream0_diagnostic_bypass_flags(monkeypatch):
     assert config.STREAM_0_POSTMUX_ONLY_MODE is True
     assert config.STREAM_0_POSTCONV_ONLY_MODE is True
     assert config.STREAM_0_PREOSD_ONLY_MODE is True
-    assert config.STREAM_0_DECOUPLED_ANALYSIS_MODE is True
 
 
 def test_config_reads_stream0_processor_diagnostic_flags(monkeypatch):

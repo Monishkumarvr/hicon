@@ -196,6 +196,12 @@ class PouringProcessor:
         self._poured_mould_durations: Dict[int, float] = defaultdict(float)
         self._tracker_pour_records: Dict[int, Dict[str, Any]] = {}
         self._tracker_slot_by_id: Dict[int, int] = {}
+        # Monotonic within a heat cycle: a slot number is never reused, even after a
+        # canonical merge frees one. Deriving it from len(_tracker_slot_by_id) instead
+        # let a merge-freed number be handed to a different physical mould, and
+        # upsert_completed_mould_pouring matches on the "MOULD_C{n}" string — so the
+        # collision silently collapsed two distinct moulds into one record.
+        self._next_tracker_slot = 1
         self._seen_mould_ids = set()
         self._mould_peak_visible = 0
         self._last_mould_observations_by_id: Dict[int, Dict[str, Any]] = {}
@@ -289,11 +295,6 @@ class PouringProcessor:
 
         # --- DS-native inference overlay toggle (recorded post-OSD via tee branch) ---
         self.enable_inference_video = bool(getattr(config, 'ENABLE_INFERENCE_VIDEO', False))
-
-        # --- Cached display state for decoupled-mode recording overlay probe ---
-        # Updated by process_frame() on the analysis branch; read by the main-path
-        # display_meta writer probe (osd_sink_pad_probe_stream0_display_meta).
-        self._cached_display_data: Optional[Dict] = None
 
         # --- Per-mould timing tracker (for live overlay) ---
         self._synced_mould_slot_ids = set()
@@ -562,18 +563,7 @@ class PouringProcessor:
         # 10. Finalize heat cycles periodically
         self._finalize_heat_cycles_if_due(timestamp, datetime_obj)
 
-        # 11. Cache latest detection state for the decoupled-mode recording display_meta probe.
-        # The main-path probe (osd_sink_pad_probe_stream0_display_meta) reads this to write
-        # NvDsDisplayMeta on the main GStreamer path without re-running analysis.
-        self._cached_display_data = {
-            'mouths': mouths,
-            'trolleys': trolleys,
-            'target_trolley': target_trolley,
-            'timestamp': timestamp,
-            'datetime_obj': datetime_obj,
-        }
-
-        # 12. DS-native overlay annotations (rendered by nvosd and captured via tee branch)
+        # 11. DS-native overlay annotations (rendered by nvosd and captured via tee branch)
         if self.enable_inference_video and self.enable_display_meta and batch_meta is not None:
             self._add_inference_display_meta(
                 batch_meta=batch_meta,
@@ -1244,10 +1234,16 @@ class PouringProcessor:
                 'end_datetime_obj': record.end_datetime,
                 'duration_s': float(record.duration_seconds),
             }
+        # Slots above were assigned directly from persisted "MOULD_C{n}" strings, not
+        # through the counter — advance it past them or a mid-cycle restart would start
+        # numbering at 1 again and collide with what we just restored.
+        self._next_tracker_slot = max(self._tracker_slot_by_id.values(), default=0) + 1
         if self._tracker_pour_records:
             logger.info(
-                "[mould-tracker] restored %d distinct mould aggregates from active heat",
+                "[mould-tracker] restored %d distinct mould aggregates from active heat "
+                "(next slot=%d)",
                 len(self._tracker_pour_records),
+                self._next_tracker_slot,
             )
 
     # =========================================================================
@@ -1970,6 +1966,20 @@ class PouringProcessor:
                 slno=self.pour_slno or 0,
             )
 
+        # Reconcile, don't just upsert: a canonical merge removes the dropped mould from
+        # _tracker_pour_records (folding its duration into the survivor), but nothing
+        # removed its already-upserted heat-cycle record, so it kept being counted.
+        # Build the valid set from EVERY tracker record — including ones the
+        # ladle_track_id gate above skipped this round — so a temporarily-unsyncable
+        # record is never mistaken for a merged-away one.
+        if self._tracker_pour_records:
+            prune = getattr(self.heat_cycle_manager, 'prune_tracker_mould_pourings', None)
+            if callable(prune):
+                prune({
+                    f"MOULD_C{record['slot_id']}"
+                    for record in self._tracker_pour_records.values()
+                })
+
     def _start_pour(self, timestamp, datetime_obj, mouths, trolleys, frame,
                     brightness, probe_x, probe_y, target_trolley, best_mouth):
         """Start a pouring event. Lock trolley on first pour."""
@@ -2091,10 +2101,10 @@ class PouringProcessor:
             committed_tracker_id = int(committed_tracker_id)
             self._poured_mould_ids.add(committed_tracker_id)
             self._poured_mould_durations[committed_tracker_id] += float(duration)
-            slot_id = self._tracker_slot_by_id.setdefault(
-                committed_tracker_id,
-                len(self._tracker_slot_by_id) + 1,
-            )
+            if committed_tracker_id not in self._tracker_slot_by_id:
+                self._tracker_slot_by_id[committed_tracker_id] = self._next_tracker_slot
+                self._next_tracker_slot += 1
+            slot_id = self._tracker_slot_by_id[committed_tracker_id]
             ladle_track_id = int(self.locked_trolley_id or 0)
             prior = self._tracker_pour_records.get(committed_tracker_id)
             start_dt = self.pour_start_datetime or effective_end_dt
@@ -2291,6 +2301,7 @@ class PouringProcessor:
         self._poured_mould_durations.clear()
         self._tracker_pour_records.clear()
         self._tracker_slot_by_id.clear()
+        self._next_tracker_slot = 1
         self._seen_mould_ids.clear()
         self._mould_peak_visible = 0
         self._last_mould_observations_by_id.clear()
@@ -2732,26 +2743,6 @@ class PouringProcessor:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         except Exception as exc:
             logger.debug("[cpu-overlay] pouring draw error: %s", exc)
-
-    def write_recording_overlay(self, batch_meta, frame_meta):
-        """Write display overlay from latest cached detection state.
-
-        Called from the main-path display_meta writer probe in decoupled analysis mode.
-        Uses state already computed by the analysis branch — zero additional analysis.
-        Safe to call from a different GStreamer thread; reads a snapshot dict reference.
-        """
-        data = self._cached_display_data
-        if not data or not self.enable_inference_video:
-            return
-        self._add_inference_display_meta(
-            batch_meta=batch_meta,
-            frame_meta=frame_meta,
-            mouths=data['mouths'],
-            trolleys=data['trolleys'],
-            target_trolley=data['target_trolley'],
-            timestamp=data['timestamp'],
-            datetime_obj=data['datetime_obj'],
-        )
 
     def close(self):
         """Flush/stop the diagnostics writer. DS-native recording is managed by

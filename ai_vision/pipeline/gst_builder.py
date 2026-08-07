@@ -69,18 +69,6 @@ class DeepStreamPipelineBuilder:
         self.stream0_postmux_only_mode = bool(config.get('stream_0_postmux_only_mode', False))
         self.stream0_postconv_only_mode = bool(config.get('stream_0_postconv_only_mode', False))
         self.stream0_preosd_only_mode = bool(config.get('stream_0_preosd_only_mode', False))
-        self.stream0_decoupled_analysis_mode = bool(
-            config.get('stream_0_decoupled_analysis_mode', False)
-        )
-        self.stream0_analysis_branch_enabled = bool(
-            config.get('stream_0_analysis_branch_enabled', True)
-        )
-        self.stream0_analysis_rgba_enabled = bool(
-            config.get('stream_0_analysis_rgba_enabled', True)
-        )
-        self.stream0_analysis_probe_enabled = bool(
-            config.get('stream_0_analysis_probe_enabled', True)
-        )
         self.stream0_mux_width = int(config.get('stream_0_mux_width', 1280) or 1280)
         self.stream0_mux_height = int(config.get('stream_0_mux_height', 720) or 720)
         self.stream0_tracker_width = int(config.get('stream_0_tracker_width', 640) or 640)
@@ -97,9 +85,6 @@ class DeepStreamPipelineBuilder:
         self.mould_count_mode = str(config.get('mould_count_mode', 'shadow')).lower()
         self.use_safe_cuda_brightness = bool(
             config.get('use_safe_cuda_brightness', False)
-        )
-        self.stream0_melting_config_ini = str(
-            config.get('stream_0_melting_config_ini', '') or ''
         )
         self.stream2_melting_config_ini = str(
             config.get('stream_2_melting_config_ini', '') or ''
@@ -1214,100 +1199,26 @@ class DeepStreamPipelineBuilder:
                     # CPU mode is more stable on the headless inference/recording path when
                     # Python processors attach display_meta with lines/rects/text.
                     self.elements['nvosd_0'].set_property('process-mode', _NVDSOSD_MODE_CPU)
-                    if self.stream0_decoupled_analysis_mode:
-                        # Stream 0 decoupled mode keeps the display path NV12-only for stability.
-                        # On this path, attempting to draw PGIE/tracker rectangles has been the
-                        # live failure boundary ("Unable to draw rectangles"). Keep the element in
-                        # place for downstream topology, but turn off bbox/text rendering.
-                        self.elements['nvosd_0'].set_property('display-bbox', False)
-                        self.elements['nvosd_0'].set_property('display-text', False)
-                if self.stream0_decoupled_analysis_mode:
-                    # In decoupled mode, no nvvideoconvert is placed on Stream 0.
-                    # Any nvvideoconvert on Stream 0 combined with a pre-OSD tee causes
-                    # pgie-pyrometer CUDA OOM during TRT startup — keep Stream 0 NV12-only.
-                    # nvosd_0 CPU mode handles NV12 directly; brightness probe uses NV12 Y-plane.
-                    self.elements['tee_stream0_analysis'] = Gst.ElementFactory.make(
-                        "tee", "tee-stream0-analysis"
-                    )
-                    self.elements['displayq0'] = Gst.ElementFactory.make("queue", "displayq0")
-                    self._configure_queue(self.elements['displayq0'], max_buffers=16, leaky=0)
-                    if self.stream0_analysis_branch_enabled:
-                        self.elements['analysisq0'] = Gst.ElementFactory.make("queue", "analysisq0")
-                        self._configure_queue(self.elements['analysisq0'], max_buffers=2, leaky=2)
-                        if self.use_safe_cuda_brightness:
-                            self.elements['hicon_melting_0'] = Gst.ElementFactory.make(
-                                "hicon_melting_detect", "hicon-melting-0"
-                            )
-                            if self.elements['hicon_melting_0']:
-                                self.elements['hicon_melting_0'].set_property(
-                                    'config-ini', self.stream0_melting_config_ini
-                                )
-                                try:
-                                    tapping_zones = self.elements['hicon_melting_0'].get_property(
-                                        'tapping-zone-count'
-                                    )
-                                    deslagging_zones = self.elements['hicon_melting_0'].get_property(
-                                        'deslagging-zone-count'
-                                    )
-                                    spectro_zones = self.elements['hicon_melting_0'].get_property(
-                                        'spectro-zone-count'
-                                    )
-                                    logger.info(
-                                        "Stream 0: C++ melting config applied "
-                                        "(len=%d, zones=%s/%s/%s)",
-                                        len(self.stream0_melting_config_ini),
-                                        tapping_zones,
-                                        deslagging_zones,
-                                        spectro_zones,
-                                    )
-                                except Exception:
-                                    logger.exception(
-                                        "Stream 0: Failed to read melting plugin zone counts "
-                                        "after config-ini apply"
-                                    )
-                                logger.info(
-                                    "Stream 0: C++ melting plugin created (hicon_melting_detect)"
-                                )
-                            else:
-                                logger.error(
-                                    "Stream 0: Failed to create hicon_melting_detect element"
-                                )
-                        self.elements['analysis_sink0'] = Gst.ElementFactory.make(
-                            "fakesink", "analysis-sink0"
-                        )
-                        self.elements['analysis_sink0'].set_property('sync', False)
-                        self.elements['analysis_sink0'].set_property('async', False)
-                        logger.info(
-                            "Stream 0: decoupled analysis mode — NV12 tee "
-                            "(display NV12 → nvosd_0, leaky NV12 analysis branch)"
-                        )
-                    else:
-                        logger.info(
-                            "Stream 0: decoupled analysis mode — NV12 tee "
-                            "(analysis branch disabled for isolation)"
-                        )
+                self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make(
+                    "nvvideoconvert", "nvvidconv-osd-0"
+                )
+                if not self.use_nvurisrcbin_0:
+                    self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
                 else:
-                    # Non-decoupled: single NV12→RGBA conversion, no pre-OSD tee.
-                    self.elements['nvvidconv_osd_0'] = Gst.ElementFactory.make(
-                        "nvvideoconvert", "nvvidconv-osd-0"
-                    )
-                    if not self.use_nvurisrcbin_0:
-                        self._tune_stream0_postmux_convert_for_cp_plus(self.elements['nvvidconv_osd_0'])
-                    else:
-                        logger.info(
-                            "Stream 0: skipping CP Plus postmux-convert tuning for nvurisrcbin "
-                            "(VIC path — Edge_Optimization_Plan.md Phase 0.5)"
-                        )
-                    self.elements['caps_osd_0'] = Gst.ElementFactory.make("capsfilter", "caps-osd-0")
-                    self.elements['caps_osd_0'].set_property(
-                        'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
-                    )
-                    self.elements['preosdq0'] = Gst.ElementFactory.make("queue", "preosdq0")
-                    self._configure_leaky_queue(self.elements['preosdq0'])
                     logger.info(
-                        "Stream 0 (CP Plus): post-mux isolation queues enabled "
-                        "(postmuxq0, preosdq0, leaky=2, max-size-buffers=16)"
+                        "Stream 0: skipping CP Plus postmux-convert tuning for nvurisrcbin "
+                        "(VIC path — Edge_Optimization_Plan.md Phase 0.5)"
                     )
+                self.elements['caps_osd_0'] = Gst.ElementFactory.make("capsfilter", "caps-osd-0")
+                self.elements['caps_osd_0'].set_property(
+                    'caps', Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+                )
+                self.elements['preosdq0'] = Gst.ElementFactory.make("queue", "preosdq0")
+                self._configure_leaky_queue(self.elements['preosdq0'])
+                logger.info(
+                    "Stream 0 (CP Plus): post-mux isolation queues enabled "
+                    "(postmuxq0, preosdq0, leaky=2, max-size-buffers=16)"
+                )
                 if self.stream0_bypass_pgie:
                     logger.warning("Stream 0 (CP Plus): bypassing pgie_pouring and tracker_0 for diagnostic run")
                 elif self.stream0_bypass_tracker:
@@ -1710,51 +1621,16 @@ class DeepStreamPipelineBuilder:
                         stream0_head = 'nvvidconv_pre_tracker_0'
                     chain_0.append((stream0_head, 'tracker_0'))
                     stream0_head = 'tracker_0'
-                if self.stream0_decoupled_analysis_mode:
-                    chain_0.append((stream0_head, 'tee_stream0_analysis'))
-                else:
-                    chain_0.extend([
-                        (stream0_head, 'nvvidconv_osd_0'),
-                        ('nvvidconv_osd_0', 'caps_osd_0'),
-                        ('caps_osd_0', 'preosdq0'),
-                        ('preosdq0', 'nvosd_0'),
-                    ])
+                chain_0.extend([
+                    (stream0_head, 'nvvidconv_osd_0'),
+                    ('nvvidconv_osd_0', 'caps_osd_0'),
+                    ('caps_osd_0', 'preosdq0'),
+                    ('preosdq0', 'nvosd_0'),
+                ])
                 for src_name, dst_name in chain_0:
                     if not self.elements[src_name].link(self.elements[dst_name]):
                         logger.error(f"Failed to link {src_name} -> {dst_name}")
                         return False
-                if self.stream0_decoupled_analysis_mode:
-                    if not self._link_tee_src_to_element('tee_stream0_analysis', 'displayq0'):
-                        return False
-                    display_chain = []
-                    display_head = 'displayq0'
-                    display_chain.append((display_head, 'nvosd_0'))
-                    for src_name, dst_name in display_chain:
-                        if not self.elements[src_name].link(self.elements[dst_name]):
-                            logger.error(f"Failed to link {src_name} -> {dst_name}")
-                            return False
-                    if self.stream0_analysis_branch_enabled:
-                        if not self._link_tee_src_to_element('tee_stream0_analysis', 'analysisq0'):
-                            return False
-                        analysis_chain = []
-                        analysis_head = 'analysisq0'
-                        if 'hicon_melting_0' in self.elements and self.elements.get('hicon_melting_0'):
-                            analysis_chain.append((analysis_head, 'hicon_melting_0'))
-                            analysis_head = 'hicon_melting_0'
-                            logger.info(
-                                "Stream 0: C++ melting plugin placed on analysis branch "
-                                "(metadata-only CUDA path)"
-                            )
-                        analysis_chain.append((analysis_head, 'analysis_sink0'))
-                        for src_name, dst_name in analysis_chain:
-                            if not self.elements[src_name].link(self.elements[dst_name]):
-                                logger.error(f"Failed to link {src_name} -> {dst_name}")
-                                return False
-                    else:
-                        logger.info(
-                            "Stream 0: analysis branch omitted for isolation; only display path "
-                            "linked from tee_stream0_analysis"
-                        )
 
                 if self.stream0_annotated_tee_enabled:
                     # Split annotated stream: display path + optional recording/relay branches

@@ -394,7 +394,7 @@ def _resolve_frame_timestamp(gst_buffer, frame_meta, fallback_stream_id):
 # ---------------------------------------------------------------------------
 # Pad probe callbacks
 # ---------------------------------------------------------------------------
-def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_path=False):
+def _process_stream0_cpu_analysis(info, update_main_path=False):
     """Run Stream 0 CPU frame extraction and processors on the provided buffer."""
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -413,11 +413,8 @@ def _process_stream0_cpu_analysis(info, update_main_path=False, update_analysis_
                 break
 
             native_melting_state = None
-            if bus_handler:
-                if update_main_path:
-                    bus_handler.update_frame_time(0)
-                if update_analysis_path:
-                    bus_handler.update_stream0_analysis_time()
+            if bus_handler and update_main_path:
+                bus_handler.update_frame_time(0)
 
             if melting_meta_reader is not None:
                 try:
@@ -571,11 +568,7 @@ def osd_sink_pad_probe_stream0(pad, info):
     Frame is extracted once and shared by both processors.
     CRITICAL: unmap_nvds_buf_surface() MUST be called on Jetson.
     """
-    return _process_stream0_cpu_analysis(
-        info,
-        update_main_path=True,
-        update_analysis_path=False,
-    )
+    return _process_stream0_cpu_analysis(info, update_main_path=True)
 
 
 def osd_sink_pad_probe_stream0_heartbeat_main(pad, info):
@@ -592,37 +585,6 @@ def osd_sink_pad_probe_stream0_heartbeat_main(pad, info):
 def osd_sink_pad_probe_stream0_heartbeat(pad, info):
     """Backward-compatible Stream 0 heartbeat probe used by diagnostic modes."""
     return osd_sink_pad_probe_stream0_heartbeat_main(pad, info)
-
-
-def osd_sink_pad_probe_stream0_display_meta(pad, info):
-    """Main-path display meta writer for decoupled analysis mode + active recording.
-
-    Reads cached overlay state from analysis processors (populated by the analysis branch
-    probe) and writes NvDsDisplayMeta so nvosd_0 renders detections, probe circles, and
-    brightness status into the recording branch (tee_0 → rec-valve → …).
-
-    Zero analysis computation — purely struct writes (~200 µs/frame).
-    Also ticks the per-stream watchdog (replaces heartbeat_main).
-    """
-    gst_buffer = info.get_buffer()
-    if not gst_buffer:
-        return Gst.PadProbeReturn.OK
-
-    # Overlays are now drawn via CPU/OpenCV in post_osd_probe_stream0_for_streaming.
-    # nvosd receives no display_meta and acts as a pure pass-through — eliminating
-    # the CUDA GPU state accumulation that caused ~70-min crashes.
-    if bus_handler:
-        bus_handler.update_frame_time(0)
-    return Gst.PadProbeReturn.OK
-
-
-def analysis_pad_probe_stream0_cpu(pad, info):
-    """Run Stream 0 CPU analysis on the decoupled NV12 side branch."""
-    return _process_stream0_cpu_analysis(
-        info,
-        update_main_path=False,
-        update_analysis_path=True,
-    )
 
 
 def _mark_stream0_stage(stage_name, info):
@@ -1379,29 +1341,20 @@ def main():
     cpp_melting_plugin_path = str(
         Path(__file__).parent / 'custom_plugins' / 'hicon_melting' / 'libgsthiconmelting.so'
     )
+    # USE_CUDA_BRIGHTNESS is the single global switch for CUDA brightness across all
+    # streams (Stream 0 and Stream 2 both check use_safe_cuda_brightness below).
     requested_cuda_brightness = bool(config.USE_CUDA_BRIGHTNESS)
-    safe_cuda_topology_ready = (
-        config.STREAM_0_DECOUPLED_ANALYSIS_MODE
-        and config.STREAM_0_ANALYSIS_BRANCH_ENABLED
-        and config.STREAM_0_ANALYSIS_PROBE_ENABLED
-    )
     use_safe_cuda_brightness = False
     if requested_cuda_brightness:
-        if not safe_cuda_topology_ready:
+        try:
+            Gst.Plugin.load_file(cpp_melting_plugin_path)
+            use_safe_cuda_brightness = True
+            logger.info("C++ melting plugin loaded: %s", cpp_melting_plugin_path)
+        except Exception as e:
             logger.warning(
-                "CUDA brightness requested, but the safe NV12 analysis topology is unavailable; "
-                "falling back to CPU brightness"
+                "Safe CUDA brightness plugin not available (%s), falling back to CPU brightness",
+                e,
             )
-        else:
-            try:
-                Gst.Plugin.load_file(cpp_melting_plugin_path)
-                use_safe_cuda_brightness = True
-                logger.info("C++ melting plugin loaded: %s", cpp_melting_plugin_path)
-            except Exception as e:
-                logger.warning(
-                    "Safe CUDA brightness plugin not available (%s), falling back to CPU brightness",
-                    e,
-                )
 
     # Create output directories
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1438,11 +1391,6 @@ def main():
         int(getattr(config, "STREAM_1_MUX_WIDTH", 1280)),
         int(getattr(config, "STREAM_1_MUX_HEIGHT", 720)),
     )
-    melting_plugin_config_ini = _serialize_melting_plugin_config(
-        stream0_zones_config,
-        target_width=int(getattr(config, "STREAM_0_MUX_WIDTH", 1280)),
-        target_height=int(getattr(config, "STREAM_0_MUX_HEIGHT", 720)),
-    )
     melting_plugin_config_ini_2 = _serialize_melting_plugin_config(
         stream2_zones_config,
         target_width=int(getattr(config, "STREAM_2_MUX_WIDTH", 1280)),
@@ -1461,24 +1409,6 @@ def main():
     heat_cycle_manager_2 = heat_cycle_manager
 
     # Initialize processors
-    # Enable display_meta when recording is active so overlay state is computed on the
-    # analysis branch and then re-written onto the main path by the recording display_meta
-    # probe.  In recording-off + decoupled mode there is no benefit to generating overlay
-    # data that would be discarded at analysis_sink0, so keep it disabled.
-    stream0_enable_display_meta = (
-        config.ENABLE_INFERENCE_VIDEO or not config.STREAM_0_DECOUPLED_ANALYSIS_MODE
-    )
-    if config.STREAM_0_DECOUPLED_ANALYSIS_MODE:
-        if config.ENABLE_INFERENCE_VIDEO:
-            logger.info(
-                "Stream 0: Display meta enabled on analysis branch for recording overlay "
-                "(decoupled mode + ENABLE_INFERENCE_VIDEO)"
-            )
-        else:
-            logger.info(
-                "Stream 0: CPU-generated display meta disabled (decoupled mode, recording off)"
-            )
-
     use_cuda_brightness = use_safe_cuda_brightness
 
     if config.ENABLE_STREAM_0_BRIGHTNESS_PROCESSOR:
@@ -1490,7 +1420,7 @@ def main():
                 config=config,
                 screenshot_dir=str(config.SCREENSHOT_DIR),
                 heat_cycle_manager=heat_cycle_manager,
-                enable_display_meta=stream0_enable_display_meta,
+                enable_display_meta=True,
                 screenshot_writer=screenshot_writer,
             )
             brightness_processor = melting_controller
@@ -1505,7 +1435,7 @@ def main():
                 config=config,
                 screenshot_dir=str(config.SCREENSHOT_DIR),
                 heat_cycle_manager=heat_cycle_manager,
-                enable_display_meta=stream0_enable_display_meta,
+                enable_display_meta=True,
                 screenshot_writer=screenshot_writer,
             )
             logger.info("Stream 0: CPU brightness processor initialized (NumPy)")
@@ -1535,7 +1465,7 @@ def main():
                 config=config,
                 screenshot_dir=str(config.SCREENSHOT_DIR),
                 heat_cycle_manager=heat_cycle_manager,
-                enable_display_meta=stream0_enable_display_meta,
+                enable_display_meta=True,
                 screenshot_writer=screenshot_writer,
             )
             logger.info("Stream 0: Pouring processor initialized")
@@ -1674,10 +1604,6 @@ def main():
         'stream_0_postmux_only_mode': config.STREAM_0_POSTMUX_ONLY_MODE,
         'stream_0_postconv_only_mode': config.STREAM_0_POSTCONV_ONLY_MODE,
         'stream_0_preosd_only_mode': config.STREAM_0_PREOSD_ONLY_MODE,
-        'stream_0_decoupled_analysis_mode': config.STREAM_0_DECOUPLED_ANALYSIS_MODE,
-        'stream_0_analysis_branch_enabled': config.STREAM_0_ANALYSIS_BRANCH_ENABLED,
-        'stream_0_analysis_rgba_enabled': config.STREAM_0_ANALYSIS_RGBA_ENABLED,
-        'stream_0_analysis_probe_enabled': config.STREAM_0_ANALYSIS_PROBE_ENABLED,
         'stream_0_mux_width': config.STREAM_0_MUX_WIDTH,
         'stream_0_mux_height': config.STREAM_0_MUX_HEIGHT,
         'stream_1_mux_width': config.STREAM_1_MUX_WIDTH,
@@ -1717,7 +1643,6 @@ def main():
         'udp_loopback_port_0': config.UDP_LOOPBACK_PORT_0,
         'udp_loopback_port_2': config.UDP_LOOPBACK_PORT_2,
         'use_safe_cuda_brightness': use_safe_cuda_brightness,
-        'stream_0_melting_config_ini': melting_plugin_config_ini,
         'stream_2_melting_config_ini': melting_plugin_config_ini_2,
     }
 
@@ -1759,7 +1684,6 @@ def main():
         pipeline,
         loop,
         healthcheck_url=config.HEALTHCHECK_URL,
-        stream0_decoupled_analysis_mode=config.STREAM_0_DECOUPLED_ANALYSIS_MODE,
         stream_policies=stream_policies,
         stream0_segment_buffer_mode=config.USE_SEGMENT_BUFFER_0,
         stream0_segment_buffer_state_path=stream0_segment_buffer_state_path,
@@ -1962,33 +1886,7 @@ def main():
     if 'nvosd_0' in elements and elements['nvosd_0']:
         osd_sinkpad = elements['nvosd_0'].get_static_pad("sink")
         if osd_sinkpad:
-            if config.STREAM_0_DECOUPLED_ANALYSIS_MODE:
-                if config.ENABLE_STREAM_0_PROBE and not config.STREAM_0_ANALYSIS_PROBE_ENABLED:
-                    osd_sinkpad.add_probe(
-                        Gst.PadProbeType.BUFFER,
-                        osd_sink_pad_probe_stream0,
-                    )
-                    logger.info(
-                        "Stream 0: Main-path CPU analysis fallback attached "
-                        "(decoupled mode, analysis side probe disabled)"
-                    )
-                else:
-                    if config.ENABLE_INFERENCE_VIDEO:
-                        osd_sinkpad.add_probe(
-                            Gst.PadProbeType.BUFFER,
-                            osd_sink_pad_probe_stream0_display_meta,
-                        )
-                        logger.info(
-                            "Stream 0: Display meta writer probe attached "
-                            "(decoupled analysis mode + recording active)"
-                        )
-                    else:
-                        osd_sinkpad.add_probe(
-                            Gst.PadProbeType.BUFFER,
-                            osd_sink_pad_probe_stream0_heartbeat_main,
-                        )
-                        logger.info("Stream 0: Main-path heartbeat probe attached (decoupled analysis mode)")
-            elif config.ENABLE_STREAM_0_PROBE:
+            if config.ENABLE_STREAM_0_PROBE:
                 osd_sinkpad.add_probe(
                     Gst.PadProbeType.BUFFER,
                     osd_sink_pad_probe_stream0,
@@ -2003,53 +1901,7 @@ def main():
                     "Stream 0: OSD sink pad probe disabled for diagnostics "
                     "(heartbeat-only probe attached)"
                 )
-    if (
-        config.STREAM_0_DECOUPLED_ANALYSIS_MODE
-        and config.STREAM_0_ANALYSIS_BRANCH_ENABLED
-        and config.STREAM_0_ANALYSIS_PROBE_ENABLED
-    ):
-        # Frames on the analysis branch are NV12 (no nvvideoconvert in decoupled mode).
-        # Probe attaches to the analysis branch terminal: after C++ plugin if present, else analysisq0.
-        if 'hicon_melting_0' in elements and elements['hicon_melting_0']:
-            analysis_probe_pad = elements['hicon_melting_0'].get_static_pad("src")
-        elif 'hicon_pouring_0' in elements and elements['hicon_pouring_0']:
-            analysis_probe_pad = elements['hicon_pouring_0'].get_static_pad("src")
-        elif 'analysisq0' in elements and elements['analysisq0']:
-            analysis_probe_pad = elements['analysisq0'].get_static_pad("src")
-        else:
-            analysis_probe_pad = None
-        if analysis_probe_pad:
-            if config.ENABLE_STREAM_0_PROBE:
-                analysis_probe_pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    analysis_pad_probe_stream0_cpu,
-                )
-                logger.info(
-                    "Stream 0: Analysis branch probe attached "
-                    "(pouring + brightness + spectro on NV12 analysis branch)"
-                )
-            else:
-                logger.warning(
-                    "Stream 0: Analysis branch probe disabled in decoupled mode "
-                    "(main-path heartbeat remains attached)"
-                )
-    elif config.STREAM_0_DECOUPLED_ANALYSIS_MODE and not config.STREAM_0_ANALYSIS_BRANCH_ENABLED:
-        logger.info(
-            "Stream 0: Analysis branch disabled for isolation; skipping analysis probe "
-            "and C++ pouring meta reader on Stream 0"
-        )
-    elif config.STREAM_0_DECOUPLED_ANALYSIS_MODE and config.STREAM_0_ANALYSIS_BRANCH_ENABLED:
-        if config.ENABLE_STREAM_0_PROBE and not config.STREAM_0_ANALYSIS_PROBE_ENABLED:
-            logger.info(
-                "Stream 0: Analysis side probe disabled; CPU analysis is running on the "
-                "main path while the side branch remains shell-only"
-            )
-        else:
-            logger.info(
-                "Stream 0: Analysis branch probe disabled for staged isolation "
-                "(main-path heartbeat remains attached)"
-            )
-    elif 'decode_sink_0' in elements and elements['decode_sink_0']:
+    if 'decode_sink_0' in elements and elements['decode_sink_0']:
         decode_sinkpad = elements['decode_sink_0'].get_static_pad("sink")
         if decode_sinkpad:
             decode_sinkpad.add_probe(

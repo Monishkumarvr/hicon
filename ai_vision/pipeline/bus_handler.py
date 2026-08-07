@@ -58,7 +58,7 @@ class BusHandler:
     """Handle GStreamer bus messages with RTSP-aware error recovery."""
 
     def __init__(self, pipeline, loop, healthcheck_url="",
-                 stream0_decoupled_analysis_mode=False, stream_policies=None,
+                 stream_policies=None,
                  stream0_segment_buffer_mode=False, stream0_segment_buffer_state_path="",
                  stream0_startup_grace_sec=None, stream_startup_grace_overrides=None,
                  stream_segment_buffer_state_paths=None,
@@ -74,7 +74,6 @@ class BusHandler:
             pipeline: GStreamer pipeline
             loop: GLib MainLoop
             healthcheck_url: healthchecks.io ping URL (empty = disabled)
-            stream0_decoupled_analysis_mode: Whether Stream 0 uses a side analysis branch
             stream_policies: {stream_id: 'restart'|'warn'} per-stream 0fps policy
             stream0_segment_buffer_mode: Whether Stream 0 uses delayed segment buffering
             stream0_segment_buffer_state_path: JSON state file published by the helper
@@ -86,14 +85,11 @@ class BusHandler:
         self.pipeline = pipeline
         self.loop = loop
         self.last_frame_time = {}
-        self.stream0_decoupled_analysis_mode = bool(stream0_decoupled_analysis_mode)
         self.stream0_segment_buffer_mode = bool(stream0_segment_buffer_mode)
         self.stream0_segment_buffer_state_path = (
             Path(stream0_segment_buffer_state_path)
             if stream0_segment_buffer_state_path else None
         )
-        self.stream0_analysis_last_time = None
-        self.stream0_analysis_count = 0
         self.stream0_stage_last_time = {}
         self.stream0_stage_pts = {}
         self.stale_threshold_sec = 600  # 10 min watchdog
@@ -512,11 +508,6 @@ class BusHandler:
         self.last_frame_time[stream_id] = time.time()
         self._frame_counts[stream_id] = self._frame_counts.get(stream_id, 0) + 1
 
-    def update_stream0_analysis_time(self):
-        """Call from the Stream 0 CPU analysis branch to track side-branch liveness."""
-        self.stream0_analysis_last_time = time.time()
-        self.stream0_analysis_count += 1
-
     def update_stream0_stage_time(self, stage_name):
         """Track liveness of a specific Stream 0 pipeline stage."""
         self.update_stream0_stage_sample(stage_name, None)
@@ -673,13 +664,6 @@ class BusHandler:
                     self._last_source_signal_time.pop(sid, None)
 
             logger.info("[FPS] " + " | ".join(parts))
-            if self.stream0_decoupled_analysis_mode and 0 in self.last_frame_time:
-                main_last = self.last_frame_time.get(0)
-                analysis_last = self.stream0_analysis_last_time
-                main_age = f"{(now - main_last):.2f}s" if main_last else "n/a"
-                analysis_age = f"{(now - analysis_last):.2f}s" if analysis_last else "n/a"
-                logger.info(f"[S0-DIAG] main_age={main_age} analysis_age={analysis_age}")
-                self.stream0_analysis_count = 0
             if self.stream0_stage_last_time:
                 stage_parts = []
                 for stage_name in _STREAM0_STAGE_ORDER:
