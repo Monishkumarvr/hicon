@@ -47,6 +47,16 @@ class HeatCycle:
     # Pouring aggregation
     mould_pourings: List[MouldPouringRecord] = field(default_factory=list)
 
+    # Pour window, tracked independently of mould attribution. A pour whose probe
+    # never landed inside a detected mould bbox is deliberately left unattributed
+    # (containment-only rule), but it still happened and we know exactly when —
+    # without this, a cycle where every pour went unattributed reported no pouring
+    # at all and never synced.
+    pour_window_start_datetime: Optional[datetime] = None
+    pour_window_end_datetime: Optional[datetime] = None
+    pour_total_seconds: float = 0.0
+    pour_count: int = 0
+
     # Cycle state
     cycle_active: bool = True  # False when finalized
     has_pouring_session: bool = False
@@ -354,6 +364,10 @@ class HeatCycleManager:
             'spectro_events': cycle.spectro_events,
             'pyrometer_events': cycle.pyrometer_events,
             'locked_trolley_id': cycle.locked_trolley_id,
+            'pour_window_start_datetime': self._dt_iso(cycle.pour_window_start_datetime),
+            'pour_window_end_datetime': self._dt_iso(cycle.pour_window_end_datetime),
+            'pour_total_seconds': cycle.pour_total_seconds,
+            'pour_count': cycle.pour_count,
             'mould_pourings': [
                 {
                     'mould_id': p.mould_id,
@@ -401,6 +415,12 @@ class HeatCycleManager:
             cycle_start_datetime=_dt(d.get('cycle_start_datetime')),
             furnace_label=d.get('furnace_label'),
             mould_pourings=mould_pourings,
+            # .get() with defaults: checkpoints written before these fields existed
+            # must still load cleanly.
+            pour_window_start_datetime=_dt(d.get('pour_window_start_datetime')),
+            pour_window_end_datetime=_dt(d.get('pour_window_end_datetime')),
+            pour_total_seconds=d.get('pour_total_seconds', 0.0) or 0.0,
+            pour_count=d.get('pour_count', 0) or 0,
             cycle_active=True,
             has_pouring_session=d.get('has_pouring_session', False),
             last_pouring_presence_time=d.get('last_pouring_presence_time'),
@@ -837,6 +857,33 @@ class HeatCycleManager:
         self._maybe_checkpoint()
         return cycle.heat_no
 
+    def record_pour_window(
+        self,
+        start_datetime: datetime,
+        end_datetime: datetime,
+        duration_seconds: float,
+    ) -> None:
+        """Record that a pour happened, regardless of which mould it hit.
+
+        Mould attribution is allowed to fail — the containment-only rule declines
+        to guess when the ladle probe never lands inside a detected mould bbox.
+        The pour itself is not in doubt, so its timing is tracked here separately
+        and used by _finalize_cycle when nothing could be attributed.
+        """
+        cycle = self.active_cycle
+        if cycle is None:
+            return
+
+        if start_datetime is not None:
+            if cycle.pour_window_start_datetime is None or start_datetime < cycle.pour_window_start_datetime:
+                cycle.pour_window_start_datetime = start_datetime
+        if end_datetime is not None:
+            if cycle.pour_window_end_datetime is None or end_datetime > cycle.pour_window_end_datetime:
+                cycle.pour_window_end_datetime = end_datetime
+        cycle.pour_total_seconds += max(0.0, float(duration_seconds or 0.0))
+        cycle.pour_count += 1
+        self._maybe_checkpoint()
+
     def prune_tracker_mould_pourings(self, valid_mould_ids) -> int:
         """Drop tracker-sourced mould records the processor no longer knows about.
 
@@ -930,8 +977,8 @@ class HeatCycleManager:
         cycle.cycle_active = False
         cycle.cycle_end_time = end_time
         cycle.cycle_end_datetime = end_datetime
-        
-        if not cycle.mould_pourings and not cycle.tapping_events:
+
+        if not cycle.mould_pourings and not cycle.tapping_events and not cycle.pour_count:
             logger.warning(f"Cycle {cycle.heat_no} has no pourings or tapping events")
             cycle.total_pouring_time = 0
             cycle.mould_wise_pouring_time = []
@@ -969,7 +1016,28 @@ class HeatCycleManager:
         if not cycle.mould_pourings:
             cycle.total_pouring_time = 0
             cycle.mould_wise_pouring_time = []
-        
+
+        # Every pour in this cycle went unattributed (containment-only rule declined
+        # to guess) — fall back to the pour window so the cycle still reports that
+        # pouring happened and when, just with no mould breakdown, instead of
+        # reporting no pouring at all.
+        if cycle.pouring_start_time is None and cycle.pour_count > 0:
+            cycle.pouring_start_time = cycle.pour_window_start_datetime
+            cycle.pouring_end_time = cycle.pour_window_end_datetime
+            cycle.total_pouring_time = int(cycle.pour_total_seconds)
+            logger.info(
+                "  ⚠️  %s: %d pour(s) totalling %ds recorded with no mould attribution — "
+                "using pour window for timing",
+                cycle.heat_no, cycle.pour_count, cycle.total_pouring_time,
+            )
+
+        if cycle.pour_count > 0 and cycle.pouring_start_time is None:
+            logger.error(
+                "  Cycle %s has %d recorded pour(s) but pouring_start_time is still "
+                "unset after fallback — this should be unreachable",
+                cycle.heat_no, cycle.pour_count,
+            )
+
         # Move to finalized cycles
         self.finalized_cycles[cycle.heat_no] = cycle
         

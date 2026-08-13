@@ -509,3 +509,105 @@ def test_pouring_processor_inserts_heat_cycle_with_empty_ladle_number(tmp_path):
     assert inserted["location"] == "Loc Furnace1"
     assert inserted["pouring_start_time"] == ""
     assert inserted["pouring_end_time"] == ""
+
+# ---------------------------------------------------------------------------
+# Pour window fallback when no mould gets attributed (hicon-7ha)
+# ---------------------------------------------------------------------------
+
+def test_unattributed_pours_still_populate_pouring_window(tmp_path):
+    """A pour whose probe never lands inside a detected mould bbox is left
+    unattributed on purpose (containment-only rule) -- but it still happened,
+    and _finalize_cycle used to derive pouring_start_time/end/total exclusively
+    from mould_pourings, so an all-unattributed cycle reported no pouring at
+    all. record_pour_window() tracks the window independently and this must
+    be what _finalize_cycle falls back to."""
+    manager = HeatCycleManager(_make_db(tmp_path), ladle_absence_timeout=300.0)
+    start = datetime(2026, 8, 8, 15, 32, 43)
+    manager.update_pouring_session_presence(7, start.timestamp(), start)
+
+    manager.record_pour_window(start_datetime=start, end_datetime=start + timedelta(seconds=9),
+                                duration_seconds=9.0)
+    manager.record_pour_window(start_datetime=start + timedelta(seconds=24),
+                                end_datetime=start + timedelta(seconds=28), duration_seconds=4.0)
+
+    cycle = manager.active_cycle
+    assert cycle is not None
+    assert cycle.mould_pourings == []  # nothing attributed
+
+    manager._finalize_cycle(cycle, (start + timedelta(seconds=28)).timestamp(),
+                             start + timedelta(seconds=28))
+
+    assert cycle.pouring_start_time == start
+    assert cycle.pouring_end_time == start + timedelta(seconds=28)
+    assert cycle.total_pouring_time == 13  # 9 + 4
+    assert cycle.mould_wise_pouring_time == []
+
+
+def test_attributed_cycle_ignores_pour_window(tmp_path):
+    """Regression guard: when moulds ARE attributed, timing still comes from
+    mould_pourings as before -- the window is only a fallback."""
+    manager = HeatCycleManager(_make_db(tmp_path), ladle_absence_timeout=300.0)
+    start = datetime(2026, 8, 8, 10, 0, 0)
+
+    # A wider, wrong window that must NOT be what gets reported.
+    manager.record_pour_window(start_datetime=start - timedelta(seconds=100),
+                                end_datetime=start + timedelta(seconds=100), duration_seconds=200.0)
+    manager.upsert_completed_mould_pouring(
+        ladle_track_id=7, mould_id="MOULD_C1", mould_track_id=41,
+        start_time=start.timestamp(), start_datetime=start,
+        end_time=(start + timedelta(seconds=3)).timestamp(),
+        end_datetime=start + timedelta(seconds=3), duration_seconds=3.0,
+    )
+
+    cycle = manager.active_cycle
+    manager._finalize_cycle(cycle, (start + timedelta(seconds=3)).timestamp(),
+                             start + timedelta(seconds=3))
+
+    assert cycle.pouring_start_time == start
+    assert cycle.pouring_end_time == start + timedelta(seconds=3)
+    assert cycle.total_pouring_time == 3
+    assert len(cycle.mould_wise_pouring_time) == 1
+
+
+def test_unattributed_pours_with_no_tapping_are_not_dropped(tmp_path):
+    """The early-return guard used to fire on 'no moulds AND no tapping',
+    which would have swallowed a pours-but-no-tapping cycle entirely."""
+    manager = HeatCycleManager(_make_db(tmp_path), ladle_absence_timeout=300.0)
+    start = datetime(2026, 8, 8, 11, 6, 3)
+    manager.update_pouring_session_presence(7, start.timestamp(), start)
+
+    manager.record_pour_window(start_datetime=start, end_datetime=start + timedelta(seconds=7),
+                                duration_seconds=7.0)
+    cycle = manager.active_cycle
+    assert not cycle.tapping_events
+
+    manager._finalize_cycle(cycle, (start + timedelta(seconds=7)).timestamp(),
+                             start + timedelta(seconds=7))
+
+    assert cycle.pouring_start_time == start
+    assert cycle.total_pouring_time == 7
+
+
+def test_pour_window_survives_checkpoint_round_trip(tmp_path):
+    manager = HeatCycleManager(_make_db(tmp_path), ladle_absence_timeout=300.0)
+    start = datetime(2026, 8, 8, 9, 0, 0)
+    manager.update_pouring_session_presence(7, start.timestamp(), start)
+    manager.record_pour_window(start_datetime=start, end_datetime=start + timedelta(seconds=5),
+                                duration_seconds=5.0)
+
+    as_dict = manager._cycle_to_dict(manager.active_cycle)
+    restored = HeatCycleManager._cycle_from_dict(as_dict)
+    assert restored.pour_window_start_datetime == start
+    assert restored.pour_window_end_datetime == start + timedelta(seconds=5)
+    assert restored.pour_total_seconds == 5.0
+    assert restored.pour_count == 1
+
+    # A checkpoint written before these fields existed must still load.
+    stale = dict(as_dict)
+    for key in ("pour_window_start_datetime", "pour_window_end_datetime",
+                "pour_total_seconds", "pour_count"):
+        stale.pop(key, None)
+    restored_stale = HeatCycleManager._cycle_from_dict(stale)
+    assert restored_stale.pour_window_start_datetime is None
+    assert restored_stale.pour_total_seconds == 0.0
+    assert restored_stale.pour_count == 0

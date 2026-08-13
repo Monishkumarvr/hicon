@@ -2088,6 +2088,16 @@ class PouringProcessor:
 
         self.last_pour_duration = duration
 
+        # Record that this pour happened, independent of whether a mould gets
+        # attributed below — the containment-only rule can legitimately find no
+        # mould bbox under the probe, and that must not erase the pour's timing.
+        if self.heat_cycle_manager:
+            self.heat_cycle_manager.record_pour_window(
+                start_datetime=self.pour_start_datetime or effective_end_dt,
+                end_datetime=effective_end_dt,
+                duration_seconds=duration,
+            )
+
         # Commit the majority-voted mould across the whole pour, not just whatever
         # frame 1 happened to pick (see _mould_vote_counts comment at __init__).
         committed_tracker_id = (

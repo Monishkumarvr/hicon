@@ -769,6 +769,7 @@ def test_restore_seeds_slot_counter_past_restored_numbers(tmp_path):
         upsert_completed_mould_pouring=lambda **kwargs: None,
         prune_tracker_mould_pourings=lambda valid_mould_ids: 0,
         update_pouring_session_presence=lambda *args, **kwargs: None,
+        record_pour_window=lambda **kwargs: None,
     )
 
     proc = PouringProcessor(
