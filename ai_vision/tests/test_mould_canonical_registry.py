@@ -284,6 +284,49 @@ def test_merge_sweep_collapses_duplicates_and_keeps_poured(tmp_path):
     assert proc._canonical_merges_total == 1
 
 
+def test_merge_sweep_swap_case_does_not_crash_on_stale_outer_id(tmp_path):
+    """Regression: when the outer-loop id (ca) is the one dropped by the
+    'keep the poured id' swap, the inner loop must stop touching it instead of
+    re-indexing a canonical entry that was just popped (previously raised
+    KeyError on the next cb visited in the same sweep)."""
+    proc = _make_proc(tmp_path)
+    cid_a = _latch_one(proc, track_id=1, cx=500, cy=400)
+    # cid_c: co-located duplicate of cid_a, but already poured -> triggers the
+    # keep/drop swap (drop=cid_a) per the "keep the poured id" tie-break.
+    cid_c = proc._next_canonical_id
+    proc._next_canonical_id += 1
+    entry_a = proc._canonical_moulds[cid_a]
+    proc._canonical_moulds[cid_c] = {
+        "cid": cid_c,
+        "centroid_rel": entry_a["centroid_rel"],
+        "bbox": entry_a["bbox"],
+        "first_ts": 1005.0,
+        "last_seen_ts": 1005.0,
+        "hits": 3,
+        "tracker_ids": {77},
+    }
+    proc._poured_mould_ids.add(cid_c)
+    proc._poured_mould_durations[cid_c] = 5.0
+    # cid_d: an unrelated third entry, later in the sorted id list, so the
+    # inner loop has a further cb to visit after ca=cid_a gets dropped.
+    cid_d = proc._next_canonical_id
+    proc._next_canonical_id += 1
+    proc._canonical_moulds[cid_d] = {
+        "cid": cid_d,
+        "centroid_rel": (0.1, 0.1),
+        "bbox": (10, 10, 60, 60),
+        "first_ts": 1005.0,
+        "last_seen_ts": 1005.0,
+        "hits": 3,
+        "tracker_ids": {88},
+    }
+    proc._frame_count = 25  # sweep trigger
+    _feed(proc, [], 1006.0)  # must not raise KeyError
+    assert cid_a not in proc._canonical_moulds
+    assert cid_c in proc._canonical_moulds  # poured id survived the swap
+    assert cid_d in proc._canonical_moulds  # untouched third entry intact
+
+
 def test_one_to_one_single_obs_refreshes_only_one_entry(tmp_path):
     proc = _make_proc(tmp_path)
     cid_a = _latch_one(proc, track_id=1, cx=500, cy=400)

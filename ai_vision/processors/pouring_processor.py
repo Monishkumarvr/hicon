@@ -971,6 +971,8 @@ class PouringProcessor:
                 for cb in cids[i + 1:]:
                     if cb in removed:
                         continue
+                    if ca in removed:
+                        break
                     if self._canonical_same_mould(
                         self._canonical_moulds[ca], self._canonical_moulds[cb]
                     ):
