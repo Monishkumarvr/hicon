@@ -54,6 +54,27 @@ def _get_nvinfer_interval(env_name: str, config_filename: str, default: int) -> 
     return int(default)
 
 
+def _get_probe_offsets(env_name: str, default: list) -> list:
+    """Parse 'dx1:dy1,dx2:dy2,...' into a list of (dx, dy) int pairs; fall back
+    to default (and log a warning) on any malformed value."""
+    raw = os.getenv(env_name)
+    if not raw:
+        return default
+    try:
+        offsets = []
+        for pair in raw.split(','):
+            dx_str, dy_str = pair.split(':')
+            offsets.append((int(dx_str.strip()), int(dy_str.strip())))
+        return offsets or default
+    except (ValueError, IndexError):
+        logger.warning(
+            "Could not parse %s=%r as 'dx:dy,dx:dy,...'; using default offsets",
+            env_name,
+            raw,
+        )
+        return default
+
+
 # =============================================================================
 # API CONFIGURATION
 # =============================================================================
@@ -118,7 +139,12 @@ SESSION_END_DURATION = float(os.getenv('HICON_SESSION_END_DURATION', '1.5'))
 POUR_REF_WIDTH = int(os.getenv('HICON_POUR_REF_WIDTH', '1920'))
 POUR_REF_HEIGHT = int(os.getenv('HICON_POUR_REF_HEIGHT', '1080'))
 POUR_PROBE_OFFSET_PX = int(os.getenv('HICON_POUR_PROBE_OFFSET', '30'))
-POUR_PROBE_RADIUS_PX = int(os.getenv('HICON_POUR_PROBE_RADIUS', '8'))
+# Widened from 8 (2026-08): at the common 1280px-wide runtime mux, the reference-
+# space radius scaled down to ~5px — narrow enough that a thin or laterally-
+# drifted molten stream could miss every sampled patch entirely. Paired with the
+# mean->max aggregation change (_measure_multi_probe_brightness) so a bigger
+# patch also means more of it can legitimately catch a drifted stream.
+POUR_PROBE_RADIUS_PX = int(os.getenv('HICON_POUR_PROBE_RADIUS', '12'))
 POUR_BRIGHTNESS_START = int(os.getenv('HICON_POUR_BRIGHTNESS_START', '205'))
 POUR_BRIGHTNESS_END = int(os.getenv('HICON_POUR_BRIGHTNESS_END', '160'))
 POUR_START_DURATION = float(os.getenv('HICON_POUR_START_DURATION', '0.20'))
@@ -149,8 +175,25 @@ MOUTH_HOLD_S = float(os.getenv('HICON_MOUTH_HOLD_S', '0.4'))
 # How long to use frozen (phantom) trolley bbox when the real trolley disappears (e.g., occluded by ladle)
 PHANTOM_TROLLEY_TIMEOUT_S = float(os.getenv('HICON_PHANTOM_TROLLEY_TIMEOUT', '60.0'))
 
-# Multiple brightness probe offsets: (dx, dy) from mouth bottom-center
-POUR_PROBE_OFFSETS = [(0, 0), (12, 0), (-12, 0), (24, 0), (-24, 0)]
+# Minimum time the locked trolley must have been genuinely absent (not just bbox-mismatched)
+# before a relock onto a different track_id is classified as a real trolley handoff rather than
+# the same trolley re-identified after a brief occlusion/tracker-ID churn. A replacement trolley
+# parked in the same floor position scores high IoU against the departed one, so IoU alone can't
+# tell them apart — see _relock_trolley / hicon-jfb.
+TROLLEY_HANDOFF_MIN_ABSENCE_S = float(os.getenv('HICON_TROLLEY_HANDOFF_MIN_ABSENCE_S', '15.0'))
+
+# Multiple brightness probe offsets: (dx, dy) from mouth bottom-center, in
+# POUR_REF_WIDTH/HEIGHT reference space. Kept at the original 5-point ±24px
+# spread (2026-08) — the miss-on-drift bug is fixed by switching
+# _measure_multi_probe_brightness to max-of-patches instead of mean-of-patches
+# (mean-aggregation would dilute a legitimate centered hit whenever more/wider
+# offsets are added, since it requires the AVERAGE across every sampled point to
+# clear the threshold, not just one). Env-configurable ('dx:dy,dx:dy,...') for
+# site tuning without a redeploy.
+POUR_PROBE_OFFSETS = _get_probe_offsets(
+    'HICON_POUR_PROBE_OFFSETS',
+    [(0, 0), (12, 0), (-12, 0), (24, 0), (-24, 0)],
+)
 POUR_PROBE_BELOW_PX = int(os.getenv('HICON_POUR_PROBE_BELOW_PX', '30'))
 
 # Pouring cycle timeout: mouth absent from locked trolley region (5 min)
@@ -404,6 +447,19 @@ MOULD_CANONICAL_EMA_ALPHA = float(os.getenv('HICON_MOULD_CANONICAL_EMA_ALPHA', '
 # Confidence hysteresis: latch requires a solid detection; refresh accepts weaker ones.
 MOULD_CANONICAL_LATCH_CONF = float(os.getenv('HICON_MOULD_CANONICAL_LATCH_CONF', '0.35'))
 MOULD_CANONICAL_REFRESH_CONF = float(os.getenv('HICON_MOULD_CANONICAL_REFRESH_CONF', '0.20'))
+# _canonical_adaptive_radius() divides a mould's own detected width by the trolley's
+# width to size its match/merge tolerance. Using the raw per-frame trolley width as
+# that denominator lets a trolley that's exiting frame (partially visible, shrinking
+# bbox) inflate the tolerance for every already-latched mould at once, causing
+# distinct, already-poured moulds to fall inside each other's match window and get
+# merged. This baseline snaps up instantly while the trolley is fully visible, and
+# decays by this factor per update while the raw width is smaller than the baseline
+# — so a momentary shrink (partial occlusion, exit in progress) can't inflate the
+# ratio the way an instantaneous width would. 0.985 ~= reaches half the true width
+# over ~46 updates before the tolerance would meaningfully loosen.
+MOULD_CANONICAL_WIDTH_BASELINE_DECAY = float(
+    os.getenv('HICON_MOULD_CANONICAL_WIDTH_BASELINE_DECAY', '0.985')
+)
 # Hide the raw (churning) mould rects on the OSD; canonical boxes render instead.
 MOULD_RAW_OVERLAY = os.getenv('HICON_MOULD_RAW_OVERLAY', 'false').lower() == 'true'
 # Max age (s) of a canonical entry's last sighting for it to be DRAWN on the

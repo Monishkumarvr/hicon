@@ -490,6 +490,59 @@ def test_handoff_prevents_new_trolley_mould_merging_into_old_poured_entry(tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# Same-position trolley swap (hicon-jfb): high IoU alone is not proof of "same
+# physical trolley" -- a replacement trolley parked in the exact same floor
+# spot scores just as high as the departed trolley re-identified after a brief
+# occlusion. Add a minimum-absence signal alongside IoU so a swap that took
+# long enough to physically execute is still classified as a handoff.
+# ---------------------------------------------------------------------------
+
+
+def test_relock_same_position_swap_after_long_absence_forces_handoff(tmp_path):
+    """A replacement trolley parked in the SAME spot (high IoU) must not
+    silently inherit the departed trolley's already-poured moulds once the
+    old trolley has been genuinely gone longer than the handoff threshold."""
+    proc = _make_proc(tmp_path)
+    proc.trolley_locked = True
+    proc.locked_trolley_id = 1
+    proc.locked_trolley_bbox = TROLLEY["bbox"]
+    proc.trolley_last_detected_time = 1000.0
+    cid = _latch_one(proc)
+    proc._poured_mould_ids.add(cid)
+
+    # Same bbox as the departed trolley -> high IoU -- but it's been gone 20s,
+    # well past the (default 15s) handoff absence threshold.
+    same_spot_trolley = {**TROLLEY, "track_id": 2, "bbox": TROLLEY["bbox"]}
+    proc._relock_trolley(same_spot_trolley, timestamp=1020.0, reason="missing_locked_id")
+
+    assert proc._canonical_handoffs_total == 1
+    assert not proc._canonical_moulds
+    # Heat-cumulative poured state must survive the handoff untouched.
+    assert cid in proc._poured_mould_ids
+    assert proc.locked_trolley_id == 2
+
+
+def test_relock_same_position_within_absence_window_preserves_registry(tmp_path):
+    """The same high-IoU same-spot relock, but the locked trolley was only
+    briefly gone (tracker-ID churn / short occlusion) -- must NOT be treated
+    as a handoff, preserving the existing brief-gap behavior."""
+    proc = _make_proc(tmp_path)
+    proc.trolley_locked = True
+    proc.locked_trolley_id = 1
+    proc.locked_trolley_bbox = TROLLEY["bbox"]
+    proc.trolley_last_detected_time = 1000.0
+    cid = _latch_one(proc)
+    proc._poured_mould_ids.add(cid)
+
+    same_spot_trolley = {**TROLLEY, "track_id": 2, "bbox": TROLLEY["bbox"]}
+    proc._relock_trolley(same_spot_trolley, timestamp=1005.0, reason="missing_locked_id")
+
+    assert proc._canonical_handoffs_total == 0
+    assert cid in proc._canonical_moulds
+    assert proc.locked_trolley_id == 2
+
+
+# ---------------------------------------------------------------------------
 # Trolley-bbox EMA continuity across a same-physical relock (2026-07-21 (3)):
 # replays the exact bboxes from the 2026-07-17 18:16 live collapse (poured_ids
 # 9->3 via an 8-merge cascade within 10s of a same-trolley relock). The EMA
@@ -881,3 +934,63 @@ def test_sync_with_no_tracker_records_prunes_nothing(tmp_path):
     proc._tracker_pour_records = {}
     proc._sync_mould_records_to_heat_cycle()
     assert len(manager.active_cycle.mould_pourings) == 1
+
+
+# ---------------------------------------------------------------------------
+# Trolley-exit width instability: _canonical_adaptive_radius divides a mould's
+# own bbox width by the trolley's width to size its match/merge tolerance. A
+# trolley exiting frame (partially visible, narrower detected bbox) must not be
+# allowed to inflate that denominator's shrink into a ballooned tolerance for
+# every already-latched mould at once -- that's what let distinct, already-
+# poured moulds fall inside each other's match window and get merged.
+# ---------------------------------------------------------------------------
+
+
+def test_trolley_width_baseline_resists_shrink_during_exit(tmp_path):
+    """A trolley exiting frame must not instantly collapse the width reference
+    _canonical_adaptive_radius divides by -- see MOULD_CANONICAL_WIDTH_BASELINE_DECAY.
+    An instant collapse would inflate the match/merge tolerance for every already-
+    latched mould simultaneously."""
+    proc = _make_proc(tmp_path)
+    full_trolley = {**TROLLEY, "bbox": (400, 300, 1000, 700)}  # width 600
+
+    for i in range(10):
+        proc._update_tracked_mould_observations([], full_trolley, 1000.0 + i * 0.1)
+    assert proc._trolley_width_baseline == pytest.approx(600.0, abs=1.0)
+
+    # Trolley partially exits -- detected bbox narrows sharply for a short burst.
+    narrow_trolley = {**TROLLEY, "bbox": (400, 300, 500, 700)}  # width 100
+    for i in range(10):
+        proc._update_tracked_mould_observations([], narrow_trolley, 1002.0 + i * 0.1)
+
+    # Baseline must have only eroded slightly, not collapsed to the raw 100px width.
+    assert proc._trolley_width_baseline > 450.0
+
+    # Trolley returns to full width -- baseline snaps back up immediately.
+    proc._update_tracked_mould_observations([], full_trolley, 1004.0)
+    assert proc._trolley_width_baseline == pytest.approx(600.0, abs=1.0)
+
+
+def test_adaptive_radius_stays_bounded_during_trolley_shrink(tmp_path):
+    """_canonical_adaptive_radius must not balloon toward its 0.12 cap just because
+    the trolley's raw detected width shrank for a few frames (exit in progress) --
+    the entry's own bbox width hasn't changed, only the pre-fix raw denominator
+    would have."""
+    proc = _make_proc(tmp_path)
+    full_trolley = {**TROLLEY, "bbox": (400, 300, 1000, 700)}  # width 600
+    for i in range(10):
+        proc._update_tracked_mould_observations([], full_trolley, 1000.0 + i * 0.1)
+
+    entry = {"bbox": (470, 470, 530, 530)}  # 60px-wide mould, matches _mould() default
+    radius_before = proc._canonical_adaptive_radius(entry)
+    assert radius_before == pytest.approx(0.08, abs=0.005)  # base match-radius floor
+
+    narrow_trolley = {**TROLLEY, "bbox": (400, 300, 500, 700)}  # width 100
+    for i in range(6):
+        proc._update_tracked_mould_observations([], narrow_trolley, 1002.0 + i * 0.1)
+
+    radius_after = proc._canonical_adaptive_radius(entry)
+    # Pre-fix this would have been 0.5 * (60/100) = 0.30, capped at 0.12 -- a 50%
+    # jump in tolerance for every latched mould simultaneously, after a single
+    # narrow-trolley frame. Post-fix it barely moves off the floor.
+    assert radius_after < 0.10

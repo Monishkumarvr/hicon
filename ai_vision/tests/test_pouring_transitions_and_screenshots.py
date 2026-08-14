@@ -398,6 +398,28 @@ def test_reference_probe_uses_v_channel_and_five_offsets(tmp_path):
     assert abs(brightness - 210.0) < 1.0
 
 
+def test_probe_catches_stream_landing_on_only_one_offset(tmp_path):
+    """A pour stream that only reaches the outer +24 probe patch (all four
+    other patches dark) must still register as pouring. Mean-of-patches would
+    average a lone bright patch down with four dark ones and miss it; the
+    fix switches to max-of-patches so one genuinely-lit patch is enough."""
+    proc = _make_proc(tmp_path)
+    frame = np.zeros((140, 220, 4), dtype=np.uint8)
+    base_x, base_y = 100, 60
+    bright = (230, 230, 230, 255)
+
+    dx, dy = 24, 0  # the outermost offset in the 5-point spread
+    px, py = base_x + dx, base_y + dy
+    r = proc.probe_radius
+    frame[py - r:py + r, px - r:px + r] = bright
+
+    brightness = proc._measure_multi_probe_brightness(frame, base_x, base_y)
+
+    # Mean-of-patches would give (0+0+0+230+0)/5 = 46, far below brightness_start.
+    assert brightness > proc.brightness_start
+    assert abs(brightness - 230.0) < 1.0
+
+
 def test_probe_brightness_accepts_float_probe_coordinates(tmp_path):
     proc = _make_proc(tmp_path)
     frame = np.zeros((120, 160, 4), dtype=np.uint8)

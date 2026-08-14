@@ -147,6 +147,7 @@ class PouringProcessor:
         self.relock_hold_s = 0.8
         self.phantom_trolley_timeout = config.PHANTOM_TROLLEY_TIMEOUT_S
         self.trolley_last_detected_time: Optional[float] = None  # last time trolley was physically seen (not phantom)
+        self.trolley_handoff_min_absence_s = float(getattr(config, 'TROLLEY_HANDOFF_MIN_ABSENCE_S', 15.0))
 
         # --- Session state ---
         self.session_active = False
@@ -236,6 +237,13 @@ class PouringProcessor:
         self._trolley_norm_ema: Optional[Tuple[float, float, float, float]] = None
         self._trolley_norm_ema_tid: Optional[int] = None
         self._last_trolley_norm_w: float = 0.0
+        # Slow-decaying "confirmed width" reference for _canonical_adaptive_radius —
+        # see MOULD_CANONICAL_WIDTH_BASELINE_DECAY for why this exists separately
+        # from the raw per-frame trolley width.
+        self.canonical_width_baseline_decay = float(
+            getattr(config, 'MOULD_CANONICAL_WIDTH_BASELINE_DECAY', 0.985)
+        )
+        self._trolley_width_baseline: float = 0.0
         self._active_raw_tracked_mould_id: Optional[int] = None
         self._poured_raw_mould_ids = set()
 
@@ -1052,7 +1060,19 @@ class PouringProcessor:
             )
             tw = max(float(tx2 - tx1), 1.0)
             th = max(float(ty2 - ty1), 1.0)
-            self._last_trolley_norm_w = tw
+            # Feed the adaptive-radius denominator through a slow-decaying baseline
+            # rather than the raw instantaneous width — see MOULD_CANONICAL_WIDTH_
+            # BASELINE_DECAY. Snaps up immediately when the trolley is as wide as
+            # (or wider than) its own recent baseline; decays slowly otherwise, so a
+            # trolley shrinking out of frame can't inflate everyone's match/merge
+            # tolerance on the way out.
+            if tw >= self._trolley_width_baseline:
+                self._trolley_width_baseline = tw
+            else:
+                self._trolley_width_baseline = max(
+                    tw, self._trolley_width_baseline * self.canonical_width_baseline_decay
+                )
+            self._last_trolley_norm_w = self._trolley_width_baseline
 
             for mould in moulds:
                 x1, y1, x2, y2 = mould['bbox']
@@ -1414,6 +1434,7 @@ class PouringProcessor:
         self._canonical_candidates.clear()
         self._trolley_norm_ema = None
         self._trolley_norm_ema_tid = None
+        self._trolley_width_baseline = 0.0
         self._canonical_handoffs_total += 1
         METRICS_REGISTRY.increment('mould.trolley_handoffs')
         logger.info(
@@ -1429,8 +1450,19 @@ class PouringProcessor:
         different physical trolley taking over — see _handle_trolley_handoff)."""
         prev_id = self.locked_trolley_id
         prev_bbox = self.locked_trolley_bbox
-        is_handoff = self.canonical_enabled and not self._is_same_physical_trolley(
-            prev_bbox, trolley['bbox']
+        # Absence is only usable as a signal once we actually have a prior sighting to
+        # measure from. Treating "unknown" as "infinitely absent" forces a handoff on
+        # every relock decided before trolley_last_detected_time is ever set (e.g. a
+        # restored/fresh processor state) even when nothing has genuinely changed —
+        # fall back to the IoU-only decision instead in that case.
+        if self.trolley_last_detected_time is not None:
+            absence_s = timestamp - self.trolley_last_detected_time
+            absence_expired = absence_s >= self.trolley_handoff_min_absence_s
+        else:
+            absence_s = 0.0
+            absence_expired = False
+        is_handoff = self.canonical_enabled and (
+            absence_expired or not self._is_same_physical_trolley(prev_bbox, trolley['bbox'])
         )
         self.locked_trolley_id = trolley['track_id']
         self.locked_trolley_bbox = trolley['bbox']
@@ -1442,7 +1474,8 @@ class PouringProcessor:
             self._handle_trolley_handoff(prev_id, trolley['track_id'])
         logger.info(
             f"[trolley] RELOCK T{prev_id} -> T{trolley['track_id']} "
-            f"at bbox {trolley['bbox']} ({reason})" + (" [HANDOFF]" if is_handoff else "")
+            f"at bbox {trolley['bbox']} ({reason}) absence={absence_s:.1f}s"
+            + (" [HANDOFF]" if is_handoff else "")
         )
 
     def _is_mouth_in_expanded_trolley(self, mouth, trolley):
@@ -1834,12 +1867,16 @@ class PouringProcessor:
         return selected_mouth
 
     def _measure_multi_probe_brightness(self, frame, base_x, base_y):
-        """Measure average brightness across multiple probe patches.
+        """Measure brightness across multiple probe patches.
 
-        Reference parity:
         - 5 probes around the mouth probe point
-        - patch score = HSV Value = max(R, G, B)
-        - frame score = mean of valid patch scores
+        - patch score = HSV Value = max(R, G, B), averaged within each patch
+        - frame score = MAX across patch scores (not mean — a mean requires the
+          whole spread to be lit at once, so a real but laterally-drifted or
+          narrow stream that only lands on one patch would get averaged down by
+          the other (dark) patches and never clear the threshold; max only needs
+          one patch to be genuinely on the stream. 2026-08 change — see hicon
+          probe-miss fix)
         """
         if frame is None:
             return 0.0
@@ -1870,10 +1907,11 @@ class PouringProcessor:
             rgb = roi[:, :, :3]
             values.append(float(np.mean(np.max(rgb, axis=2))))
 
-        return sum(values) / len(values) if values else 0.0
+        return max(values) if values else 0.0
 
     def _measure_multi_probe_brightness_nv12(self, frame, base_x, base_y):
-        """Measure reference-style V-channel brightness from a tiny NV12 ROI."""
+        """Measure V-channel brightness from a tiny NV12 ROI — see
+        _measure_multi_probe_brightness for the max-over-patches rationale."""
         visible_h = frame.shape[0] * 2 // 3
         w = frame.shape[1]
         r = self.probe_radius
@@ -1923,7 +1961,7 @@ class PouringProcessor:
             if roi.size == 0:
                 continue
             values.append(float(np.mean(np.max(roi, axis=2))))
-        return sum(values) / len(values) if values else 0.0
+        return max(values) if values else 0.0
 
     def _prepare_frame_for_annotation(self, frame):
         """Convert NV12 or RGBA frames into a screenshot-safe RGBA image."""
@@ -2322,6 +2360,7 @@ class PouringProcessor:
         self._canonical_candidates.clear()
         self._trolley_norm_ema = None
         self._trolley_norm_ema_tid = None
+        self._trolley_width_baseline = 0.0
         self.mouth_last_seen_in_trolley = None
         self.cycle_start_time = None
         self.cycle_start_datetime = None
