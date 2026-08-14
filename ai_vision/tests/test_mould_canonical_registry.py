@@ -10,6 +10,7 @@ import pytest
 from db_manager import HiConDatabase
 from processors.pouring_processor import PouringProcessor
 from state.heat_cycle_manager import HeatCycleManager, MouldPouringRecord
+from utils.metrics import REGISTRY as METRICS_REGISTRY
 
 
 class DummyDB:
@@ -325,6 +326,94 @@ def test_merge_sweep_swap_case_does_not_crash_on_stale_outer_id(tmp_path):
     assert cid_a not in proc._canonical_moulds
     assert cid_c in proc._canonical_moulds  # poured id survived the swap
     assert cid_d in proc._canonical_moulds  # untouched third entry intact
+
+
+# ---------------------------------------------------------------------------
+# Both-already-poured merge guard: a live-production incident showed two
+# distinct, already-independently-poured moulds drift together via ordinary
+# EMA refresh (no trolley handoff involved) until the sweep's geometric
+# duplicate test fired and destroyed one of them. A single physical mould can
+# only sit under one canonical id at a time, so two ids that each separately
+# accumulated their own committed pour must be two different physical moulds
+# -- merging them is never correct, however close their positions have drifted.
+# ---------------------------------------------------------------------------
+
+
+def _drive_drift_to_collision(proc, start_t=1002.0, steps=80, dt=0.2):
+    """Feed mould 1 (fixed at (550,500)) and mould 2 (walked from (850,500) to
+    (550,500)) every frame -- replicates the real incident's EMA convergence
+    via genuine _update_tracked_mould_observations calls, not seeded state."""
+    start_cx, target_cx = 850, 550
+    for i in range(steps):
+        frac = i / (steps - 1)
+        bx = int(round(start_cx + (target_cx - start_cx) * frac))
+        proc._frame_count += 1
+        _feed(proc, [_mould(1, 550, 500), _mould(2, bx, 500)], start_t + i * dt)
+
+
+def test_both_poured_entries_never_merge_even_after_drift(tmp_path):
+    proc = _make_proc(tmp_path)
+    # Latch two moulds far apart (rel 0.5 apart -- well outside the 0.06 merge
+    # threshold and the ~0.08 adaptive match radius). Latched sequentially, not
+    # simultaneously -- a separate, pre-existing bug in the candidate-latch
+    # loop mis-tracks `used_cands` indices when two candidates mature in the
+    # same frame (list.remove() mid-iteration shifts indices out from under
+    # it), which is out of scope for this fix.
+    for i in range(4):
+        _feed(proc, [_mould(1, 550, 500)], 1000.0 + i * 0.5)
+    for i in range(4):
+        _feed(proc, [_mould(2, 850, 500)], 1003.0 + i * 0.5)
+    assert len(proc._canonical_moulds) == 2
+    cid_a, cid_b = sorted(proc._canonical_moulds)
+
+    # Mark both independently poured with distinct durations, mirroring the
+    # real incident (6.7s / 5.2s committed pours before the merge).
+    proc._poured_mould_ids.add(cid_a)
+    proc._poured_mould_ids.add(cid_b)
+    proc._poured_mould_durations[cid_a] = 6.7
+    proc._poured_mould_durations[cid_b] = 5.2
+
+    _drive_drift_to_collision(proc)
+
+    entry_a = proc._canonical_moulds[cid_a]
+    entry_b = proc._canonical_moulds[cid_b]
+    d = proc._rel_dist(entry_a["centroid_rel"], entry_b["centroid_rel"])
+    iou = proc._bbox_iou(entry_a["bbox"], entry_b["bbox"])
+    # Confirm the drive sequence actually reached the geometric merge trigger --
+    # otherwise this test would pass vacuously without ever exercising the guard.
+    assert d < 0.06 or iou > 0.4
+
+    assert proc._canonical_merges_total == 0
+    assert cid_a in proc._canonical_moulds
+    assert cid_b in proc._canonical_moulds
+    assert proc._poured_mould_durations[cid_a] == 6.7
+    assert proc._poured_mould_durations[cid_b] == 5.2
+
+
+def test_both_poured_merge_blocked_metric_and_log(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    proc = _make_proc(tmp_path)
+    # Latched sequentially -- see test_both_poured_entries_never_merge_even_after_drift.
+    for i in range(4):
+        _feed(proc, [_mould(1, 550, 500)], 1000.0 + i * 0.5)
+    for i in range(4):
+        _feed(proc, [_mould(2, 850, 500)], 1003.0 + i * 0.5)
+    cid_a, cid_b = sorted(proc._canonical_moulds)
+    proc._poured_mould_ids.add(cid_a)
+    proc._poured_mould_ids.add(cid_b)
+
+    before = METRICS_REGISTRY.snapshot()["counters"].get(
+        "mould.canonical_merge_blocked_both_poured", 0
+    )
+    _drive_drift_to_collision(proc)
+    after = METRICS_REGISTRY.snapshot()["counters"].get(
+        "mould.canonical_merge_blocked_both_poured", 0
+    )
+
+    assert after > before
+    assert "MERGE BLOCKED (both already poured)" in caplog.text
 
 
 def test_one_to_one_single_obs_refreshes_only_one_entry(tmp_path):

@@ -984,6 +984,34 @@ class PouringProcessor:
                     if self._canonical_same_mould(
                         self._canonical_moulds[ca], self._canonical_moulds[cb]
                     ):
+                        if ca in self._poured_mould_ids and cb in self._poured_mould_ids:
+                            # Both sides already have an independently-committed pour.
+                            # A single physical mould can only sit under one canonical
+                            # id at a time, so for two ids to each separately
+                            # accumulate their own committed pour, two distinct bboxes
+                            # must have existed and been separately poured into -- that
+                            # is definitionally two different physical moulds. Merging
+                            # them here would destroy real, already-correct data no
+                            # matter how close their tracked positions have since
+                            # drifted (see hicon mould-merge-on-trolley-exit incident).
+                            METRICS_REGISTRY.increment(
+                                'mould.canonical_merge_blocked_both_poured'
+                            )
+                            logger.warning(
+                                "[mould-canonical] MERGE BLOCKED (both already poured) "
+                                "cid=%d <-> cid=%d d=%.3f iou=%.2f -- kept as two "
+                                "distinct moulds",
+                                ca, cb,
+                                self._rel_dist(
+                                    self._canonical_moulds[ca]['centroid_rel'],
+                                    self._canonical_moulds[cb]['centroid_rel'],
+                                ),
+                                self._bbox_iou(
+                                    self._canonical_moulds[ca]['bbox'],
+                                    self._canonical_moulds[cb]['bbox'],
+                                ),
+                            )
+                            continue
                         keep, drop = ca, cb
                         if cb in self._poured_mould_ids and ca not in self._poured_mould_ids:
                             keep, drop = cb, ca
